@@ -18,6 +18,12 @@ app.use(express.json());
 // ============================================
 // DATABASE HELPER FUNCTIONS
 // ============================================
+// DESIGN NOTE: saveFabricStructure() uses incremental updates to preserve data:
+// - UPDATE existing records (identified by fabric_id, color_id, roll_id)
+// - INSERT new records (no ID provided)
+// - DELETE only records explicitly removed from the payload
+// - NEVER touches the logs table - preserves audit trail
+// - Uses transactions to ensure consistency
 
 // Build nested fabric structure from database (fabrics -> colors -> rolls)
 const buildFabricStructure = async () => {
@@ -26,12 +32,35 @@ const buildFabricStructure = async () => {
     const [colors] = await db.query('SELECT * FROM colors ORDER BY fabric_id, color_id');
     const [rolls] = await db.query('SELECT * FROM rolls ORDER BY color_id, roll_id');
 
-    // Group rolls by color_id
+    // First pass: assign sequential color indices within each fabric
+    const colorIndexMap = {}; // Maps color_id to its sequential index within fabric
+    const colorsByFabric = {};
+    colors.forEach(color => {
+      if (!colorsByFabric[color.fabric_id]) colorsByFabric[color.fabric_id] = [];
+      const colorIndex = colorsByFabric[color.fabric_id].length + 1; // 1-based
+      colorIndexMap[color.color_id] = colorIndex;
+      colorsByFabric[color.fabric_id].push(color);
+    });
+
+    // Build rolls with correct hierarchical IDs
     const rollsByColor = {};
     rolls.forEach(roll => {
       if (!rollsByColor[roll.color_id]) rollsByColor[roll.color_id] = [];
+      
+      // Get the fabric for this roll
+      const color = colors.find(c => c.color_id === roll.color_id);
+      if (!color) return;
+      
+      const fabric = fabrics.find(f => f.fabric_id === color.fabric_id);
+      if (!fabric) return;
+      
+      // Extract fabric number from fabric_code (e.g., "FAB-001" -> "001")
+      const fabricNum = (fabric.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(fabric.fabric_id).padStart(3, '0');
+      const colorNum = String(colorIndexMap[roll.color_id]).padStart(3, '0');
+      const rollNum = String(rollsByColor[roll.color_id].length + 1).padStart(3, '0');
+      
       rollsByColor[roll.color_id].push({
-        id: `FAB-${String(roll.fabric_id).padStart(3, '0')}-COL-${String(roll.color_id).padStart(3, '0')}-ROL-${String(roll.roll_id).padStart(3, '0')}`,
+        id: `FAB-${fabricNum}-COL-${colorNum}-ROL-${rollNum}`,
         date: roll.date,
         length_meters: parseFloat(roll.length_meters),
         length_yards: parseFloat(roll.length_yards),
@@ -40,16 +69,21 @@ const buildFabricStructure = async () => {
       });
     });
 
-    // Group colors by fabric_id
-    const colorsByFabric = {};
-    colors.forEach(color => {
-      if (!colorsByFabric[color.fabric_id]) colorsByFabric[color.fabric_id] = [];
-      colorsByFabric[color.fabric_id].push({
-        color_id: color.color_id,
-        fabric_id: color.fabric_id,
-        id: `FAB-${String(color.fabric_id).padStart(3, '0')}-COL-${String(color.color_id).padStart(3, '0')}`,
-        color_name: color.color_name,
-        rolls: rollsByColor[color.color_id] || []
+    // Build colors with correct hierarchical IDs
+    const finalColorsByFabric = {};
+    Object.keys(colorsByFabric).forEach(fabricId => {
+      const fabric = fabrics.find(f => f.fabric_id === parseInt(fabricId));
+      const fabricNum = (fabric.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(fabricId).padStart(3, '0');
+      
+      finalColorsByFabric[fabricId] = colorsByFabric[fabricId].map((color, idx) => {
+        const colorNum = String(idx + 1).padStart(3, '0');
+        return {
+          color_id: color.color_id,
+          fabric_id: color.fabric_id,
+          id: `FAB-${fabricNum}-COL-${colorNum}`,
+          color_name: color.color_name,
+          rolls: rollsByColor[color.color_id] || []
+        };
       });
     });
 
@@ -58,9 +92,10 @@ const buildFabricStructure = async () => {
       fabric_id: fabric.fabric_id,
       fabric_name: fabric.fabric_name,
       fabric_code: fabric.fabric_code,
+      main_code: fabric.main_code,
       source: fabric.source,
       design: fabric.design,
-      colors: colorsByFabric[fabric.fabric_id] || []
+      colors: finalColorsByFabric[fabric.fabric_id] || []
     }));
   } catch (error) {
     console.error('Error building fabric structure:', error);
@@ -74,41 +109,125 @@ const getFabricByIndex = async (index) => {
   return fabrics[index] || null;
 };
 
-// Save complete fabric structure to database
+// Save complete fabric structure to database (INCREMENTAL - preserves existing data)
 const saveFabricStructure = async (fabricsArray) => {
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
 
-    // Clear existing data
-    // Logs clear must precede rolls/colors/fabrics to avoid FK issues if present
-    await connection.query('DELETE FROM logs');
-    await connection.query('DELETE FROM rolls');
-    await connection.query('DELETE FROM colors');
-    await connection.query('DELETE FROM fabrics');
+    // Get existing data for comparison
+    const [existingFabrics] = await connection.query('SELECT fabric_id, fabric_code FROM fabrics');
+    const [existingColors] = await connection.query('SELECT color_id, fabric_id, color_name FROM colors');
+    const [existingRolls] = await connection.query('SELECT roll_id, color_id, fabric_id FROM rolls');
 
-    // Insert fabrics, colors, and rolls
+    const existingFabricIds = new Set(existingFabrics.map(f => f.fabric_id));
+    const processedFabricIds = new Set();
+
+    // Process each fabric
     for (const fabric of fabricsArray) {
-      const [fabricResult] = await connection.query(
-        'INSERT INTO fabrics (fabric_name, fabric_code, source, design) VALUES (?, ?, ?, ?)',
-        [fabric.fabric_name, fabric.fabric_code, fabric.source, fabric.design]
+      let fabricId = fabric.fabric_id;
+
+      if (fabricId && existingFabricIds.has(fabricId)) {
+        // UPDATE existing fabric
+        await connection.query(
+          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ? WHERE fabric_id = ?',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design, fabricId]
+        );
+        processedFabricIds.add(fabricId);
+      } else {
+        // INSERT new fabric
+        const [result] = await connection.query(
+          'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design) VALUES (?, ?, ?, ?, ?)',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design]
+        );
+        fabricId = result.insertId;
+        processedFabricIds.add(fabricId);
+      }
+
+      // Process colors for this fabric
+      const existingColorIds = new Set(
+        existingColors.filter(c => c.fabric_id === fabricId).map(c => c.color_id)
       );
-      const fabricId = fabricResult.insertId;
+      const processedColorIds = new Set();
 
       for (const color of fabric.colors || []) {
-        const [colorResult] = await connection.query(
-          'INSERT INTO colors (fabric_id, color_name) VALUES (?, ?)',
-          [fabricId, color.color_name]
+        let colorId = color.color_id;
+
+        if (colorId && existingColorIds.has(colorId)) {
+          // UPDATE existing color
+          await connection.query(
+            'UPDATE colors SET color_name = ? WHERE color_id = ?',
+            [color.color_name, colorId]
+          );
+          processedColorIds.add(colorId);
+        } else {
+          // INSERT new color
+          const [result] = await connection.query(
+            'INSERT INTO colors (fabric_id, color_name) VALUES (?, ?)',
+            [fabricId, color.color_name]
+          );
+          colorId = result.insertId;
+          processedColorIds.add(colorId);
+        }
+
+        // Process rolls for this color
+        const existingRollIds = new Set(
+          existingRolls.filter(r => r.color_id === colorId).map(r => r.roll_id)
         );
-        const colorId = colorResult.insertId;
+        const processedRollIds = new Set();
 
         for (const roll of color.rolls || []) {
-          await connection.query(
-            'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [colorId, fabricId, roll.date, roll.length_meters, roll.length_yards, roll.isTrimmable || false, roll.weight || 'N/A', 'available']
+          // Rolls are identified by their display ID (e.g., "FAB-001-COL-001-ROL-001")
+          // Find matching roll by display ID format
+          const [matchingRolls] = await connection.query(
+            'SELECT roll_id FROM rolls WHERE color_id = ? AND fabric_id = ?',
+            [colorId, fabricId]
           );
+          
+          // Try to find existing roll by position/order
+          const rollIndex = color.rolls.indexOf(roll);
+          const existingRoll = matchingRolls[rollIndex];
+
+          if (existingRoll) {
+            // UPDATE existing roll
+            await connection.query(
+              'UPDATE rolls SET date = ?, length_meters = ?, length_yards = ?, is_trimmable = ?, weight = ? WHERE roll_id = ?',
+              [roll.date, roll.length_meters, roll.length_yards, roll.isTrimmable || false, roll.weight || 'N/A', existingRoll.roll_id]
+            );
+            processedRollIds.add(existingRoll.roll_id);
+          } else {
+            // INSERT new roll
+            const [result] = await connection.query(
+              'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [colorId, fabricId, roll.date, roll.length_meters, roll.length_yards, roll.isTrimmable || false, roll.weight || 'N/A', 'available']
+            );
+            processedRollIds.add(result.insertId);
+          }
+        }
+
+        // DELETE rolls that were removed from this color
+        const rollsToDelete = [...existingRollIds].filter(id => !processedRollIds.has(id));
+        if (rollsToDelete.length > 0) {
+          await connection.query('DELETE FROM rolls WHERE roll_id IN (?)', [rollsToDelete]);
         }
       }
+
+      // DELETE colors that were removed from this fabric
+      const colorsToDelete = [...existingColorIds].filter(id => !processedColorIds.has(id));
+      if (colorsToDelete.length > 0) {
+        // First delete all rolls in those colors
+        await connection.query('DELETE FROM rolls WHERE color_id IN (?)', [colorsToDelete]);
+        await connection.query('DELETE FROM colors WHERE color_id IN (?)', [colorsToDelete]);
+      }
+    }
+
+    // DELETE fabrics that were completely removed
+    const fabricsToDelete = [...existingFabricIds].filter(id => !processedFabricIds.has(id));
+    if (fabricsToDelete.length > 0) {
+      // Cascade delete: rolls -> colors -> fabrics
+      await connection.query('DELETE FROM rolls WHERE fabric_id IN (?)', [fabricsToDelete]);
+      await connection.query('DELETE FROM colors WHERE fabric_id IN (?)', [fabricsToDelete]);
+      await connection.query('DELETE FROM fabrics WHERE fabric_id IN (?)', [fabricsToDelete]);
     }
 
     await connection.commit();
@@ -161,10 +280,10 @@ app.get('/api/customers', async (req, res) => {
     let sql = 'SELECT * FROM customers';
     const params = [];
     if (search) {
-      sql += ' WHERE name LIKE ?';
+      sql += ' WHERE customer_name LIKE ?';
       params.push(`%${search}%`);
     }
-    sql += ' ORDER BY name ASC LIMIT 100';
+    sql += ' ORDER BY customer_name ASC LIMIT 100';
     const [rows] = await db.query(sql, params);
     res.json(rows.map(mapCustomer));
   } catch (error) {
@@ -230,16 +349,32 @@ app.put('/api/customers/:id', async (req, res) => {
 
 app.delete('/api/customers/:id', async (req, res) => {
   try {
+    // Check if customer has associated logs
+    const [logs] = await db.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
+    
+    if (logs[0].count > 0) {
+      return res.status(409).json({ 
+        error: 'Cannot delete customer with transaction history',
+        detail: `This customer has ${logs[0].count} transaction(s). Consider archiving instead.`
+      });
+    }
+
     const [result] = await db.query('DELETE FROM customers WHERE customer_id = ?', [req.params.id]);
+    
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Customer not found' });
     }
+
     res.json({ success: true });
   } catch (error) {
     console.error('Error deleting customer:', error.message, error.code);
     res.status(500).json({ error: error.message || 'Failed to delete customer' });
   }
 });
+
+// ============================================
+// FABRICS ENDPOINTS (ID-based, not index-based)
+// ============================================
 
 // GET all fabrics
 app.get('/api/fabrics', async (req, res) => {
@@ -252,16 +387,21 @@ app.get('/api/fabrics', async (req, res) => {
   }
 });
 
-// GET single fabric by index
-app.get('/api/fabrics/:index', async (req, res) => {
+// GET single fabric by fabric_id (DB ID, not array index)
+app.get('/api/fabrics/:fabric_id', async (req, res) => {
   try {
-    const index = parseInt(req.params.index);
-    const fabric = await getFabricByIndex(index);
-    if (fabric) {
-      res.json(fabric);
-    } else {
-      res.status(404).json({ error: 'Fabric not found' });
+    const fabricId = parseInt(req.params.fabric_id);
+    const [rows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Fabric not found' });
     }
+
+    // Build full structure for this fabric
+    const fabrics = await buildFabricStructure();
+    const fabric = fabrics.find(f => f.fabric_id === fabricId);
+    
+    res.json(fabric);
   } catch (error) {
     console.error('Error fetching fabric:', error);
     res.status(500).json({ error: 'Failed to fetch fabric' });
@@ -271,67 +411,219 @@ app.get('/api/fabrics/:index', async (req, res) => {
 // POST create new fabric
 app.post('/api/fabrics', async (req, res) => {
   try {
+    const { fabric_name, fabric_code, main_code, source, design } = req.body;
+    
+    // Validation
+    if (!fabric_name || !fabric_name.trim()) {
+      return res.status(400).json({ error: 'Fabric name is required' });
+    }
+    if (!fabric_code) {
+      return res.status(400).json({ error: 'Fabric code is required' });
+    }
+
+    // Check for duplicate fabric_code
+    const [existing] = await db.query('SELECT fabric_id FROM fabrics WHERE fabric_code = ?', [fabric_code]);
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'Fabric code already exists' });
+    }
+
+    // Insert and return DB reality
+    const [result] = await db.query(
+      'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design) VALUES (?, ?, ?, ?, ?)',
+      [fabric_name.trim(), fabric_code, main_code || null, source || null, design || 'none']
+    );
+
+    // Return what DB actually created
     const fabrics = await buildFabricStructure();
-    fabrics.push(req.body);
-    await saveFabricStructure(fabrics);
-    res.status(201).json(req.body);
+    const created = fabrics.find(f => f.fabric_id === result.insertId);
+    
+    res.status(201).json(created);
   } catch (error) {
     console.error('Error creating fabric:', error);
     res.status(500).json({ error: 'Failed to create fabric' });
   }
 });
 
-// PUT update fabric by index
-app.put('/api/fabrics/:index', async (req, res) => {
+// PUT update single fabric by fabric_id
+app.put('/api/fabrics/:fabric_id', async (req, res) => {
   try {
-    const fabrics = await buildFabricStructure();
-    const index = parseInt(req.params.index);
-    if (index >= 0 && index < fabrics.length) {
-      fabrics[index] = req.body;
-      await saveFabricStructure(fabrics);
-      res.json(fabrics[index]);
-    } else {
-      res.status(404).json({ error: 'Fabric not found' });
+    const fabricId = parseInt(req.params.fabric_id);
+    const { fabric_name, fabric_code, main_code, source, design } = req.body;
+
+    // Check fabric exists
+    const [existing] = await db.query('SELECT fabric_id FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (existing.length === 0) {
+      return res.status(404).json({ error: 'Fabric not found' });
     }
+
+    // Check for duplicate fabric_code (excluding current fabric)
+    if (fabric_code) {
+      const [duplicate] = await db.query(
+        'SELECT fabric_id FROM fabrics WHERE fabric_code = ? AND fabric_id != ?',
+        [fabric_code, fabricId]
+      );
+      if (duplicate.length > 0) {
+        return res.status(409).json({ error: 'Fabric code already exists' });
+      }
+    }
+
+    // Build update query dynamically
+    const updates = {};
+    if (fabric_name !== undefined) updates.fabric_name = fabric_name.trim();
+    if (fabric_code !== undefined) updates.fabric_code = fabric_code;
+    if (main_code !== undefined) updates.main_code = main_code || null;
+    if (source !== undefined) updates.source = source || null;
+    if (design !== undefined) updates.design = design || 'none';
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+    const values = [...Object.values(updates), fabricId];
+    
+    await db.query(`UPDATE fabrics SET ${fields} WHERE fabric_id = ?`, values);
+
+    // Return DB reality after update
+    const fabrics = await buildFabricStructure();
+    const updated = fabrics.find(f => f.fabric_id === fabricId);
+    
+    res.json(updated);
   } catch (error) {
     console.error('Error updating fabric:', error);
     res.status(500).json({ error: 'Failed to update fabric' });
   }
 });
 
-// DELETE fabric by index
-app.delete('/api/fabrics/:index', async (req, res) => {
+// DELETE fabric by fabric_id with cascade
+app.delete('/api/fabrics/:fabric_id', async (req, res) => {
+  const connection = await db.getConnection();
   try {
-    const fabrics = await buildFabricStructure();
-    const index = parseInt(req.params.index);
-    if (index >= 0 && index < fabrics.length) {
-      fabrics.splice(index, 1);
-      await saveFabricStructure(fabrics);
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: 'Fabric not found' });
+    const fabricId = parseInt(req.params.fabric_id);
+    
+    await connection.beginTransaction();
+
+    // Check if fabric exists
+    const [existing] = await connection.query('SELECT fabric_id FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Fabric not found' });
     }
+
+    // Cascade delete: logs -> rolls -> colors -> fabric
+    // First delete logs that reference rolls of this fabric
+    await connection.query('DELETE FROM logs WHERE fabric_id = ?', [fabricId]);
+    // Then delete rolls
+    await connection.query('DELETE FROM rolls WHERE fabric_id = ?', [fabricId]);
+    // Then delete colors
+    await connection.query('DELETE FROM colors WHERE fabric_id = ?', [fabricId]);
+    // Finally delete the fabric
+    await connection.query('DELETE FROM fabrics WHERE fabric_id = ?', [fabricId]);
+
+    await connection.commit();
+    res.json({ success: true });
   } catch (error) {
+    await connection.rollback();
     console.error('Error deleting fabric:', error);
     res.status(500).json({ error: 'Failed to delete fabric' });
+  } finally {
+    connection.release();
   }
 });
 
-// PUT update all fabrics (for bulk updates)
+// DELETE color by color_id with cascade to rolls
+app.delete('/api/colors/:color_id', async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const colorId = parseInt(req.params.color_id);
+    
+    await connection.beginTransaction();
+
+    // Check if color exists
+    const [existing] = await connection.query('SELECT color_id FROM colors WHERE color_id = ?', [colorId]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Color not found' });
+    }
+
+    // Cascade delete: rolls -> color
+    await connection.query('DELETE FROM rolls WHERE color_id = ?', [colorId]);
+    await connection.query('DELETE FROM colors WHERE color_id = ?', [colorId]);
+
+    await connection.commit();
+    res.json({ success: true });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error deleting color:', error);
+    res.status(500).json({ error: 'Failed to delete color' });
+  } finally {
+    connection.release();
+  }
+});
+
+// DELETE roll by roll_id
+app.delete('/api/rolls/:roll_id', async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const rollId = parseInt(req.params.roll_id);
+    
+    await connection.beginTransaction();
+
+    // Check if roll exists
+    const [existing] = await connection.query('SELECT roll_id FROM rolls WHERE roll_id = ?', [rollId]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Roll not found' });
+    }
+
+    // Delete the roll
+    await connection.query('DELETE FROM rolls WHERE roll_id = ?', [rollId]);
+
+    await connection.commit();
+    res.json({ success: true });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error deleting roll:', error);
+    res.status(500).json({ error: 'Failed to delete roll' });
+  } finally {
+    connection.release();
+  }
+});
+
+// PUT bulk update (validates each fabric exists)
 app.put('/api/fabrics', async (req, res) => {
   try {
-    await saveFabricStructure(req.body);
-    res.json(req.body);
+    const fabricsArray = req.body;
+    
+    if (!Array.isArray(fabricsArray)) {
+      return res.status(400).json({ error: 'Request body must be an array' });
+    }
+
+    // Validate all fabrics have IDs
+    for (const fabric of fabricsArray) {
+      if (!fabric.fabric_id) {
+        return res.status(400).json({ error: 'All fabrics must have fabric_id for bulk update' });
+      }
+    }
+
+    await saveFabricStructure(fabricsArray);
+    
+    // Return DB state
+    const updated = await buildFabricStructure();
+    res.json(updated);
   } catch (error) {
     console.error('Error updating fabrics:', error);
     res.status(500).json({ error: 'Failed to update fabrics' });
   }
 });
 
-// Logs endpoints
+// ============================================
+// LOGS ENDPOINTS (Accept fabricIndex/colorIndex, store fabricId/colorId)
+// ============================================
+
 app.get('/api/logs', async (req, res) => {
   try {
-    const { type, fabricIndex, colorIndex, rollId, start, end, minLength, maxLength } = req.query;
+    const { type, fabricId, colorId, rollId, start, end, minLength, maxLength } = req.query;
     
     let query = 'SELECT * FROM logs WHERE 1=1';
     const params = [];
@@ -339,6 +631,14 @@ app.get('/api/logs', async (req, res) => {
     if (type) {
       query += ' AND type = ?';
       params.push(type);
+    }
+    if (fabricId) {
+      query += ' AND fabric_id = ?';
+      params.push(parseInt(fabricId));
+    }
+    if (colorId) {
+      query += ' AND color_id = ?';
+      params.push(parseInt(colorId));
     }
     if (rollId) {
       query += ' AND roll_id LIKE ?';
@@ -365,13 +665,12 @@ app.get('/api/logs', async (req, res) => {
 
     const [logs] = await db.query(query, params);
     
-    // Convert database format to JSON format
+    // Convert database format to JSON format (use DB IDs, not indices)
     const formattedLogs = logs.map(log => ({
       type: log.type,
       rollId: log.roll_id,
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      fabricIndex: log.fabric_id ? log.fabric_id - 1 : null, // legacy index for UI
-      colorIndex: log.color_id ? log.color_id - 1 : null,
+      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       fabricId: log.fabric_id || null,
       colorId: log.color_id || null,
       fabricName: log.fabric_name,
@@ -403,8 +702,7 @@ app.get('/api/logs/:id', async (req, res) => {
         type: log.type,
         rollId: log.roll_id,
         amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-        fabricIndex: log.fabric_id ? log.fabric_id - 1 : null,
-        colorIndex: log.color_id ? log.color_id - 1 : null,
+        length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
         fabricId: log.fabric_id || null,
         colorId: log.color_id || null,
         fabricName: log.fabric_name,
@@ -433,19 +731,57 @@ app.post('/api/logs', async (req, res) => {
     const entry = req.body || {};
     const now = getLebanonTimestamp();
     
+    // Validation
+    if (!entry.type) {
+      return res.status(400).json({ error: 'Log type is required' });
+    }
+
+    // Accept fabricIndex from frontend, store fabricId in DB
+    let fabricId = entry.fabricId || entry.fabric_id;
+    let colorId = entry.colorId || entry.color_id;
+
+    // If frontend sends fabricIndex/colorIndex, resolve to IDs
+    if ((fabricId === undefined || fabricId === null) && entry.fabricIndex !== undefined) {
+      const fabrics = await buildFabricStructure();
+      if (entry.fabricIndex >= 0 && entry.fabricIndex < fabrics.length) {
+        fabricId = fabrics[entry.fabricIndex].fabric_id;
+        
+        if (entry.colorIndex !== undefined && fabrics[entry.fabricIndex].colors) {
+          const colors = fabrics[entry.fabricIndex].colors;
+          if (entry.colorIndex >= 0 && entry.colorIndex < colors.length) {
+            colorId = colors[entry.colorIndex].color_id;
+          }
+        }
+      }
+    }
+
+    if (!fabricId) {
+      return res.status(400).json({ error: 'Fabric ID or index is required' });
+    }
+
+    // Validate roll_id exists if provided
+    let rollId = entry.rollId || null;
+    if (rollId) {
+      const [rollExists] = await db.query('SELECT roll_id FROM rolls WHERE roll_id = ?', [rollId]);
+      if (rollExists.length === 0) {
+        console.warn(`Warning: Roll ID ${rollId} does not exist, setting to NULL`);
+        rollId = null;
+      }
+    }
+
     const logData = {
       type: entry.type,
-      roll_id: entry.rollId,
-      fabric_id: entry.fabricId || entry.fabric_id || ((entry.fabricIndex || 0) + 1), // prefer explicit ID
-      color_id: entry.colorId || entry.color_id || (entry.colorIndex !== undefined ? entry.colorIndex + 1 : null),
-      fabric_name: entry.fabricName,
-      color_name: entry.colorName,
+      roll_id: rollId,
+      fabric_id: fabricId,
+      color_id: colorId || null,
+      fabric_name: entry.fabricName || null,
+      color_name: entry.colorName || null,
       customer_id: entry.customerId || null,
-      customer_name: entry.customerName,
+      customer_name: entry.customerName || null,
       amount_meters: entry.amount_meters || entry.length_meters || 0,
       is_trimmable: entry.isTrimmable || false,
       weight: entry.weight || 'N/A',
-      notes: entry.notes,
+      notes: entry.notes || null,
       timestamp: entry.timestamp || now.iso,
       epoch: entry.epoch || now.epoch,
       timezone: 'Asia/Beirut'
@@ -456,79 +792,97 @@ app.post('/api/logs', async (req, res) => {
       [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone]
     );
 
-    const response = {
-      ...entry,
-      id: result.insertId,
-      customerId: logData.customer_id || null,
-      timestamp: logData.timestamp,
-      epoch: logData.epoch,
-      tz: 'Asia/Beirut'
-    };
-
-    res.status(201).json(response);
+    // Return DB reality
+    const [created] = await db.query('SELECT * FROM logs WHERE log_id = ?', [result.insertId]);
+    const log = created[0];
+    
+    res.status(201).json({
+      type: log.type,
+      rollId: log.roll_id,
+      amount_meters: parseFloat(log.amount_meters) || 0,
+      length_meters: parseFloat(log.amount_meters) || 0,
+      fabricId: log.fabric_id,
+      colorId: log.color_id,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerId: log.customer_id,
+      customerName: log.customer_name,
+      notes: log.notes,
+      timestamp: log.timestamp,
+      epoch: log.epoch,
+      id: log.log_id,
+      tz: log.timezone,
+      isTrimmable: Boolean(log.is_trimmable),
+      weight: log.weight
+    });
   } catch (error) {
     console.error('Error creating log:', error);
-    res.status(500).json({ error: 'Failed to create log' });
+    // Provide more helpful error message
+    const errorMessage = error.code === 'ER_NO_REFERENCED_ROW_2' 
+      ? 'Invalid roll ID or fabric ID - record does not exist'
+      : error.message || 'Failed to create log';
+    res.status(500).json({ error: errorMessage });
   }
 });
 
 app.put('/api/logs/:id', async (req, res) => {
   try {
+    const logId = parseInt(req.params.id);
     const updates = req.body;
-    const updateData = {
-      type: updates.type,
-      roll_id: updates.rollId,
-      fabric_id: updates.fabricId || updates.fabric_id || (updates.fabricIndex !== undefined ? updates.fabricIndex + 1 : undefined),
-      color_id: updates.colorId || updates.color_id || (updates.colorIndex !== undefined ? updates.colorIndex + 1 : undefined),
-      fabric_name: updates.fabricName,
-      color_name: updates.colorName,
-      customer_id: updates.customerId,
-      customer_name: updates.customerName,
-      amount_meters: updates.amount_meters,
-      is_trimmable: updates.isTrimmable,
-      weight: updates.weight,
-      notes: updates.notes,
-      timestamp: updates.timestamp,
-      epoch: updates.epoch
-    };
 
-    // Build dynamic update query
-    const fields = [];
-    const values = [];
-    Object.keys(updateData).forEach(key => {
-      if (updateData[key] !== undefined) {
-        fields.push(`${key} = ?`);
-        values.push(updateData[key]);
-      }
+    // Check log exists
+    const [existing] = await db.query('SELECT log_id FROM logs WHERE log_id = ?', [logId]);
+    if (existing.length === 0) {
+      return res.status(404).json({ error: 'Log not found' });
+    }
+
+    const updateData = {};
+    if (updates.type !== undefined) updateData.type = updates.type;
+    if (updates.rollId !== undefined) updateData.roll_id = updates.rollId;
+    if (updates.fabricId !== undefined) updateData.fabric_id = updates.fabricId;
+    if (updates.colorId !== undefined) updateData.color_id = updates.colorId;
+    if (updates.fabricName !== undefined) updateData.fabric_name = updates.fabricName;
+    if (updates.colorName !== undefined) updateData.color_name = updates.colorName;
+    if (updates.customerId !== undefined) updateData.customer_id = updates.customerId;
+    if (updates.customerName !== undefined) updateData.customer_name = updates.customerName;
+    if (updates.amount_meters !== undefined) updateData.amount_meters = updates.amount_meters;
+    if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.isTrimmable;
+    if (updates.weight !== undefined) updateData.weight = updates.weight;
+    if (updates.notes !== undefined) updateData.notes = updates.notes;
+    if (updates.timestamp !== undefined) updateData.timestamp = updates.timestamp;
+    if (updates.epoch !== undefined) updateData.epoch = updates.epoch;
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const fields = Object.keys(updateData).map(k => `${k} = ?`).join(', ');
+    const values = [...Object.values(updateData), logId];
+    
+    await db.query(`UPDATE logs SET ${fields} WHERE log_id = ?`, values);
+
+    // Return DB reality
+    const [updated] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+    const log = updated[0];
+    
+    res.json({
+      type: log.type,
+      rollId: log.roll_id,
+      amount_meters: parseFloat(log.amount_meters) || 0,
+      fabricId: log.fabric_id,
+      colorId: log.color_id,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerId: log.customer_id,
+      customerName: log.customer_name,
+      notes: log.notes,
+      timestamp: log.timestamp,
+      epoch: log.epoch,
+      id: log.log_id,
+      tz: log.timezone,
+      isTrimmable: Boolean(log.is_trimmable),
+      weight: log.weight
     });
-
-    if (fields.length > 0) {
-      values.push(req.params.id);
-      await db.query(`UPDATE logs SET ${fields.join(', ')} WHERE log_id = ?`, values);
-    }
-
-    const [logs] = await db.query('SELECT * FROM logs WHERE log_id = ?', [req.params.id]);
-    if (logs.length > 0) {
-      const log = logs[0];
-      res.json({
-        type: log.type,
-        rollId: log.roll_id,
-        amount_meters: parseFloat(log.amount_meters) || 0,
-        fabricIndex: log.fabric_id - 1,
-        colorIndex: log.color_id ? log.color_id - 1 : null,
-        fabricName: log.fabric_name,
-        colorName: log.color_name,
-        customerId: log.customer_id || null,
-        customerName: log.customer_name,
-        notes: log.notes,
-        timestamp: log.timestamp,
-        epoch: log.epoch,
-        id: log.log_id,
-        tz: log.timezone
-      });
-    } else {
-      res.status(404).json({ error: 'Log not found' });
-    }
   } catch (error) {
     console.error('Error updating log:', error);
     res.status(500).json({ error: 'Failed to update log' });
