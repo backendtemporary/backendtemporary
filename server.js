@@ -13,7 +13,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT;
 
+console.log("=== SERVER STARTUP ===");
 console.log("SERVER.JS LOADED — REAL FILE");
+console.log("PORT:", PORT || "UNDEFINED");
+console.log("NODE_ENV:", process.env.NODE_ENV || "development");
+console.log("=========================");
 
 app.get("/api/__prove", (req, res) => {
   res.send("PROVE ROUTE");
@@ -32,6 +36,18 @@ app.use(cors({
 
 app.options('*', cors());
 app.use(express.json());
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${req.method} ${req.url} from ${req.ip || req.connection.remoteAddress}`);
+  console.log('  Origin:', req.headers.origin || 'none');
+  console.log('  User-Agent:', req.headers['user-agent']?.substring(0, 50) || 'none');
+  res.on('finish', () => {
+    console.log(`  → ${res.statusCode} ${res.statusMessage || ''}`);
+  });
+  next();
+});
 
 // Root health checks for Elastic Beanstalk/ALB
 app.get('/', (req, res) => {
