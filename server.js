@@ -178,24 +178,34 @@ const saveFabricStructure = async (fabricsArray) => {
     await connection.beginTransaction();
 
     // Get existing data for comparison
-    const [existingFabrics] = await connection.query('SELECT fabric_id, fabric_code FROM fabrics');
+    const [existingFabrics] = await connection.query('SELECT fabric_id, fabric_code, main_code FROM fabrics');
     const [existingColors] = await connection.query('SELECT color_id, fabric_id, color_name FROM colors');
     const [existingRolls] = await connection.query(
       'SELECT roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status FROM rolls'
     );
 
     const existingFabricIds = new Set(existingFabrics.map(f => f.fabric_id));
+    const existingFabricsByMainCode = new Map(existingFabrics.filter(f => f.main_code).map(f => [f.main_code, f.fabric_id]));
     const processedFabricIds = new Set();
 
     // Process each fabric
     for (const fabric of fabricsArray) {
       let fabricId = fabric.fabric_id;
 
+      // Priority: fabric_id > main_code > insert new
       if (fabricId && existingFabricIds.has(fabricId)) {
-        // UPDATE existing fabric
+        // UPDATE by fabric_id
         await connection.query(
           'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ? WHERE fabric_id = ?',
           [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design, fabricId]
+        );
+        processedFabricIds.add(fabricId);
+      } else if (fabric.main_code && existingFabricsByMainCode.has(fabric.main_code)) {
+        // UPDATE by main_code if no fabric_id provided
+        fabricId = existingFabricsByMainCode.get(fabric.main_code);
+        await connection.query(
+          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ? WHERE fabric_id = ?',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code, fabric.source, fabric.design, fabricId]
         );
         processedFabricIds.add(fabricId);
       } else {
@@ -681,11 +691,11 @@ app.put('/api/fabrics', async (req, res) => {
       return res.status(400).json({ error: 'Request body must be a non-empty array of fabrics' });
     }
 
-    // Validate all fabrics have IDs
+    // Validate fabrics have either fabric_id or main_code for matching
     for (const fabric of fabricsArray) {
-      if (!fabric.fabric_id) {
-        console.warn('PUT /api/fabrics: validation failed - fabric_id missing on fabric:', fabric);
-        return res.status(400).json({ error: 'All fabrics must have fabric_id for update', detail: 'fabric_id missing' });
+      if (!fabric.fabric_id && !fabric.main_code) {
+        console.warn('PUT /api/fabrics: validation failed - fabric_id and main_code both missing on fabric:', fabric);
+        return res.status(400).json({ error: 'Each fabric must have fabric_id or main_code for matching' });
       }
     }
 
@@ -695,8 +705,9 @@ app.put('/api/fabrics', async (req, res) => {
     const updated = await buildFabricStructure();
     res.json(updated);
   } catch (error) {
-    console.error('Error updating fabrics:', error);
-    res.status(500).json({ error: 'Failed to update fabrics' });
+    console.error('PUT /api/fabrics error:', error.message);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ error: error.message || 'Failed to update fabrics' });
   }
 });
 
