@@ -5,18 +5,40 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import db from './db.js';
 
+import pool from "./db.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT;
+
+app.get("/api/__prove", (req, res) => {
+  res.send("PROVE ROUTE");
+});
+
 
 // Middleware
-// Explicitly allow all origins temporarily for EB/ALB; tighten later if needed
+// CORS: allow localhost dev and EB HTTPS domain
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://risetexco-depot-prod.eba-3qgbu6pm.eu-north-1.elasticbeanstalk.com',
+];
+
+const isElasticBeanstalkDomain = (origin = '') => /https:\/\/.*\.elasticbeanstalk\.com$/i.test(origin);
+
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // allow curl/ALB health checks
+    if (allowedOrigins.includes(origin) || isElasticBeanstalkDomain(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 }));
 app.use(express.json());
 
@@ -27,6 +49,15 @@ app.get('/', (req, res) => {
 
 app.get('/api', (req, res) => {
   res.status(200).send('API root');
+});
+
+// Authentication middleware must not block public health endpoints
+// Replace `authMiddleware` with your real auth when ready
+const authMiddleware = (req, res, next) => next();
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/' || req.path === '/health') return next();
+  return authMiddleware(req, res, next);
 });
 
 // ============================================
@@ -922,6 +953,23 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'RisetexCo API is running' });
 });
 
+
+///TEST
+
+app.get("/api/db-health", async (req, res) => {
+  try {
+    const conn = await pool.getConnection();
+    await conn.ping();
+    conn.release();
+    res.json({ db: "connected" });
+  } catch (err) {
+    res.status(500).json({
+      db: "disconnected",
+      error: err.message
+    });
+  }
+});
+
 // Serve built frontend if available so the app can run from one server
 const FRONTEND_DIST = path.join(__dirname, '..', 'frontend', 'dist');
 if (fs.existsSync(FRONTEND_DIST)) {
@@ -940,4 +988,3 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT || 'undefined'} (env: ${env})`);
   console.log('Elastic Beanstalk/ALB ready to proxy traffic.');
 });
-
