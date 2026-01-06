@@ -20,9 +20,13 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Root health check for AWS Elastic Beanstalk
+// Root health checks for Elastic Beanstalk/ALB
 app.get('/', (req, res) => {
-  res.status(200).send('OK');
+  res.status(200).send('API is running');
+});
+
+app.get('/api', (req, res) => {
+  res.status(200).send('API root');
 });
 
 // ============================================
