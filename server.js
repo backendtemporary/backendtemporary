@@ -15,6 +15,11 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Root health check for AWS Elastic Beanstalk
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // ============================================
 // DATABASE HELPER FUNCTIONS
 // ============================================
