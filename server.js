@@ -9,10 +9,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 // Middleware
-app.use(cors());
+// Explicitly allow all origins temporarily for EB/ALB; tighten later if needed
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 
 // Root health check for AWS Elastic Beanstalk
@@ -926,8 +931,9 @@ if (fs.existsSync(FRONTEND_DIST)) {
 }
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log(`API endpoints available at http://localhost:${PORT}/api`);
+app.listen(PORT, '0.0.0.0', () => {
+  const env = process.env.NODE_ENV || 'development';
+  console.log(`Server listening on port ${PORT} (env: ${env})`);
+  console.log('Elastic Beanstalk/ALB ready to proxy traffic.');
 });
 
