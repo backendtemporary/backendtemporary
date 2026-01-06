@@ -22,27 +22,15 @@ app.get("/api/__prove", (req, res) => {
 
 
 // Middleware
-// CORS: allow localhost dev and EB HTTPS domain
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'https://risetexco-depot-prod.eba-3qgbu6pm.eu-north-1.elasticbeanstalk.com',
-];
-
-const isElasticBeanstalkDomain = (origin = '') => /https:\/\/.*\.elasticbeanstalk\.com$/i.test(origin);
-
+// CORS: permissive config to avoid preflight timeouts in production
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true); // allow curl/ALB health checks
-    if (allowedOrigins.includes(origin) || isElasticBeanstalkDomain(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
-  },
+  origin: true,
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
 }));
+
+app.options('*', cors());
 app.use(express.json());
 
 // Root health checks for Elastic Beanstalk/ALB
