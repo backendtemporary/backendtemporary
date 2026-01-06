@@ -933,7 +933,7 @@ if (fs.existsSync(FRONTEND_DIST)) {
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   const env = process.env.NODE_ENV || 'development';
-  console.log(`Server listening on port ${PORT} (env: ${env})`);
+  console.log(`Server listening on port ${PORT || 'undefined'} (env: ${env})`);
   console.log('Elastic Beanstalk/ALB ready to proxy traffic.');
 });
 
