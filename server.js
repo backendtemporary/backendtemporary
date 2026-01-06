@@ -112,12 +112,18 @@ const buildFabricStructure = async () => {
       const rollNum = String(rollsByColor[roll.color_id].length + 1).padStart(3, '0');
       
       rollsByColor[roll.color_id].push({
+        roll_id: roll.roll_id,
+        color_id: roll.color_id,
+        fabric_id: roll.fabric_id,
         id: `FAB-${fabricNum}-COL-${colorNum}-ROL-${rollNum}`,
         date: roll.date,
         length_meters: parseFloat(roll.length_meters),
         length_yards: parseFloat(roll.length_yards),
         isTrimmable: Boolean(roll.is_trimmable),
-        weight: roll.weight || 'N/A'
+        weight: roll.weight || 'N/A',
+        status: roll.status,
+        created_at: roll.created_at,
+        updated_at: roll.updated_at
       });
     });
 
@@ -134,6 +140,8 @@ const buildFabricStructure = async () => {
           fabric_id: color.fabric_id,
           id: `FAB-${fabricNum}-COL-${colorNum}`,
           color_name: color.color_name,
+          created_at: color.created_at,
+          updated_at: color.updated_at,
           rolls: rollsByColor[color.color_id] || []
         };
       });
@@ -147,6 +155,8 @@ const buildFabricStructure = async () => {
       main_code: fabric.main_code,
       source: fabric.source,
       design: fabric.design,
+      created_at: fabric.created_at,
+      updated_at: fabric.updated_at,
       colors: finalColorsByFabric[fabric.fabric_id] || []
     }));
   } catch (error) {
@@ -170,7 +180,9 @@ const saveFabricStructure = async (fabricsArray) => {
     // Get existing data for comparison
     const [existingFabrics] = await connection.query('SELECT fabric_id, fabric_code FROM fabrics');
     const [existingColors] = await connection.query('SELECT color_id, fabric_id, color_name FROM colors');
-    const [existingRolls] = await connection.query('SELECT roll_id, color_id, fabric_id FROM rolls');
+    const [existingRolls] = await connection.query(
+      'SELECT roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status FROM rolls'
+    );
 
     const existingFabricIds = new Set(existingFabrics.map(f => f.fabric_id));
     const processedFabricIds = new Set();
@@ -223,35 +235,38 @@ const saveFabricStructure = async (fabricsArray) => {
         }
 
         // Process rolls for this color
-        const existingRollIds = new Set(
-          existingRolls.filter(r => r.color_id === colorId).map(r => r.roll_id)
-        );
+        const existingRollsForColor = existingRolls.filter(r => r.color_id === colorId);
+        const existingRollIds = new Set(existingRollsForColor.map(r => r.roll_id));
         const processedRollIds = new Set();
 
         for (const roll of color.rolls || []) {
-          // Rolls are identified by their display ID (e.g., "FAB-001-COL-001-ROL-001")
-          // Find matching roll by display ID format
-          const [matchingRolls] = await connection.query(
-            'SELECT roll_id FROM rolls WHERE color_id = ? AND fabric_id = ?',
-            [colorId, fabricId]
-          );
-          
-          // Try to find existing roll by position/order
-          const rollIndex = color.rolls.indexOf(roll);
-          const existingRoll = matchingRolls[rollIndex];
+          // Prefer explicit DB roll_id when provided; otherwise fall back to position as before
+          let targetRollId = roll.roll_id || roll.rollId;
+          if (!targetRollId) {
+            const rollIndex = color.rolls.indexOf(roll);
+            const byIndex = existingRollsForColor[rollIndex];
+            if (byIndex) targetRollId = byIndex.roll_id;
+          }
 
-          if (existingRoll) {
-            // UPDATE existing roll
+          const rollPayload = {
+            date: roll.date,
+            length_meters: roll.length_meters,
+            length_yards: roll.length_yards,
+            is_trimmable: roll.is_trimmable ?? roll.isTrimmable ?? false,
+            weight: roll.weight || 'N/A',
+            status: roll.status || 'available'
+          };
+
+          if (targetRollId && existingRollIds.has(targetRollId)) {
             await connection.query(
-              'UPDATE rolls SET date = ?, length_meters = ?, length_yards = ?, is_trimmable = ?, weight = ? WHERE roll_id = ?',
-              [roll.date, roll.length_meters, roll.length_yards, roll.isTrimmable || false, roll.weight || 'N/A', existingRoll.roll_id]
+              'UPDATE rolls SET date = ?, length_meters = ?, length_yards = ?, is_trimmable = ?, weight = ?, status = ? WHERE roll_id = ?',
+              [rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status, targetRollId]
             );
-            processedRollIds.add(existingRoll.roll_id);
+            processedRollIds.add(targetRollId);
           } else {
-            // INSERT new roll
             const [result] = await connection.query(
               'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [colorId, fabricId, roll.date, roll.length_meters, roll.length_yards, roll.isTrimmable || false, roll.weight || 'N/A', 'available']
+              [colorId, fabricId, rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status]
             );
             processedRollIds.add(result.insertId);
           }
@@ -645,16 +660,32 @@ app.delete('/api/rolls/:roll_id', async (req, res) => {
 // PUT bulk update (validates each fabric exists)
 app.put('/api/fabrics', async (req, res) => {
   try {
-    const fabricsArray = req.body;
-    
+    console.log('PUT /api/fabrics body:', req.body);
+    console.log('DEBUG params:', req.params);
+    console.log('DEBUG body type:', typeof req.body, 'isArray:', Array.isArray(req.body));
+    try {
+      console.log('DEBUG body sample:', JSON.stringify(req.body).slice(0, 4000));
+    } catch (err) {
+      console.log('DEBUG body stringify error:', err.message);
+    }
+
+    let fabricsArray = req.body;
+
+    // Accept single-object payloads by wrapping into an array
     if (!Array.isArray(fabricsArray)) {
-      return res.status(400).json({ error: 'Request body must be an array' });
+      console.warn('PUT /api/fabrics: received non-array payload; wrapping into array');
+      fabricsArray = [fabricsArray];
+    }
+    if (!Array.isArray(fabricsArray) || fabricsArray.length === 0) {
+      console.warn('PUT /api/fabrics: validation failed - empty or invalid array');
+      return res.status(400).json({ error: 'Request body must be a non-empty array of fabrics' });
     }
 
     // Validate all fabrics have IDs
     for (const fabric of fabricsArray) {
       if (!fabric.fabric_id) {
-        return res.status(400).json({ error: 'All fabrics must have fabric_id for bulk update' });
+        console.warn('PUT /api/fabrics: validation failed - fabric_id missing on fabric:', fabric);
+        return res.status(400).json({ error: 'All fabrics must have fabric_id for update', detail: 'fabric_id missing' });
       }
     }
 
@@ -717,25 +748,38 @@ app.get('/api/logs', async (req, res) => {
 
     const [logs] = await db.query(query, params);
     
-    // Convert database format to JSON format (use DB IDs, not indices)
+    // Convert database format to JSON format (expose DB columns + camelCase for compatibility)
     const formattedLogs = logs.map(log => ({
+      log_id: log.log_id,
       type: log.type,
-      rollId: log.roll_id,
+      roll_id: log.roll_id,
+      fabric_id: log.fabric_id || null,
+      color_id: log.color_id || null,
+      customer_id: log.customer_id || null,
+      fabric_name: log.fabric_name,
+      color_name: log.color_name,
+      customer_name: log.customer_name,
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      fabricId: log.fabric_id || null,
-      colorId: log.color_id || null,
-      fabricName: log.fabric_name,
-      colorName: log.color_name,
-      customerId: log.customer_id || null,
-      customerName: log.customer_name,
+      is_trimmable: Boolean(log.is_trimmable),
+      weight: log.weight,
       notes: log.notes,
       timestamp: log.timestamp,
       epoch: log.epoch,
+      timezone: log.timezone,
+      created_at: log.created_at,
+      updated_at: log.updated_at,
+      // compatibility camelCase aliases
       id: log.log_id,
+      rollId: log.roll_id,
+      fabricId: log.fabric_id || null,
+      colorId: log.color_id || null,
+      customerId: log.customer_id || null,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerName: log.customer_name,
+      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable),
-      weight: log.weight
+      isTrimmable: Boolean(log.is_trimmable)
     }));
 
     res.json(formattedLogs);
@@ -751,23 +795,36 @@ app.get('/api/logs/:id', async (req, res) => {
     if (logs.length > 0) {
       const log = logs[0];
       res.json({
+        log_id: log.log_id,
         type: log.type,
-        rollId: log.roll_id,
+        roll_id: log.roll_id,
+        fabric_id: log.fabric_id || null,
+        color_id: log.color_id || null,
+        customer_id: log.customer_id || null,
+        fabric_name: log.fabric_name,
+        color_name: log.color_name,
+        customer_name: log.customer_name,
         amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-        length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-        fabricId: log.fabric_id || null,
-        colorId: log.color_id || null,
-        fabricName: log.fabric_name,
-        colorName: log.color_name,
-        customerId: log.customer_id || null,
-        customerName: log.customer_name,
+        is_trimmable: Boolean(log.is_trimmable),
+        weight: log.weight,
         notes: log.notes,
         timestamp: log.timestamp,
         epoch: log.epoch,
+        timezone: log.timezone,
+        created_at: log.created_at,
+        updated_at: log.updated_at,
+        // compatibility aliases
         id: log.log_id,
+        rollId: log.roll_id,
+        fabricId: log.fabric_id || null,
+        colorId: log.color_id || null,
+        customerId: log.customer_id || null,
+        fabricName: log.fabric_name,
+        colorName: log.color_name,
+        customerName: log.customer_name,
+        length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
         tz: log.timezone,
-        isTrimmable: Boolean(log.is_trimmable),
-        weight: log.weight
+        isTrimmable: Boolean(log.is_trimmable)
       });
     } else {
       res.status(404).json({ error: 'Log not found' });
@@ -849,23 +906,36 @@ app.post('/api/logs', async (req, res) => {
     const log = created[0];
     
     res.status(201).json({
+      log_id: log.log_id,
       type: log.type,
-      rollId: log.roll_id,
+      roll_id: log.roll_id,
+      fabric_id: log.fabric_id,
+      color_id: log.color_id,
+      customer_id: log.customer_id,
+      fabric_name: log.fabric_name,
+      color_name: log.color_name,
+      customer_name: log.customer_name,
       amount_meters: parseFloat(log.amount_meters) || 0,
-      length_meters: parseFloat(log.amount_meters) || 0,
-      fabricId: log.fabric_id,
-      colorId: log.color_id,
-      fabricName: log.fabric_name,
-      colorName: log.color_name,
-      customerId: log.customer_id,
-      customerName: log.customer_name,
+      is_trimmable: Boolean(log.is_trimmable),
+      weight: log.weight,
       notes: log.notes,
       timestamp: log.timestamp,
       epoch: log.epoch,
+      timezone: log.timezone,
+      created_at: log.created_at,
+      updated_at: log.updated_at,
+      // compatibility aliases
       id: log.log_id,
+      rollId: log.roll_id,
+      fabricId: log.fabric_id,
+      colorId: log.color_id,
+      customerId: log.customer_id,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerName: log.customer_name,
+      length_meters: parseFloat(log.amount_meters) || 0,
       tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable),
-      weight: log.weight
+      isTrimmable: Boolean(log.is_trimmable)
     });
   } catch (error) {
     console.error('Error creating log:', error);
@@ -918,22 +988,36 @@ app.put('/api/logs/:id', async (req, res) => {
     const log = updated[0];
     
     res.json({
+      log_id: log.log_id,
       type: log.type,
-      rollId: log.roll_id,
+      roll_id: log.roll_id,
+      fabric_id: log.fabric_id,
+      color_id: log.color_id,
+      customer_id: log.customer_id,
+      fabric_name: log.fabric_name,
+      color_name: log.color_name,
+      customer_name: log.customer_name,
       amount_meters: parseFloat(log.amount_meters) || 0,
-      fabricId: log.fabric_id,
-      colorId: log.color_id,
-      fabricName: log.fabric_name,
-      colorName: log.color_name,
-      customerId: log.customer_id,
-      customerName: log.customer_name,
+      is_trimmable: Boolean(log.is_trimmable),
+      weight: log.weight,
       notes: log.notes,
       timestamp: log.timestamp,
       epoch: log.epoch,
+      timezone: log.timezone,
+      created_at: log.created_at,
+      updated_at: log.updated_at,
+      // compatibility aliases
       id: log.log_id,
+      rollId: log.roll_id,
+      fabricId: log.fabric_id,
+      colorId: log.color_id,
+      customerId: log.customer_id,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerName: log.customer_name,
+      length_meters: parseFloat(log.amount_meters) || 0,
       tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable),
-      weight: log.weight
+      isTrimmable: Boolean(log.is_trimmable)
     });
   } catch (error) {
     console.error('Error updating log:', error);
