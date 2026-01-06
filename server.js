@@ -13,9 +13,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT;
 
+console.log("SERVER.JS LOADED — REAL FILE");
+
 app.get("/api/__prove", (req, res) => {
   res.send("PROVE ROUTE");
 });
+
 
 
 // Middleware
