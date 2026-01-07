@@ -122,6 +122,10 @@ const buildFabricStructure = async () => {
           formattedDate = null;
         }
       }
+      // If still null (shouldn't happen for new rolls, but handle gracefully)
+      if (!formattedDate) {
+        formattedDate = new Date().toISOString().split('T')[0];
+      }
       
       rollsByColor[roll.color_id].push({
         roll_id: roll.roll_id,
@@ -802,10 +806,12 @@ app.post('/api/colors/:color_id/rolls', async (req, res) => {
 
     // Insert roll - ensure date is valid, use today if missing
     const rollDate = date && date.trim() ? date.trim() : new Date().toISOString().split('T')[0];
+    console.log('[ADD ROLL] Received date:', date, 'Using date:', rollDate);
     const [result] = await connection.query(
       'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available']
     );
+    console.log('[ADD ROLL] Inserted roll_id:', result.insertId, 'with date:', rollDate);
 
     await connection.commit();
 
