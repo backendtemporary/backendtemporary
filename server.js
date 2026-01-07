@@ -780,10 +780,7 @@ app.post('/api/colors/:color_id/rolls', async (req, res) => {
     const colorId = parseInt(req.params.color_id);
     const { date, length_meters, length_yards, is_trimmable, weight } = req.body;
 
-    // Validation
-    if (!date) {
-      return res.status(400).json({ error: 'Date is required' });
-    }
+    // Validation - date will default to today if not provided
     const lenM = parseFloat(length_meters);
     const lenY = parseFloat(length_yards);
     if (isNaN(lenM) || lenM < 0 || isNaN(lenY) || lenY < 0) {
@@ -803,10 +800,11 @@ app.post('/api/colors/:color_id/rolls', async (req, res) => {
     }
     const fabricId = colors[0].fabric_id;
 
-    // Insert roll
+    // Insert roll - ensure date is valid, use today if missing
+    const rollDate = date && date.trim() ? date.trim() : new Date().toISOString().split('T')[0];
     const [result] = await connection.query(
       'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [colorId, fabricId, date, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available']
+      [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available']
     );
 
     await connection.commit();
