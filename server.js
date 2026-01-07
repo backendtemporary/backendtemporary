@@ -112,7 +112,16 @@ const buildFabricStructure = async () => {
       const rollNum = String(rollsByColor[roll.color_id].length + 1).padStart(3, '0');
       
       // Format date to YYYY-MM-DD (remove time component if present)
-      const formattedDate = roll.date ? (roll.date.toString().split('T')[0]) : null;
+      let formattedDate = null;
+      if (roll.date) {
+        const dateStr = String(roll.date);
+        // Extract just the date part (YYYY-MM-DD) - handles both DATE and DATETIME
+        formattedDate = dateStr.split('T')[0].split(' ')[0];
+        // Ensure it's valid YYYY-MM-DD format
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(formattedDate)) {
+          formattedDate = null;
+        }
+      }
       
       rollsByColor[roll.color_id].push({
         roll_id: roll.roll_id,
