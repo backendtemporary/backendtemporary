@@ -111,12 +111,15 @@ const buildFabricStructure = async () => {
       const colorNum = String(colorIndexMap[roll.color_id]).padStart(3, '0');
       const rollNum = String(rollsByColor[roll.color_id].length + 1).padStart(3, '0');
       
+      // Format date to YYYY-MM-DD (remove time component if present)
+      const formattedDate = roll.date ? (roll.date.toString().split('T')[0]) : null;
+      
       rollsByColor[roll.color_id].push({
         roll_id: roll.roll_id,
         color_id: roll.color_id,
         fabric_id: roll.fabric_id,
         id: `FAB-${fabricNum}-COL-${colorNum}-ROL-${rollNum}`,
-        date: roll.date,
+        date: formattedDate,
         length_meters: parseFloat(roll.length_meters),
         length_yards: parseFloat(roll.length_yards),
         isTrimmable: Boolean(roll.is_trimmable),
