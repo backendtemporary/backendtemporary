@@ -777,6 +777,65 @@ app.post('/api/fabrics/:fabric_id/colors', async (req, res) => {
   }
 });
 
+// PUT /api/colors/:color_id - Update color name
+app.put('/api/colors/:color_id', async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const colorId = parseInt(req.params.color_id);
+    const { color_name } = req.body;
+
+    if (!color_name || !color_name.trim()) {
+      return res.status(400).json({ error: 'Color name is required' });
+    }
+
+    await connection.beginTransaction();
+
+    // Check color exists and get fabric_id
+    const [colors] = await connection.query(
+      'SELECT color_id, fabric_id FROM colors WHERE color_id = ?',
+      [colorId]
+    );
+    if (colors.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Color not found' });
+    }
+    const fabricId = colors[0].fabric_id;
+
+    // Check for duplicate color name (excluding current color)
+    const [existing] = await connection.query(
+      'SELECT color_id FROM colors WHERE fabric_id = ? AND color_name = ? AND color_id != ?',
+      [fabricId, color_name.trim(), colorId]
+    );
+    if (existing.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Color name already exists for this fabric' });
+    }
+
+    // Update color name
+    await connection.query(
+      'UPDATE colors SET color_name = ? WHERE color_id = ?',
+      [color_name.trim(), colorId]
+    );
+
+    await connection.commit();
+
+    // Return full fabric structure with updated color
+    const fabrics = await buildFabricStructure();
+    const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
+    if (!updatedFabric) {
+      return res.status(404).json({ error: 'Fabric not found after color update' });
+    }
+
+    res.json(updatedFabric);
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error updating color:', error);
+    res.status(500).json({ error: error.message || 'Failed to update color' });
+  } finally {
+    connection.release();
+  }
+});
+
 // POST /api/colors/:color_id/rolls - Add roll to color
 app.post('/api/colors/:color_id/rolls', async (req, res) => {
   const connection = await db.getConnection();
