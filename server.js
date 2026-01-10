@@ -1793,14 +1793,26 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
       );
     }
 
+    // Check if this transaction has already been returned (prevent duplicate returns)
+    if (!skip_log && reference_log_id) {
+      const [existingReturns] = await connection.query(
+        'SELECT log_id FROM logs WHERE type = ? AND reference_log_id = ?',
+        ['return', reference_log_id]
+      );
+      if (existingReturns.length > 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This transaction has already been returned. Each transaction can only be returned once.' });
+      }
+    }
+
     // Create log entry only if skip_log is not true (used for cancellations)
     if (!skip_log) {
       const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
       const salesperson_id = req.body.salesperson_id || null;
       const conducted_by_user_id = req.user ? req.user.user_id : null;
       await connection.query(
-        'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, salesperson_id, conducted_by_user_id]
+        'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salesperson_id, conducted_by_user_id]
       );
     }
 
@@ -1873,7 +1885,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       params.push(parseFloat(maxLength));
     }
 
-    query += ' ORDER BY l.epoch DESC';
+    query += ' ORDER BY l.epoch DESC, l.log_id DESC';
     
     const [logs] = await db.query(query, params);
     
@@ -1895,6 +1907,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       timestamp: log.timestamp,
       epoch: log.epoch,
       timezone: log.timezone,
+      reference_log_id: log.reference_log_id || null,
       transaction_group_id: log.transaction_group_id || null,
       salesperson_id: log.salesperson_id || null,
       salesperson_name: log.salesperson_name || null,
@@ -1905,6 +1918,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       updated_at: log.updated_at,
       // compatibility camelCase aliases
       id: log.log_id,
+      log_id: log.log_id,
       rollId: log.roll_id,
       fabricId: log.fabric_id || null,
       colorId: log.color_id || null,
@@ -1915,6 +1929,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       tz: log.timezone,
       isTrimmable: Boolean(log.is_trimmable),
+      referenceLogId: log.reference_log_id || null,
       transactionGroupId: log.transaction_group_id || null,
       salespersonId: log.salesperson_id || null,
       salespersonName: log.salesperson_name || null,
@@ -1961,6 +1976,7 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         timestamp: log.timestamp,
         epoch: log.epoch,
         timezone: log.timezone,
+        reference_log_id: log.reference_log_id || null,
         transaction_group_id: log.transaction_group_id || null,
         salesperson_id: log.salesperson_id || null,
         salesperson_name: log.salesperson_name || null,
@@ -1971,6 +1987,7 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         updated_at: log.updated_at,
         // compatibility aliases
         id: log.log_id,
+        log_id: log.log_id,
         rollId: log.roll_id,
         fabricId: log.fabric_id || null,
         colorId: log.color_id || null,
@@ -1981,6 +1998,7 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
         tz: log.timezone,
         isTrimmable: Boolean(log.is_trimmable),
+        referenceLogId: log.reference_log_id || null,
         transactionGroupId: log.transaction_group_id || null,
         salespersonId: log.salesperson_id || null,
         salespersonName: log.salesperson_name || null,
