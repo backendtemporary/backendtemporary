@@ -1597,7 +1597,7 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     let rollId = parseInt(req.params.roll_id) || null;
-    const { amount_meters, customer_id, customer_name, notes, timestamp, epoch, reference_log_id } = req.body;
+    const { amount_meters, customer_id, customer_name, notes, timestamp, epoch, reference_log_id, skip_log } = req.body;
     
     // If roll_id is 0 or invalid, but we have reference_log_id, look up the log to get roll_id
     if ((!rollId || rollId === 0 || isNaN(rollId)) && reference_log_id) {
@@ -1793,14 +1793,16 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
       );
     }
 
-    // Create log entry
-    const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
-    const salesperson_id = req.body.salesperson_id || null;
-    const conducted_by_user_id = req.user ? req.user.user_id : null;
-    await connection.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, salesperson_id, conducted_by_user_id]
-    );
+    // Create log entry only if skip_log is not true (used for cancellations)
+    if (!skip_log) {
+      const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
+      const salesperson_id = req.body.salesperson_id || null;
+      const conducted_by_user_id = req.user ? req.user.user_id : null;
+      await connection.query(
+        'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, salesperson_id, conducted_by_user_id]
+      );
+    }
 
     await connection.commit();
 
