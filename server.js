@@ -2141,6 +2141,190 @@ app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, re
   }
 });
 
+// ============================================
+// SALESPERSON MANAGEMENT ENDPOINTS
+// ============================================
+
+// GET /api/salespersons - List all salespersons
+app.get('/api/salespersons', authMiddleware, async (req, res) => {
+  try {
+    const { active } = req.query;
+    let query = 'SELECT * FROM salespersons';
+    const params = [];
+    
+    if (active !== undefined) {
+      query += ' WHERE active = ?';
+      params.push(active === 'true' || active === '1');
+    }
+    
+    query += ' ORDER BY name ASC';
+    
+    const [salespersons] = await db.query(query, params);
+    res.json(salespersons);
+  } catch (error) {
+    console.error('Error fetching salespersons:', error);
+    res.status(500).json({ error: 'Failed to fetch salespersons' });
+  }
+});
+
+// POST /api/salespersons - Create new salesperson
+app.post('/api/salespersons', authMiddleware, async (req, res) => {
+  try {
+    const { name, code, email, phone, active = true } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Salesperson name is required' });
+    }
+    
+    // Check if code already exists (if provided)
+    if (code) {
+      const [existing] = await db.query('SELECT salesperson_id FROM salespersons WHERE code = ?', [code]);
+      if (existing.length > 0) {
+        return res.status(409).json({ error: 'Salesperson code already exists' });
+      }
+    }
+    
+    const [result] = await db.query(
+      'INSERT INTO salespersons (name, code, email, phone, active) VALUES (?, ?, ?, ?, ?)',
+      [name.trim(), code || null, email || null, phone || null, Boolean(active)]
+    );
+    
+    const [newSalesperson] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [result.insertId]);
+    res.status(201).json(newSalesperson[0]);
+  } catch (error) {
+    console.error('Error creating salesperson:', error);
+    res.status(500).json({ error: 'Failed to create salesperson' });
+  }
+});
+
+// PUT /api/salespersons/:id - Update salesperson
+app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
+  try {
+    const salespersonId = parseInt(req.params.id);
+    const { name, code, email, phone, active } = req.body;
+    
+    const updates = {};
+    const values = [];
+    
+    if (name !== undefined) {
+      updates.name = name.trim();
+      values.push(name.trim());
+    }
+    if (code !== undefined) {
+      // Check if code is taken by another salesperson
+      const [existing] = await db.query('SELECT salesperson_id FROM salespersons WHERE code = ? AND salesperson_id != ?', [code, salespersonId]);
+      if (existing.length > 0) {
+        return res.status(409).json({ error: 'Salesperson code already exists' });
+      }
+      updates.code = code;
+      values.push(code || null);
+    }
+    if (email !== undefined) {
+      updates.email = email;
+      values.push(email || null);
+    }
+    if (phone !== undefined) {
+      updates.phone = phone;
+      values.push(phone || null);
+    }
+    if (active !== undefined) {
+      updates.active = Boolean(active);
+      values.push(Boolean(active));
+    }
+    
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    values.push(salespersonId);
+    const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
+    await db.query(`UPDATE salespersons SET ${fields} WHERE salesperson_id = ?`, values);
+    
+    const [updated] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+    res.json(updated[0]);
+  } catch (error) {
+    console.error('Error updating salesperson:', error);
+    res.status(500).json({ error: 'Failed to update salesperson' });
+  }
+});
+
+// DELETE /api/salespersons/:id - Delete salesperson (soft delete by setting active = false, or hard delete)
+app.delete('/api/salespersons/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const salespersonId = parseInt(req.params.id);
+    
+    // Check if salesperson has transactions
+    const [hasTransactions] = await db.query('SELECT COUNT(*) as count FROM logs WHERE salesperson_id = ?', [salespersonId]);
+    
+    if (hasTransactions[0].count > 0) {
+      // Soft delete - set active to false
+      await db.query('UPDATE salespersons SET active = FALSE WHERE salesperson_id = ?', [salespersonId]);
+      res.json({ success: true, message: 'Salesperson deactivated (has transactions)' });
+    } else {
+      // Hard delete - no transactions exist
+      await db.query('DELETE FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+      res.json({ success: true, message: 'Salesperson deleted' });
+    }
+  } catch (error) {
+    console.error('Error deleting salesperson:', error);
+    res.status(500).json({ error: 'Failed to delete salesperson' });
+  }
+});
+
+// GET /api/salespersons/stats - Get top sellers statistics
+app.get('/api/salespersons/stats', authMiddleware, async (req, res) => {
+  try {
+    const { limit = 10, start_date, end_date } = req.query;
+    
+    let dateFilter = '';
+    const params = [];
+    
+    if (start_date) {
+      dateFilter += ' AND l.epoch >= ?';
+      params.push(parseInt(start_date));
+    }
+    if (end_date) {
+      dateFilter += ' AND l.epoch <= ?';
+      params.push(parseInt(end_date));
+    }
+    
+    // Get top sellers by transaction count and total meters
+    const query = `
+      SELECT 
+        s.salesperson_id,
+        s.name,
+        s.code,
+        COUNT(l.log_id) as transaction_count,
+        SUM(CASE WHEN l.type IN ('sell', 'trim') THEN l.amount_meters ELSE 0 END) as total_meters_sold,
+        SUM(CASE WHEN l.type = 'sell' THEN 1 ELSE 0 END) as full_sales_count,
+        SUM(CASE WHEN l.type = 'trim' THEN 1 ELSE 0 END) as trim_count
+      FROM salespersons s
+      LEFT JOIN logs l ON s.salesperson_id = l.salesperson_id AND l.type IN ('sell', 'trim') ${dateFilter}
+      WHERE s.active = TRUE
+      GROUP BY s.salesperson_id, s.name, s.code
+      HAVING transaction_count > 0
+      ORDER BY transaction_count DESC, total_meters_sold DESC
+      LIMIT ?
+    `;
+    
+    params.push(parseInt(limit));
+    
+    const [stats] = await db.query(query, params);
+    res.json(stats.map(row => ({
+      salesperson_id: row.salesperson_id,
+      name: row.name,
+      code: row.code,
+      transaction_count: parseInt(row.transaction_count) || 0,
+      total_meters_sold: parseFloat(row.total_meters_sold) || 0,
+      full_sales_count: parseInt(row.full_sales_count) || 0,
+      trim_count: parseInt(row.trim_count) || 0
+    })));
+  } catch (error) {
+    console.error('Error fetching salesperson stats:', error);
+    res.status(500).json({ error: 'Failed to fetch salesperson statistics' });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'RisetexCo API is running' });
