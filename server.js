@@ -1499,9 +1499,11 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
 
     // Create log entry
     const now = getLebanonTimestamp();
+    const salesperson_id = req.body.salesperson_id || null;
+    const conducted_by_user_id = req.user ? req.user.user_id : null;
     await connection.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['trim', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, trimAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id]
+      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['trim', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, trimAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id, salesperson_id, conducted_by_user_id]
     );
 
     await connection.commit();
@@ -1562,9 +1564,11 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
 
     // Create log entry BEFORE deleting roll
     const now = getLebanonTimestamp();
+    const salesperson_id = req.body.salesperson_id || null;
+    const conducted_by_user_id = req.user ? req.user.user_id : null;
     await connection.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, rollLengthMeters, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id]
+      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['sell', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, rollLengthMeters, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id, salesperson_id, conducted_by_user_id]
     );
 
     // Delete roll
@@ -1667,9 +1671,11 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
 
     // Create log entry
     const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
+    const salesperson_id = req.body.salesperson_id || null;
+    const conducted_by_user_id = req.user ? req.user.user_id : null;
     await connection.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz]
+      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['return', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, returnAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, salesperson_id, conducted_by_user_id]
     );
 
     await connection.commit();
@@ -1695,44 +1701,54 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
   try {
     const { type, fabricId, colorId, rollId, start, end, minLength, maxLength } = req.query;
     
-    let query = 'SELECT * FROM logs WHERE 1=1';
+    let query = `
+      SELECT 
+        l.*,
+        s.name as salesperson_name,
+        u.username as conducted_by_username,
+        u.full_name as conducted_by_full_name
+      FROM logs l
+      LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
+      LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
+      WHERE 1=1
+    `;
     const params = [];
 
     if (type) {
-      query += ' AND type = ?';
+      query += ' AND l.type = ?';
       params.push(type);
     }
     if (fabricId) {
-      query += ' AND fabric_id = ?';
+      query += ' AND l.fabric_id = ?';
       params.push(parseInt(fabricId));
     }
     if (colorId) {
-      query += ' AND color_id = ?';
+      query += ' AND l.color_id = ?';
       params.push(parseInt(colorId));
     }
     if (rollId) {
-      query += ' AND roll_id LIKE ?';
+      query += ' AND l.roll_id LIKE ?';
       params.push(`%${rollId}%`);
     }
     if (start) {
-      query += ' AND epoch >= ?';
+      query += ' AND l.epoch >= ?';
       params.push(parseInt(start));
     }
     if (end) {
-      query += ' AND epoch <= ?';
+      query += ' AND l.epoch <= ?';
       params.push(parseInt(end));
     }
     if (minLength) {
-      query += ' AND amount_meters >= ?';
+      query += ' AND l.amount_meters >= ?';
       params.push(parseFloat(minLength));
     }
     if (maxLength) {
-      query += ' AND amount_meters <= ?';
+      query += ' AND l.amount_meters <= ?';
       params.push(parseFloat(maxLength));
     }
 
-    query += ' ORDER BY epoch DESC';
-
+    query += ' ORDER BY l.epoch DESC';
+    
     const [logs] = await db.query(query, params);
     
     // Convert database format to JSON format (expose DB columns + camelCase for compatibility)
@@ -1754,6 +1770,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       epoch: log.epoch,
       timezone: log.timezone,
       transaction_group_id: log.transaction_group_id || null,
+      salesperson_id: log.salesperson_id || null,
+      salesperson_name: log.salesperson_name || null,
+      conducted_by_user_id: log.conducted_by_user_id || null,
+      conducted_by_username: log.conducted_by_username || null,
+      conducted_by_full_name: log.conducted_by_full_name || null,
       created_at: log.created_at,
       updated_at: log.updated_at,
       // compatibility camelCase aliases
@@ -1768,7 +1789,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       tz: log.timezone,
       isTrimmable: Boolean(log.is_trimmable),
-      transactionGroupId: log.transaction_group_id || null
+      transactionGroupId: log.transaction_group_id || null,
+      salespersonId: log.salesperson_id || null,
+      salespersonName: log.salesperson_name || null,
+      conductedByUserId: log.conducted_by_user_id || null,
+      conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
     }));
 
     res.json(formattedLogs);
@@ -1780,7 +1805,17 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
 
 app.get('/api/logs/:id', authMiddleware, async (req, res) => {
   try {
-    const [logs] = await db.query('SELECT * FROM logs WHERE log_id = ?', [req.params.id]);
+    const [logs] = await db.query(`
+      SELECT 
+        l.*,
+        s.name as salesperson_name,
+        u.username as conducted_by_username,
+        u.full_name as conducted_by_full_name
+      FROM logs l
+      LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
+      LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
+      WHERE l.log_id = ?
+    `, [req.params.id]);
     if (logs.length > 0) {
       const log = logs[0];
       res.json({
@@ -1801,6 +1836,11 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         epoch: log.epoch,
         timezone: log.timezone,
         transaction_group_id: log.transaction_group_id || null,
+        salesperson_id: log.salesperson_id || null,
+        salesperson_name: log.salesperson_name || null,
+        conducted_by_user_id: log.conducted_by_user_id || null,
+        conducted_by_username: log.conducted_by_username || null,
+        conducted_by_full_name: log.conducted_by_full_name || null,
         created_at: log.created_at,
         updated_at: log.updated_at,
         // compatibility aliases
@@ -1815,7 +1855,11 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
         tz: log.timezone,
         isTrimmable: Boolean(log.is_trimmable),
-        transactionGroupId: log.transaction_group_id || null
+        transactionGroupId: log.transaction_group_id || null,
+        salespersonId: log.salesperson_id || null,
+        salespersonName: log.salesperson_name || null,
+        conductedByUserId: log.conducted_by_user_id || null,
+        conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
       });
     } else {
       res.status(404).json({ error: 'Log not found' });
@@ -1949,12 +1993,14 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       notes: entry.notes || null,
       timestamp: entry.timestamp || now.iso,
       epoch: entry.epoch || now.epoch,
-      timezone: 'Asia/Beirut'
+      timezone: 'Asia/Beirut',
+      salesperson_id: entry.salesperson_id || null,
+      conducted_by_user_id: req.user ? req.user.user_id : null
     };
 
     const [result] = await db.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone]
+      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone, logData.salesperson_id, logData.conducted_by_user_id]
     );
 
     // Return DB reality
