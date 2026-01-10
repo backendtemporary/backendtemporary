@@ -3,9 +3,13 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 import db from './db.js';
 
 import pool from "./db.js";
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,14 +62,70 @@ app.get('/api', (req, res) => {
   res.status(200).send('API root');
 });
 
-// Authentication middleware must not block public health endpoints
-// Replace `authMiddleware` with your real auth when ready
-const authMiddleware = (req, res, next) => next();
+// ============================================
+// AUTHENTICATION & AUTHORIZATION MIDDLEWARE
+// ============================================
 
-app.use('/api', (req, res, next) => {
-  if (req.path === '/' || req.path === '/health') return next();
-  return authMiddleware(req, res, next);
-});
+// Extract token from Authorization header
+const extractToken = (req) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  return null;
+};
+
+// Authentication middleware - verifies JWT token
+const authMiddleware = async (req, res, next) => {
+  // Allow public endpoints
+  const publicPaths = ['/health', '/auth/login', '/auth/register'];
+  if (publicPaths.includes(req.path)) {
+    return next();
+  }
+
+  try {
+    const token = extractToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Verify user still exists and get current role
+    const [users] = await db.query('SELECT user_id, username, email, role, full_name FROM users WHERE user_id = ?', [decoded.userId]);
+    if (users.length === 0) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    req.user = users[0];
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired' });
+    }
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    console.error('Auth middleware error:', error);
+    return res.status(500).json({ error: 'Authentication error' });
+  }
+};
+
+// Permission check middleware - requires specific role
+const requireRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+};
+
+// Apply auth middleware to protected routes (will be applied selectively)
+// Public routes are handled individually
 
 // ============================================
 // DATABASE HELPER FUNCTIONS
@@ -395,10 +455,374 @@ const mapCustomer = (row) => ({
 });
 
 // ============================================
+// AUTHENTICATION ENDPOINTS (Public)
+// ============================================
+
+// POST /api/auth/login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    
+    if (!password) {
+      return res.status(400).json({ error: 'Password is required' });
+    }
+    
+    const identifier = username || email;
+    if (!identifier) {
+      return res.status(400).json({ error: 'Username or email is required' });
+    }
+
+    // Find user by username or email
+    const [users] = await db.query(
+      'SELECT user_id, username, email, password_hash, role, full_name FROM users WHERE username = ? OR email = ?',
+      [identifier, identifier]
+    );
+
+    if (users.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const user = users[0];
+
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.user_id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Return user info (without password hash) and token
+    res.json({
+      token,
+      user: {
+        user_id: user.user_id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        full_name: user.full_name
+      }
+    });
+  } catch (error) {
+    console.error('Error during login:', error);
+    res.status(500).json({ error: 'Failed to login' });
+  }
+});
+
+// POST /api/auth/register (admin only - but allow first user to be admin)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password, role = 'limited', full_name } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'Username, email, and password are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // Check if this is the first user (allow them to be admin)
+    const [existingUsers] = await db.query('SELECT COUNT(*) as count FROM users');
+    const isFirstUser = existingUsers[0].count === 0;
+    const finalRole = isFirstUser ? 'admin' : role;
+
+    // If not first user, require admin role to create other admins
+    if (!isFirstUser && role === 'admin') {
+      // Check if requester is admin (from token)
+      const token = extractToken(req);
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          const [adminCheck] = await db.query('SELECT role FROM users WHERE user_id = ?', [decoded.userId]);
+          if (adminCheck.length === 0 || adminCheck[0].role !== 'admin') {
+            return res.status(403).json({ error: 'Only admins can create admin accounts' });
+          }
+        } catch (err) {
+          return res.status(403).json({ error: 'Only admins can create admin accounts' });
+        }
+      } else {
+        return res.status(403).json({ error: 'Only admins can create admin accounts' });
+      }
+    }
+
+    // Check if username or email already exists
+    const [existing] = await db.query(
+      'SELECT user_id FROM users WHERE username = ? OR email = ?',
+      [username, email]
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({ error: 'Username or email already exists' });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create user
+    const [result] = await db.query(
+      'INSERT INTO users (username, email, password_hash, role, full_name) VALUES (?, ?, ?, ?, ?)',
+      [username, email, passwordHash, finalRole, full_name || null]
+    );
+
+    const [newUser] = await db.query(
+      'SELECT user_id, username, email, role, full_name FROM users WHERE user_id = ?',
+      [result.insertId]
+    );
+
+    res.status(201).json(newUser[0]);
+  } catch (error) {
+    console.error('Error during registration:', error);
+    res.status(500).json({ error: 'Failed to register user' });
+  }
+});
+
+// GET /api/auth/me - Get current user info
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    res.json({
+      user_id: req.user.user_id,
+      username: req.user.username,
+      email: req.user.email,
+      role: req.user.role,
+      full_name: req.user.full_name
+    });
+  } catch (error) {
+    console.error('Error fetching current user:', error);
+    res.status(500).json({ error: 'Failed to fetch user info' });
+  }
+});
+
+// ============================================
+// USER MANAGEMENT ENDPOINTS (Admin Only)
+// ============================================
+
+// GET /api/users - List all users (admin only)
+app.get('/api/users', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const [users] = await db.query(
+      'SELECT user_id, username, email, role, full_name, created_at, updated_at FROM users ORDER BY created_at DESC'
+    );
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// PUT /api/users/:id - Update user (admin only)
+app.put('/api/users/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const { username, email, role, full_name, password } = req.body;
+
+    // Don't allow changing your own role (security)
+    if (req.user.user_id === userId && role && role !== req.user.role) {
+      return res.status(403).json({ error: 'Cannot change your own role' });
+    }
+
+    const updates = [];
+    const values = [];
+
+    if (username) {
+      // Check if username is taken by another user
+      const [existing] = await db.query('SELECT user_id FROM users WHERE username = ? AND user_id != ?', [username, userId]);
+      if (existing.length > 0) {
+        return res.status(409).json({ error: 'Username already taken' });
+      }
+      updates.push('username = ?');
+      values.push(username);
+    }
+
+    if (email) {
+      // Check if email is taken by another user
+      const [existing] = await db.query('SELECT user_id FROM users WHERE email = ? AND user_id != ?', [email, userId]);
+      if (existing.length > 0) {
+        return res.status(409).json({ error: 'Email already taken' });
+      }
+      updates.push('email = ?');
+      values.push(email);
+    }
+
+    if (role && ['admin', 'limited'].includes(role)) {
+      updates.push('role = ?');
+      values.push(role);
+    }
+
+    if (full_name !== undefined) {
+      updates.push('full_name = ?');
+      values.push(full_name || null);
+    }
+
+    if (password) {
+      if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+      const passwordHash = await bcrypt.hash(password, 10);
+      updates.push('password_hash = ?');
+      values.push(passwordHash);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    values.push(userId);
+    const sql = `UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`;
+    await db.query(sql, values);
+
+    const [updated] = await db.query(
+      'SELECT user_id, username, email, role, full_name, created_at, updated_at FROM users WHERE user_id = ?',
+      [userId]
+    );
+
+    res.json(updated[0]);
+  } catch (error) {
+    console.error('Error updating user:', error);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// DELETE /api/users/:id - Delete user (admin only)
+app.delete('/api/users/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+
+    // Don't allow deleting yourself
+    if (req.user.user_id === userId) {
+      return res.status(403).json({ error: 'Cannot delete your own account' });
+    }
+
+    await db.query('DELETE FROM users WHERE user_id = ?', [userId]);
+    res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// ============================================
+// DELETION REQUESTS ENDPOINTS
+// ============================================
+
+// POST /api/deletion-requests - Create deletion request (limited users)
+app.post('/api/deletion-requests', authMiddleware, async (req, res) => {
+  try {
+    const { request_type, target_id, target_name, reason } = req.body;
+
+    if (!request_type || !target_id) {
+      return res.status(400).json({ error: 'Request type and target ID are required' });
+    }
+
+    const validTypes = ['delete_fabric', 'delete_color', 'delete_roll', 'cancel_transaction'];
+    if (!validTypes.includes(request_type)) {
+      return res.status(400).json({ error: 'Invalid request type' });
+    }
+
+    // Limited users can create requests, admins can too (but usually don't need to)
+    await db.query(
+      'INSERT INTO deletion_requests (requested_by_user_id, request_type, target_id, target_name, reason, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.user.user_id, request_type, target_id, target_name || null, reason || null, 'pending']
+    );
+
+    res.status(201).json({ success: true, message: 'Deletion request created' });
+  } catch (error) {
+    console.error('Error creating deletion request:', error);
+    res.status(500).json({ error: 'Failed to create deletion request' });
+  }
+});
+
+// GET /api/deletion-requests - Get deletion requests (admin sees all, limited users see their own)
+app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
+  try {
+    let sql = `
+      SELECT 
+        dr.*,
+        u.username as requested_by_username,
+        u.full_name as requested_by_name,
+        reviewer.username as reviewed_by_username
+      FROM deletion_requests dr
+      JOIN users u ON dr.requested_by_user_id = u.user_id
+      LEFT JOIN users reviewer ON dr.reviewed_by_user_id = reviewer.user_id
+    `;
+    const params = [];
+
+    // Limited users only see their own requests
+    if (req.user.role !== 'admin') {
+      sql += ' WHERE dr.requested_by_user_id = ?';
+      params.push(req.user.user_id);
+    }
+
+    sql += ' ORDER BY dr.created_at DESC';
+
+    const [requests] = await db.query(sql, params);
+    res.json(requests);
+  } catch (error) {
+    console.error('Error fetching deletion requests:', error);
+    res.status(500).json({ error: 'Failed to fetch deletion requests' });
+  }
+});
+
+// PUT /api/deletion-requests/:id/approve - Approve deletion request (admin only)
+app.put('/api/deletion-requests/:id/approve', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id);
+
+    // Get the request
+    const [requests] = await db.query('SELECT * FROM deletion_requests WHERE request_id = ?', [requestId]);
+    if (requests.length === 0) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+
+    const deletionRequest = requests[0];
+    if (deletionRequest.status !== 'pending') {
+      return res.status(400).json({ error: 'Request is not pending' });
+    }
+
+    // Mark as approved
+    await db.query(
+      'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
+      ['approved', req.user.user_id, requestId]
+    );
+
+    // Execute the deletion based on request type
+    // Note: The actual deletion logic will be handled by existing endpoints
+    // This just marks the request as approved - the admin will still need to perform the actual deletion
+    // OR you can implement the deletion here directly
+
+    res.json({ success: true, message: 'Request approved' });
+  } catch (error) {
+    console.error('Error approving deletion request:', error);
+    res.status(500).json({ error: 'Failed to approve request' });
+  }
+});
+
+// PUT /api/deletion-requests/:id/reject - Reject deletion request (admin only)
+app.put('/api/deletion-requests/:id/reject', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id);
+
+    await db.query(
+      'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
+      ['rejected', req.user.user_id, requestId]
+    );
+
+    res.json({ success: true, message: 'Request rejected' });
+  } catch (error) {
+    console.error('Error rejecting deletion request:', error);
+    res.status(500).json({ error: 'Failed to reject request' });
+  }
+});
+
+// ============================================
 // CUSTOMERS ENDPOINTS
 // ============================================
 
-app.get('/api/customers', async (req, res) => {
+app.get('/api/customers', authMiddleware, async (req, res) => {
   try {
     const search = (req.query.search || '').trim();
     let sql = 'SELECT * FROM customers';
@@ -416,7 +840,7 @@ app.get('/api/customers', async (req, res) => {
   }
 });
 
-app.get('/api/customers/:id', async (req, res) => {
+app.get('/api/customers/:id', authMiddleware, async (req, res) => {
   try {
     const [rows] = await db.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Customer not found' });
@@ -427,7 +851,7 @@ app.get('/api/customers/:id', async (req, res) => {
   }
 });
 
-app.post('/api/customers', async (req, res) => {
+app.post('/api/customers', authMiddleware, async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     if (!name || !name.trim()) {
@@ -445,7 +869,7 @@ app.post('/api/customers', async (req, res) => {
   }
 });
 
-app.put('/api/customers/:id', async (req, res) => {
+app.put('/api/customers/:id', authMiddleware, async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     const updates = {};
@@ -471,7 +895,7 @@ app.put('/api/customers/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/customers/:id', async (req, res) => {
+app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
   try {
     // Check if customer has associated logs
     const [logs] = await db.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
@@ -501,7 +925,7 @@ app.delete('/api/customers/:id', async (req, res) => {
 // ============================================
 
 // GET all fabrics
-app.get('/api/fabrics', async (req, res) => {
+app.get('/api/fabrics', authMiddleware, async (req, res) => {
   try {
     const fabrics = await buildFabricStructure();
     res.json(fabrics);
@@ -512,7 +936,7 @@ app.get('/api/fabrics', async (req, res) => {
 });
 
 // GET single fabric by fabric_id (DB ID, not array index)
-app.get('/api/fabrics/:fabric_id', async (req, res) => {
+app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const [rows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
@@ -533,7 +957,7 @@ app.get('/api/fabrics/:fabric_id', async (req, res) => {
 });
 
 // POST create new fabric
-app.post('/api/fabrics', async (req, res) => {
+app.post('/api/fabrics', authMiddleware, async (req, res) => {
   try {
     const { fabric_name, fabric_code, main_code, source, design } = req.body;
     
@@ -569,7 +993,7 @@ app.post('/api/fabrics', async (req, res) => {
 });
 
 // PUT update single fabric by fabric_id
-app.put('/api/fabrics/:fabric_id', async (req, res) => {
+app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const { fabric_name, fabric_code, main_code, source, design } = req.body;
@@ -620,7 +1044,7 @@ app.put('/api/fabrics/:fabric_id', async (req, res) => {
 });
 
 // DELETE fabric by fabric_id with cascade (PRESERVES LOGS)
-app.delete('/api/fabrics/:fabric_id', async (req, res) => {
+app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
@@ -653,7 +1077,7 @@ app.delete('/api/fabrics/:fabric_id', async (req, res) => {
 });
 
 // DELETE color by color_id with cascade to rolls
-app.delete('/api/colors/:color_id', async (req, res) => {
+app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -683,7 +1107,7 @@ app.delete('/api/colors/:color_id', async (req, res) => {
 });
 
 // DELETE roll by roll_id
-app.delete('/api/rolls/:roll_id', async (req, res) => {
+app.delete('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
@@ -713,7 +1137,7 @@ app.delete('/api/rolls/:roll_id', async (req, res) => {
 
 // PUT bulk update - DEPRECATED: Use granular endpoints instead
 // Kept for backward compatibility but should be phased out
-app.put('/api/fabrics', async (req, res) => {
+app.put('/api/fabrics', authMiddleware, async (req, res) => {
   try {
     console.warn('PUT /api/fabrics: Bulk save endpoint is deprecated. Use granular endpoints instead.');
     
@@ -754,7 +1178,7 @@ app.put('/api/fabrics', async (req, res) => {
 // ============================================
 
 // POST /api/fabrics/:fabric_id/colors - Add color to fabric
-app.post('/api/fabrics/:fabric_id/colors', async (req, res) => {
+app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
@@ -809,7 +1233,7 @@ app.post('/api/fabrics/:fabric_id/colors', async (req, res) => {
 });
 
 // PUT /api/colors/:color_id - Update color name
-app.put('/api/colors/:color_id', async (req, res) => {
+app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -868,7 +1292,7 @@ app.put('/api/colors/:color_id', async (req, res) => {
 });
 
 // POST /api/colors/:color_id/rolls - Add roll to color
-app.post('/api/colors/:color_id/rolls', async (req, res) => {
+app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
@@ -920,8 +1344,8 @@ app.post('/api/colors/:color_id/rolls', async (req, res) => {
   }
 });
 
-// PUT /api/rolls/:roll_id - Update roll (length, date, weight, etc.)
-app.put('/api/rolls/:roll_id', async (req, res) => {
+// PUT /api/rolls/:roll_id - Update roll (length, date, weight, etc.) - Admin only
+app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
@@ -1004,7 +1428,7 @@ app.put('/api/rolls/:roll_id', async (req, res) => {
 });
 
 // POST /api/rolls/:roll_id/trim - Trim roll (transactional, creates log)
-app.post('/api/rolls/:roll_id/trim', async (req, res) => {
+app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
@@ -1096,7 +1520,7 @@ app.post('/api/rolls/:roll_id/trim', async (req, res) => {
 });
 
 // POST /api/rolls/:roll_id/sell - Sell roll (transactional, creates log)
-app.post('/api/rolls/:roll_id/sell', async (req, res) => {
+app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
@@ -1162,7 +1586,7 @@ app.post('/api/rolls/:roll_id/sell', async (req, res) => {
 });
 
 // POST /api/rolls/:roll_id/return - Return roll (transactional, creates log, adds length back)
-app.post('/api/rolls/:roll_id/return', async (req, res) => {
+app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
@@ -1267,7 +1691,7 @@ app.post('/api/rolls/:roll_id/return', async (req, res) => {
 // LOGS ENDPOINTS (Accept fabricIndex/colorIndex, store fabricId/colorId)
 // ============================================
 
-app.get('/api/logs', async (req, res) => {
+app.get('/api/logs', authMiddleware, async (req, res) => {
   try {
     const { type, fabricId, colorId, rollId, start, end, minLength, maxLength } = req.query;
     
@@ -1354,7 +1778,7 @@ app.get('/api/logs', async (req, res) => {
   }
 });
 
-app.get('/api/logs/:id', async (req, res) => {
+app.get('/api/logs/:id', authMiddleware, async (req, res) => {
   try {
     const [logs] = await db.query('SELECT * FROM logs WHERE log_id = ?', [req.params.id]);
     if (logs.length > 0) {
@@ -1403,7 +1827,7 @@ app.get('/api/logs/:id', async (req, res) => {
 });
 
 // GET /api/transaction-groups/:transaction_group_id - Get transaction group with all related logs (for delivery permit)
-app.get('/api/transaction-groups/:transaction_group_id', async (req, res) => {
+app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (req, res) => {
   try {
     const transactionGroupId = req.params.transaction_group_id;
     
@@ -1482,7 +1906,7 @@ app.get('/api/transaction-groups/:transaction_group_id', async (req, res) => {
   }
 });
 
-app.post('/api/logs', async (req, res) => {
+app.post('/api/logs', authMiddleware, async (req, res) => {
   try {
     const entry = req.body || {};
     const now = getLebanonTimestamp();
@@ -1579,7 +2003,7 @@ app.post('/api/logs', async (req, res) => {
   }
 });
 
-app.put('/api/logs/:id', async (req, res) => {
+app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const logId = parseInt(req.params.id);
     const updates = req.body;
@@ -1657,7 +2081,7 @@ app.put('/api/logs/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/logs/:id', async (req, res) => {
+app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const [result] = await db.query('DELETE FROM logs WHERE log_id = ?', [req.params.id]);
     if (result.affectedRows > 0) {
