@@ -142,7 +142,8 @@ const buildFabricStructure = async () => {
   try {
     const [fabrics] = await db.query('SELECT * FROM fabrics ORDER BY fabric_id');
     const [colors] = await db.query('SELECT * FROM colors ORDER BY fabric_id, color_id');
-    const [rolls] = await db.query('SELECT * FROM rolls ORDER BY color_id, roll_id');
+    // Only fetch rolls that are not sold (sold = false or NULL)
+    const [rolls] = await db.query('SELECT * FROM rolls WHERE (sold = FALSE OR sold IS NULL) ORDER BY color_id, roll_id');
 
     // First pass: assign sequential color indices within each fabric
     const colorIndexMap = {}; // Maps color_id to its sequential index within fabric
@@ -1474,9 +1475,11 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
     const newLengthM = Math.max(0, currentLength - trimAmount);
     const newLengthY = newLengthM * 1.09361;
 
-    // Update roll (or delete if length becomes 0)
+    // Update roll (or mark as sold if length becomes 0)
+    // We keep the roll in the database so roll_id can be used for returns/cancels
     if (newLengthM <= 0) {
-      await connection.query('DELETE FROM rolls WHERE roll_id = ?', [rollId]);
+      // Mark as sold instead of deleting, so roll_id remains valid for transaction history
+      await connection.query('UPDATE rolls SET length_meters = 0, length_yards = 0, sold = TRUE WHERE roll_id = ?', [rollId]);
     } else {
       await connection.query(
         'UPDATE rolls SET length_meters = ?, length_yards = ? WHERE roll_id = ?',
@@ -1562,7 +1565,7 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
       );
     }
 
-    // Create log entry BEFORE deleting roll
+    // Create log entry BEFORE marking as sold
     const now = getLebanonTimestamp();
     const salesperson_id = req.body.salesperson_id || null;
     const conducted_by_user_id = req.user ? req.user.user_id : null;
@@ -1571,8 +1574,8 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
       ['sell', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, rollLengthMeters, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id, salesperson_id, conducted_by_user_id]
     );
 
-    // Delete roll
-    await connection.query('DELETE FROM rolls WHERE roll_id = ?', [rollId]);
+    // Mark roll as sold instead of deleting, so roll_id remains valid for transaction history
+    await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [rollId]);
 
     await connection.commit();
 
@@ -1593,8 +1596,46 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
 app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
-    const rollId = parseInt(req.params.roll_id);
-    const { amount_meters, customer_id, customer_name, notes, timestamp, epoch } = req.body;
+    let rollId = parseInt(req.params.roll_id) || null;
+    const { amount_meters, customer_id, customer_name, notes, timestamp, epoch, reference_log_id } = req.body;
+    
+    // If roll_id is 0 or invalid, but we have reference_log_id, look up the log to get roll_id
+    if ((!rollId || rollId === 0 || isNaN(rollId)) && reference_log_id) {
+      const [referenceLog] = await connection.query(
+        'SELECT roll_id, fabric_id, color_id, is_trimmable, weight, type FROM logs WHERE log_id = ?',
+        [reference_log_id]
+      );
+      if (referenceLog.length > 0) {
+        const refLog = referenceLog[0];
+        rollId = refLog.roll_id;
+        
+        // If roll_id is still NULL in the reference log, we need to create a new roll_id
+        // This can happen if the log was created incorrectly
+        if (!rollId || rollId === null) {
+          // Generate a new roll_id - we'll need fabric_id and color_id from the log
+          if (refLog.fabric_id && refLog.color_id) {
+            // Get the next available roll_id for this color
+            const [maxRoll] = await connection.query(
+              'SELECT MAX(roll_id) as max_id FROM rolls WHERE color_id = ?',
+              [refLog.color_id]
+            );
+            rollId = maxRoll.length > 0 && maxRoll[0].max_id ? maxRoll[0].max_id + 1 : 1;
+            console.log(`Generated new roll_id ${rollId} for return operation from log ${reference_log_id}`);
+          } else {
+            await connection.rollback();
+            return res.status(400).json({ error: 'Cannot determine roll_id: reference log is missing fabric_id or color_id' });
+          }
+        }
+      } else {
+        await connection.rollback();
+        return res.status(404).json({ error: `Reference log ${reference_log_id} not found` });
+      }
+    }
+    
+    if (!rollId || rollId === 0 || isNaN(rollId)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Invalid roll_id and no reference_log_id provided' });
+    }
 
     // Validation
     const returnAmount = parseFloat(amount_meters);
@@ -1604,11 +1645,16 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
 
     await connection.beginTransaction();
 
-    // Get roll with lock (roll may not exist if it was sold, so we need to recreate it)
-    const [rolls] = await connection.query(
-      'SELECT roll_id, color_id, fabric_id, length_meters, length_yards, is_trimmable, weight FROM rolls WHERE roll_id = ? FOR UPDATE',
-      [rollId]
-    );
+      // Get roll with lock (roll may be marked as sold, but it should still exist in the database)
+      // If rollId is 0 or invalid, skip the roll lookup (we'll create from log data)
+      let [rolls] = [];
+      if (rollId && !isNaN(rollId) && rollId > 0) {
+        // Fetch roll even if it's marked as sold - we need it for return operations
+        [rolls] = await connection.query(
+          'SELECT roll_id, color_id, fabric_id, length_meters, length_yards, is_trimmable, weight, sold FROM rolls WHERE roll_id = ? FOR UPDATE',
+          [rollId]
+        );
+      }
 
     let roll;
     let isNewRoll = false;
@@ -1616,25 +1662,65 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
     if (rolls.length === 0) {
       // Roll doesn't exist (was sold), need to recreate it
       // Get color and fabric info from logs
-      const [logData] = await connection.query(
-        'SELECT fabric_id, color_id, is_trimmable, weight FROM logs WHERE roll_id = ? AND type = ? ORDER BY epoch DESC LIMIT 1',
+      // Try to find by roll_id first, then try by looking up recent sell logs if roll_id doesn't match
+      let [logData] = await connection.query(
+        'SELECT fabric_id, color_id, is_trimmable, weight, roll_id FROM logs WHERE roll_id = ? AND type = ? ORDER BY epoch DESC LIMIT 1',
         [rollId, 'sell']
       );
       
+      // If not found by exact roll_id match, try to find any recent sell log for this fabric/color
+      // This handles cases where roll_id might have been NULL or mismatched
       if (logData.length === 0) {
-        await connection.rollback();
-        return res.status(404).json({ error: 'Roll not found and no sell log found to recreate from' });
+        console.warn(`No sell log found for roll_id ${rollId}, trying alternative lookup...`);
+        // Try to find recent sell logs that might match (last resort)
+        [logData] = await connection.query(
+          'SELECT fabric_id, color_id, is_trimmable, weight, roll_id FROM logs WHERE type = ? ORDER BY epoch DESC LIMIT 10',
+          ['sell']
+        );
+        // Filter for logs that might be related (same fabric/color pattern, or just use the most recent)
+        if (logData.length > 0) {
+          // Use the most recent sell log as fallback
+          console.warn(`Using fallback: most recent sell log with roll_id ${logData[0].roll_id}`);
+        }
+      }
+      
+      if (logData.length === 0) {
+        // Roll_id might be NULL in the log. Try to find the sell log using log_id if provided
+        // Check if request body has a reference_log_id to help identify which log entry this return corresponds to
+        const referenceLogId = req.body.reference_log_id || null;
+        if (referenceLogId) {
+          // Find the sell log by log_id instead of roll_id
+          [logData] = await connection.query(
+            'SELECT fabric_id, color_id, is_trimmable, weight, roll_id, amount_meters FROM logs WHERE log_id = ? AND type = ?',
+            [referenceLogId, 'sell']
+          );
+        }
+        
+        if (logData.length === 0) {
+          await connection.rollback();
+          return res.status(404).json({ 
+            error: `Roll not found and no sell log found to recreate from. Roll ID: ${rollId}. If roll_id is NULL in the log, please provide reference_log_id in the request body.` 
+          });
+        }
       }
 
       const log = logData[0];
+      // Validate we have all required information
+      if (!log.fabric_id || !log.color_id) {
+        await connection.rollback();
+        return res.status(400).json({ 
+          error: `Incomplete log data: missing fabric_id or color_id. Cannot recreate roll.` 
+        });
+      }
+      
       roll = {
         roll_id: rollId,
         color_id: log.color_id,
         fabric_id: log.fabric_id,
         length_meters: 0,
         length_yards: 0,
-        is_trimmable: log.is_trimmable,
-        weight: log.weight
+        is_trimmable: log.is_trimmable !== null && log.is_trimmable !== undefined ? Boolean(log.is_trimmable) : true,
+        weight: log.weight || 'N/A'
       };
       isNewRoll = true;
     } else {
@@ -1658,13 +1744,15 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
     const newLengthY = newLengthM * 1.09361;
 
     if (isNewRoll) {
+      // When recreating a sold roll, mark it as not sold
       await connection.query(
-        'INSERT INTO rolls (roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, CURDATE(), ?, ?, ?, ?, ?)',
+        'INSERT INTO rolls (roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, ?, CURDATE(), ?, ?, ?, ?, ?, FALSE)',
         [rollId, roll.color_id, roll.fabric_id, newLengthM, newLengthY, roll.is_trimmable, roll.weight || 'N/A', 'available']
       );
     } else {
+      // When returning to an existing roll, restore length and mark as not sold
       await connection.query(
-        'UPDATE rolls SET length_meters = ?, length_yards = ? WHERE roll_id = ?',
+        'UPDATE rolls SET length_meters = ?, length_yards = ?, sold = FALSE WHERE roll_id = ?',
         [newLengthM, newLengthY, rollId]
       );
     }
