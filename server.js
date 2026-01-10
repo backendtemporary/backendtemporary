@@ -1739,8 +1739,44 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
     const fabric = fabrics[0];
     const color = colors[0];
 
-    // Update or create roll
-    const newLengthM = parseFloat(roll.length_meters) + returnAmount;
+    // Determine the correct length to restore
+    // If roll is marked as sold, restore to exactly the returnAmount (what was sold)
+    // Otherwise, add to existing length (for trim returns or partial returns)
+    let newLengthM;
+    let originalTransactionType = null;
+    
+    // Check if we have a reference log to determine original transaction type
+    // This helps us know if we're canceling a sell vs trim transaction
+    if (reference_log_id) {
+      const [refLogData] = await connection.query(
+        'SELECT type, amount_meters FROM logs WHERE log_id = ?',
+        [reference_log_id]
+      );
+      if (refLogData.length > 0) {
+        originalTransactionType = refLogData[0].type;
+      }
+    }
+    
+    // MySQL BOOLEAN is stored as TINYINT(1): 1 = true, 0 = false
+    // MySQL2 returns it as 0 or 1 (number), not true/false
+    const isSold = roll.sold === true || roll.sold === 1 || roll.sold === '1' || Boolean(roll.sold);
+    
+    // If roll is sold OR the original transaction was a sell, restore to exactly what was sold (returnAmount)
+    // This fixes the bug where canceling a sell transaction would double the length
+    // When a roll is sold, its length_meters still contains the original length, so adding returnAmount
+    // would give us double the amount instead of the correct amount that was actually sold
+    if (isSold || originalTransactionType === 'sell') {
+      // Restore to exactly the amount that was sold/returned
+      newLengthM = returnAmount;
+      console.log(`Restoring sold roll ${rollId} to exact length: ${returnAmount}m (was ${roll.length_meters}m, sold=${roll.sold}, originalType=${originalTransactionType})`);
+    } else {
+      // For trim returns or returns to non-sold rolls, add to existing length
+      // This handles cases where a roll was partially trimmed and we're returning some of it
+      const currentLength = parseFloat(roll.length_meters) || 0;
+      newLengthM = currentLength + returnAmount;
+      console.log(`Adding return amount to existing roll ${rollId}: ${currentLength}m + ${returnAmount}m = ${newLengthM}m (sold=${roll.sold}, originalType=${originalTransactionType})`);
+    }
+    
     const newLengthY = newLengthM * 1.09361;
 
     if (isNewRoll) {
