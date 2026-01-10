@@ -352,6 +352,37 @@ function getLebanonTimestamp(date = new Date()) {
   return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
 }
 
+// Helper to create or update transaction group
+// Called within a database transaction, expects a connection
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters) {
+  if (!transactionGroupId) return;
+  
+  const now = getLebanonTimestamp();
+  
+  // Check if transaction group already exists
+  const [existing] = await connection.query(
+    'SELECT transaction_group_id, total_items, total_meters, notes FROM transaction_groups WHERE transaction_group_id = ?',
+    [transactionGroupId]
+  );
+  
+  if (existing.length === 0) {
+    // Create new transaction group
+    await connection.query(
+      'INSERT INTO transaction_groups (transaction_group_id, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)',
+      [transactionGroupId, customerId || null, customerName || null, now.iso, now.epoch, now.tz, amountMeters, notes || null]
+    );
+  } else {
+    // Update existing transaction group - increment items and add to total meters
+    const current = existing[0];
+    // Preserve existing notes if new notes are null/empty, otherwise use new notes
+    const finalNotes = (notes && notes.trim()) ? notes : (current.notes || null);
+    await connection.query(
+      'UPDATE transaction_groups SET total_items = ?, total_meters = ?, notes = ? WHERE transaction_group_id = ?',
+      [current.total_items + 1, parseFloat(current.total_meters) + amountMeters, finalNotes, transactionGroupId]
+    );
+  }
+}
+
 // Map customer row to API shape
 const mapCustomer = (row) => ({
   id: row.customer_id,
@@ -1029,9 +1060,21 @@ app.post('/api/rolls/:roll_id/trim', async (req, res) => {
       );
     }
 
+    // Handle transaction group creation/update
+    const transaction_group_id = req.body.transaction_group_id || null;
+    if (transaction_group_id) {
+      await createOrUpdateTransactionGroup(
+        connection,
+        transaction_group_id,
+        customer_id,
+        customer_name,
+        notes,
+        trimAmount
+      );
+    }
+
     // Create log entry
     const now = getLebanonTimestamp();
-    const transaction_group_id = req.body.transaction_group_id || null;
     await connection.query(
       'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ['trim', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, trimAmount, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id]
@@ -1079,12 +1122,25 @@ app.post('/api/rolls/:roll_id/sell', async (req, res) => {
     const fabric = fabrics[0];
     const color = colors[0];
 
+    // Handle transaction group creation/update
+    const transaction_group_id = req.body.transaction_group_id || null;
+    const rollLengthMeters = parseFloat(roll.length_meters);
+    if (transaction_group_id) {
+      await createOrUpdateTransactionGroup(
+        connection,
+        transaction_group_id,
+        customer_id,
+        customer_name,
+        notes,
+        rollLengthMeters
+      );
+    }
+
     // Create log entry BEFORE deleting roll
     const now = getLebanonTimestamp();
-    const transaction_group_id = req.body.transaction_group_id || null;
     await connection.query(
       'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, parseFloat(roll.length_meters), roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id]
+      ['sell', rollId, roll.fabric_id, roll.color_id, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, rollLengthMeters, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transaction_group_id]
     );
 
     // Delete roll
@@ -1273,6 +1329,7 @@ app.get('/api/logs', async (req, res) => {
       timestamp: log.timestamp,
       epoch: log.epoch,
       timezone: log.timezone,
+      transaction_group_id: log.transaction_group_id || null,
       created_at: log.created_at,
       updated_at: log.updated_at,
       // compatibility camelCase aliases
@@ -1286,7 +1343,8 @@ app.get('/api/logs', async (req, res) => {
       customerName: log.customer_name,
       length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable)
+      isTrimmable: Boolean(log.is_trimmable),
+      transactionGroupId: log.transaction_group_id || null
     }));
 
     res.json(formattedLogs);
@@ -1318,6 +1376,7 @@ app.get('/api/logs/:id', async (req, res) => {
         timestamp: log.timestamp,
         epoch: log.epoch,
         timezone: log.timezone,
+        transaction_group_id: log.transaction_group_id || null,
         created_at: log.created_at,
         updated_at: log.updated_at,
         // compatibility aliases
@@ -1331,7 +1390,8 @@ app.get('/api/logs/:id', async (req, res) => {
         customerName: log.customer_name,
         length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
         tz: log.timezone,
-        isTrimmable: Boolean(log.is_trimmable)
+        isTrimmable: Boolean(log.is_trimmable),
+        transactionGroupId: log.transaction_group_id || null
       });
     } else {
       res.status(404).json({ error: 'Log not found' });
@@ -1339,6 +1399,86 @@ app.get('/api/logs/:id', async (req, res) => {
   } catch (error) {
     console.error('Error fetching log:', error);
     res.status(500).json({ error: 'Failed to fetch log' });
+  }
+});
+
+// GET /api/transaction-groups/:transaction_group_id - Get transaction group with all related logs (for delivery permit)
+app.get('/api/transaction-groups/:transaction_group_id', async (req, res) => {
+  try {
+    const transactionGroupId = req.params.transaction_group_id;
+    
+    // Get transaction group info
+    const [groups] = await db.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    if (groups.length === 0) {
+      return res.status(404).json({ error: 'Transaction group not found' });
+    }
+    
+    const group = groups[0];
+    
+    // Get all related logs
+    const [logs] = await db.query(
+      'SELECT * FROM logs WHERE transaction_group_id = ? ORDER BY epoch ASC',
+      [transactionGroupId]
+    );
+    
+    // Format logs
+    const formattedLogs = logs.map(log => ({
+      log_id: log.log_id,
+      type: log.type,
+      roll_id: log.roll_id,
+      fabric_id: log.fabric_id || null,
+      color_id: log.color_id || null,
+      customer_id: log.customer_id || null,
+      fabric_name: log.fabric_name,
+      color_name: log.color_name,
+      customer_name: log.customer_name,
+      amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      is_trimmable: Boolean(log.is_trimmable),
+      weight: log.weight,
+      notes: log.notes,
+      timestamp: log.timestamp,
+      epoch: log.epoch,
+      timezone: log.timezone,
+      transaction_group_id: log.transaction_group_id || null,
+      created_at: log.created_at,
+      updated_at: log.updated_at,
+      // compatibility aliases
+      id: log.log_id,
+      rollId: log.roll_id,
+      fabricId: log.fabric_id || null,
+      colorId: log.color_id || null,
+      customerId: log.customer_id || null,
+      fabricName: log.fabric_name,
+      colorName: log.color_name,
+      customerName: log.customer_name,
+      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      tz: log.timezone,
+      isTrimmable: Boolean(log.is_trimmable),
+      transactionGroupId: log.transaction_group_id || null
+    }));
+    
+    // Return transaction group with items
+    res.json({
+      transaction_group_id: group.transaction_group_id,
+      customer_id: group.customer_id || null,
+      customer_name: group.customer_name,
+      transaction_date: group.transaction_date,
+      epoch: group.epoch,
+      timezone: group.timezone,
+      total_items: group.total_items,
+      total_meters: parseFloat(group.total_meters) || 0,
+      notes: group.notes,
+      created_at: group.created_at,
+      updated_at: group.updated_at,
+      items: formattedLogs
+    });
+  } catch (error) {
+    console.error('Error fetching transaction group:', error);
+    res.status(500).json({ error: 'Failed to fetch transaction group' });
   }
 });
 
