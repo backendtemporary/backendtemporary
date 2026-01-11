@@ -1473,7 +1473,7 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
 
     // Calculate new length
     const newLengthM = Math.max(0, currentLength - trimAmount);
-    const newLengthY = newLengthM * 1.09361;
+    const newLengthY = newLengthM * 1.0936;
 
     // Update roll (or mark as sold if length becomes 0)
     // We keep the roll in the database so roll_id can be used for returns/cancels
@@ -1777,7 +1777,7 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
       console.log(`Adding return amount to existing roll ${rollId}: ${currentLength}m + ${returnAmount}m = ${newLengthM}m (sold=${roll.sold}, originalType=${originalTransactionType})`);
     }
     
-    const newLengthY = newLengthM * 1.09361;
+    const newLengthY = newLengthM * 1.0936;
 
     if (isNewRoll) {
       // When recreating a sold roll, mark it as not sold
