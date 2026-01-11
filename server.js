@@ -422,15 +422,19 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
   
   // Check if transaction group already exists
   const [existing] = await connection.query(
-    'SELECT transaction_group_id, total_items, total_meters, notes FROM transaction_groups WHERE transaction_group_id = ?',
+    'SELECT transaction_group_id, total_items, total_meters, notes, permit_number FROM transaction_groups WHERE transaction_group_id = ?',
     [transactionGroupId]
   );
   
   if (existing.length === 0) {
-    // Create new transaction group
+    // Get the next permit number (MAX + 1, or 1 if no records exist)
+    const [maxResult] = await connection.query('SELECT COALESCE(MAX(permit_number), 0) as max_permit FROM transaction_groups');
+    const nextPermitNumber = (maxResult[0]?.max_permit || 0) + 1;
+    
+    // Create new transaction group with permit number
     await connection.query(
-      'INSERT INTO transaction_groups (transaction_group_id, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)',
-      [transactionGroupId, customerId || null, customerName || null, now.iso, now.epoch, now.tz, amountMeters, notes || null]
+      'INSERT INTO transaction_groups (transaction_group_id, permit_number, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
+      [transactionGroupId, nextPermitNumber, customerId || null, customerName || null, now.iso, now.epoch, now.tz, amountMeters, notes || null]
     );
   } else {
     // Update existing transaction group - increment items and add to total meters
@@ -2076,6 +2080,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
     // Return transaction group with items
     res.json({
       transaction_group_id: group.transaction_group_id,
+      permit_number: group.permit_number || null,
       customer_id: group.customer_id || null,
       customer_name: group.customer_name,
       transaction_date: group.transaction_date,
