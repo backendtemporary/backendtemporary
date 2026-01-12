@@ -413,28 +413,101 @@ function getLebanonTimestamp(date = new Date()) {
   return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
 }
 
+// Helper to get next permit number for a transaction type
+// Returns permit number in format "{type}-{number}" based on chronological order
+async function getNextPermitNumber(connection, transactionType, epoch) {
+  // Get all transactions of this type ordered by epoch (timestamp)
+  const [transactions] = await connection.query(
+    'SELECT transaction_group_id, epoch, permit_number FROM transaction_groups WHERE transaction_type = ? ORDER BY epoch ASC, transaction_group_id ASC',
+    [transactionType]
+  );
+  
+  // Find where this transaction should be inserted chronologically
+  let insertPosition = transactions.length; // Default to end
+  
+  for (let i = 0; i < transactions.length; i++) {
+    if (epoch < transactions[i].epoch) {
+      insertPosition = i;
+      break;
+    }
+  }
+  
+  // If inserting at the end, just get max number + 1
+  if (insertPosition === transactions.length) {
+    // Get max permit number for this type
+    const [maxResult] = await connection.query(
+      'SELECT permit_number FROM transaction_groups WHERE transaction_type = ? ORDER BY CAST(SUBSTRING_INDEX(permit_number, "-", -1) AS UNSIGNED) DESC LIMIT 1',
+      [transactionType]
+    );
+    
+    if (maxResult.length > 0) {
+      const maxPermit = maxResult[0].permit_number;
+      const numericPart = parseInt(maxPermit.split('-')[1]) || 0;
+      return `${transactionType}-${numericPart + 1}`;
+    } else {
+      return `${transactionType}-1`;
+    }
+  }
+  
+  // If inserting in the middle, we need to shift all subsequent permit numbers
+  // Get the permit number at the insertion position
+  const targetPermit = transactions[insertPosition].permit_number;
+  const targetNumber = parseInt(targetPermit.split('-')[1]) || 0;
+  
+  // Increment all permit numbers for transactions after this position
+  for (let i = insertPosition; i < transactions.length; i++) {
+    const currentPermit = transactions[i].permit_number;
+    const currentNumber = parseInt(currentPermit.split('-')[1]) || 0;
+    const newPermit = `${transactionType}-${currentNumber + 1}`;
+    
+    await connection.query(
+      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
+      [newPermit, transactions[i].transaction_group_id]
+    );
+  }
+  
+  return `${transactionType}-${targetNumber}`;
+}
+
+// Helper to recalculate permit numbers for a transaction type after a change
+async function recalculatePermitNumbers(connection, transactionType) {
+  // Get all transactions of this type ordered by epoch
+  const [transactions] = await connection.query(
+    'SELECT transaction_group_id FROM transaction_groups WHERE transaction_type = ? ORDER BY epoch ASC, transaction_group_id ASC',
+    [transactionType]
+  );
+  
+  // Reassign permit numbers sequentially
+  for (let i = 0; i < transactions.length; i++) {
+    const newPermit = `${transactionType}-${i + 1}`;
+    await connection.query(
+      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
+      [newPermit, transactions[i].transaction_group_id]
+    );
+  }
+}
+
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
-async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters) {
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null) {
   if (!transactionGroupId) return;
   
   const now = getLebanonTimestamp();
+  const transactionEpoch = epoch || now.epoch;
   
   // Check if transaction group already exists
   const [existing] = await connection.query(
-    'SELECT transaction_group_id, total_items, total_meters, notes, permit_number FROM transaction_groups WHERE transaction_group_id = ?',
+    'SELECT transaction_group_id, total_items, total_meters, notes, permit_number, transaction_type, epoch FROM transaction_groups WHERE transaction_group_id = ?',
     [transactionGroupId]
   );
   
   if (existing.length === 0) {
-    // Get the next permit number (MAX + 1, or 1 if no records exist)
-    const [maxResult] = await connection.query('SELECT COALESCE(MAX(permit_number), 0) as max_permit FROM transaction_groups');
-    const nextPermitNumber = (maxResult[0]?.max_permit || 0) + 1;
+    // Create new transaction group
+    const permitNumber = await getNextPermitNumber(connection, transactionType, transactionEpoch);
     
-    // Create new transaction group with permit number
     await connection.query(
-      'INSERT INTO transaction_groups (transaction_group_id, permit_number, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
-      [transactionGroupId, nextPermitNumber, customerId || null, customerName || null, now.iso, now.epoch, now.tz, amountMeters, notes || null]
+      'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
+      [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
     );
   } else {
     // Update existing transaction group - increment items and add to total meters
@@ -1493,6 +1566,7 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
 
     // Handle transaction group creation/update
     const transaction_group_id = req.body.transaction_group_id || null;
+    const transaction_type = req.body.transaction_type || 'A'; // Default to 'A' if not provided
     if (transaction_group_id) {
       await createOrUpdateTransactionGroup(
         connection,
@@ -1500,7 +1574,9 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
         customer_id,
         customer_name,
         notes,
-        trimAmount
+        trimAmount,
+        transaction_type,
+        null // Use current time
       );
     }
 
@@ -1557,6 +1633,7 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
 
     // Handle transaction group creation/update
     const transaction_group_id = req.body.transaction_group_id || null;
+    const transaction_type = req.body.transaction_type || 'A'; // Default to 'A' if not provided
     const rollLengthMeters = parseFloat(roll.length_meters);
     if (transaction_group_id) {
       await createOrUpdateTransactionGroup(
@@ -1565,7 +1642,9 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
         customer_id,
         customer_name,
         notes,
-        rollLengthMeters
+        rollLengthMeters,
+        transaction_type,
+        null // Use current time
       );
     }
 
@@ -1848,10 +1927,13 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         l.*,
         s.name as salesperson_name,
         u.username as conducted_by_username,
-        u.full_name as conducted_by_full_name
+        u.full_name as conducted_by_full_name,
+        tg.transaction_type,
+        tg.permit_number
       FROM logs l
       LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
       LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
+      LEFT JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id
       WHERE 1=1
     `;
     const params = [];
@@ -1935,6 +2017,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       isTrimmable: Boolean(log.is_trimmable),
       referenceLogId: log.reference_log_id || null,
       transactionGroupId: log.transaction_group_id || null,
+      transactionType: log.transaction_type || null,
+      permitNumber: log.permit_number || null,
       salespersonId: log.salesperson_id || null,
       salespersonName: log.salesperson_name || null,
       conductedByUserId: log.conducted_by_user_id || null,
@@ -2081,6 +2165,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
     res.json({
       transaction_group_id: group.transaction_group_id,
       permit_number: group.permit_number || null,
+      transaction_type: group.transaction_type || 'A',
       customer_id: group.customer_id || null,
       customer_name: group.customer_name,
       transaction_date: group.transaction_date,
@@ -2096,6 +2181,172 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
   } catch (error) {
     console.error('Error fetching transaction group:', error);
     res.status(500).json({ error: 'Failed to fetch transaction group' });
+  }
+});
+
+// PUT /api/transaction-groups/:transaction_group_id/type - Update transaction type and recalculate permit numbers
+app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const transactionGroupId = req.params.transaction_group_id;
+    const { transaction_type, epoch } = req.body;
+    
+    if (!transaction_type || !['A', 'B'].includes(transaction_type)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Transaction type must be A or B' });
+    }
+    
+    await connection.beginTransaction();
+    
+    // Get current transaction group
+    const [groups] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    if (groups.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Transaction group not found' });
+    }
+    
+    const currentGroup = groups[0];
+    const oldType = currentGroup.transaction_type;
+    const newEpoch = epoch || currentGroup.epoch;
+    
+    // If type changed, we need to recalculate permit numbers
+    if (oldType !== transaction_type) {
+      // Remove from old type's sequence (recalculate old type)
+      await recalculatePermitNumbers(connection, oldType);
+      
+      // Update transaction group with new type and epoch
+      await connection.query(
+        'UPDATE transaction_groups SET transaction_type = ?, epoch = ? WHERE transaction_group_id = ?',
+        [transaction_type, newEpoch, transactionGroupId]
+      );
+      
+      // Recalculate new type's permit numbers (this will insert it in the right position)
+      await recalculatePermitNumbers(connection, transaction_type);
+    } else if (epoch && epoch !== currentGroup.epoch) {
+      // Only epoch changed, update it and recalculate permit numbers for this type
+      await connection.query(
+        'UPDATE transaction_groups SET epoch = ? WHERE transaction_group_id = ?',
+        [newEpoch, transactionGroupId]
+      );
+      await recalculatePermitNumbers(connection, transaction_type);
+    }
+    
+    await connection.commit();
+    
+    // Return updated transaction group
+    const [updated] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    const group = updated[0];
+    res.json({
+      transaction_group_id: group.transaction_group_id,
+      permit_number: group.permit_number,
+      transaction_type: group.transaction_type,
+      customer_id: group.customer_id,
+      customer_name: group.customer_name,
+      transaction_date: group.transaction_date,
+      epoch: group.epoch,
+      timezone: group.timezone,
+      total_items: group.total_items,
+      total_meters: parseFloat(group.total_meters) || 0,
+      notes: group.notes
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error updating transaction type:', error);
+    res.status(500).json({ error: 'Failed to update transaction type' });
+  } finally {
+    connection.release();
+  }
+});
+
+// PUT /api/transaction-groups/:transaction_group_id/permit-number - Update permit number with duplicate validation
+app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const transactionGroupId = req.params.transaction_group_id;
+    const { permit_number } = req.body;
+    
+    if (!permit_number || typeof permit_number !== 'string') {
+      return res.status(400).json({ error: 'Permit number is required and must be a string' });
+    }
+    
+    // Validate format: should be "A-1" or "B-1" format
+    const permitPattern = /^[AB]-\d+$/;
+    if (!permitPattern.test(permit_number)) {
+      return res.status(400).json({ error: 'Permit number must be in format "A-{number}" or "B-{number}"' });
+    }
+    
+    await connection.beginTransaction();
+    
+    // Get current transaction group
+    const [groups] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    if (groups.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Transaction group not found' });
+    }
+    
+    const currentGroup = groups[0];
+    
+    // Check if permit number already exists (excluding current transaction)
+    const [existing] = await connection.query(
+      'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_group_id != ?',
+      [permit_number, transactionGroupId]
+    );
+    
+    if (existing.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ 
+        error: 'Duplicate permit number',
+        message: `Another transaction already has permit number ${permit_number}`,
+        conflictingTransaction: existing[0].transaction_group_id
+      });
+    }
+    
+    // Update permit number
+    await connection.query(
+      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
+      [permit_number, transactionGroupId]
+    );
+    
+    await connection.commit();
+    
+    // Return updated transaction group
+    const [updated] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    const group = updated[0];
+    res.json({
+      transaction_group_id: group.transaction_group_id,
+      permit_number: group.permit_number,
+      transaction_type: group.transaction_type,
+      customer_id: group.customer_id,
+      customer_name: group.customer_name,
+      transaction_date: group.transaction_date,
+      epoch: group.epoch,
+      timezone: group.timezone,
+      total_items: group.total_items,
+      total_meters: parseFloat(group.total_meters) || 0,
+      notes: group.notes
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error updating permit number:', error);
+    res.status(500).json({ error: 'Failed to update permit number' });
+  } finally {
+    connection.release();
   }
 });
 
@@ -2224,6 +2475,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.notes !== undefined) updateData.notes = updates.notes;
     if (updates.timestamp !== undefined) updateData.timestamp = updates.timestamp;
     if (updates.epoch !== undefined) updateData.epoch = updates.epoch;
+    if (updates.salesperson_id !== undefined) updateData.salesperson_id = updates.salesperson_id;
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -2234,8 +2486,15 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     
     await db.query(`UPDATE logs SET ${fields} WHERE log_id = ?`, values);
 
-    // Return DB reality
-    const [updated] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+    // Return DB reality with salesperson info
+    const [updated] = await db.query(`
+      SELECT 
+        l.*,
+        s.name as salesperson_name
+      FROM logs l
+      LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
+      WHERE l.log_id = ?
+    `, [logId]);
     const log = updated[0];
     
     res.json({
@@ -2255,6 +2514,8 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       timestamp: log.timestamp,
       epoch: log.epoch,
       timezone: log.timezone,
+      salesperson_id: log.salesperson_id || null,
+      salesperson_name: log.salesperson_name || null,
       created_at: log.created_at,
       updated_at: log.updated_at,
       // compatibility aliases
@@ -2268,7 +2529,9 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       customerName: log.customer_name,
       length_meters: parseFloat(log.amount_meters) || 0,
       tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable)
+      isTrimmable: Boolean(log.is_trimmable),
+      salespersonId: log.salesperson_id || null,
+      salespersonName: log.salesperson_name || null
     });
   } catch (error) {
     console.error('Error updating log:', error);
