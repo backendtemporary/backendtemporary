@@ -2285,11 +2285,20 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       return res.status(400).json({ error: 'Permit number is required and must be a string' });
     }
     
-    // Validate format: should be "A-1" or "B-1" format
+    // Clean and validate format: should be "A-1" or "B-1" format
+    // Remove any curly braces and convert to uppercase
+    let cleanedPermit = permit_number.replace(/[{}]/g, '').trim().toUpperCase();
+    
     const permitPattern = /^[AB]-\d+$/;
-    if (!permitPattern.test(permit_number)) {
-      return res.status(400).json({ error: 'Permit number must be in format "A-{number}" or "B-{number}"' });
+    if (!permitPattern.test(cleanedPermit)) {
+      return res.status(400).json({ 
+        error: 'Permit number must be in format "A-{number}" or "B-{number}" (e.g., "A-5" or "B-10")',
+        received: permit_number
+      });
     }
+    
+    // Use cleaned permit number
+    permit_number = cleanedPermit;
     
     await connection.beginTransaction();
     
@@ -2306,6 +2315,9 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     
     const currentGroup = groups[0];
     
+    // Extract transaction type from permit number (A or B)
+    const permitType = permit_number.charAt(0).toUpperCase();
+    
     // Check if permit number already exists (excluding current transaction)
     const [existing] = await connection.query(
       'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_group_id != ?',
@@ -2321,11 +2333,20 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       });
     }
     
-    // Update permit number
-    await connection.query(
-      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
-      [permit_number, transactionGroupId]
-    );
+    // Update permit number and transaction type (if type changed based on permit number)
+    // This ensures permit number and transaction type stay in sync
+    if (permitType === 'A' || permitType === 'B') {
+      await connection.query(
+        'UPDATE transaction_groups SET permit_number = ?, transaction_type = ? WHERE transaction_group_id = ?',
+        [permit_number, permitType, transactionGroupId]
+      );
+    } else {
+      // Just update permit number if type can't be determined
+      await connection.query(
+        'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
+        [permit_number, transactionGroupId]
+      );
+    }
     
     await connection.commit();
     
