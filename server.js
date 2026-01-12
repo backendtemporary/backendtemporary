@@ -2227,12 +2227,20 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       // Recalculate new type's permit numbers (this will insert it in the right position)
       await recalculatePermitNumbers(connection, transaction_type);
     } else if (epoch && epoch !== currentGroup.epoch) {
-      // Only epoch changed, update it and recalculate permit numbers for this type
+      // Only epoch changed - DO NOT recalculate permit numbers (user wants manual control)
+      // Just update the epoch and transaction_date
+      const timestamp = new Date(epoch);
+      const isoString = timestamp.toISOString().replace('T', ' ').substring(0, 19);
       await connection.query(
-        'UPDATE transaction_groups SET epoch = ? WHERE transaction_group_id = ?',
-        [newEpoch, transactionGroupId]
+        'UPDATE transaction_groups SET epoch = ?, transaction_date = ? WHERE transaction_group_id = ?',
+        [newEpoch, isoString, transactionGroupId]
       );
-      await recalculatePermitNumbers(connection, transaction_type);
+      // Also update all related logs' timestamps and epochs
+      await connection.query(
+        'UPDATE logs SET epoch = ?, timestamp = ? WHERE transaction_group_id = ?',
+        [newEpoch, isoString, transactionGroupId]
+      );
+      // DO NOT call recalculatePermitNumbers - permit numbers are manually controlled
     }
     
     await connection.commit();
