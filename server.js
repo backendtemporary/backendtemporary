@@ -413,79 +413,7 @@ function getLebanonTimestamp(date = new Date()) {
   return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
 }
 
-// Helper to get next permit number for a transaction type
-// Returns permit number in format "{type}-{number}" based on chronological order
-async function getNextPermitNumber(connection, transactionType, epoch) {
-  // Get all transactions of this type ordered by epoch (timestamp)
-  const [transactions] = await connection.query(
-    'SELECT transaction_group_id, epoch, permit_number FROM transaction_groups WHERE transaction_type = ? ORDER BY epoch ASC, transaction_group_id ASC',
-    [transactionType]
-  );
-  
-  // Find where this transaction should be inserted chronologically
-  let insertPosition = transactions.length; // Default to end
-  
-  for (let i = 0; i < transactions.length; i++) {
-    if (epoch < transactions[i].epoch) {
-      insertPosition = i;
-      break;
-    }
-  }
-  
-  // If inserting at the end, just get max number + 1
-  if (insertPosition === transactions.length) {
-    // Get max permit number for this type
-    const [maxResult] = await connection.query(
-      'SELECT permit_number FROM transaction_groups WHERE transaction_type = ? ORDER BY CAST(SUBSTRING_INDEX(permit_number, "-", -1) AS UNSIGNED) DESC LIMIT 1',
-      [transactionType]
-    );
-    
-    if (maxResult.length > 0) {
-      const maxPermit = maxResult[0].permit_number;
-      const numericPart = parseInt(maxPermit.split('-')[1]) || 0;
-      return `${transactionType}-${numericPart + 1}`;
-    } else {
-      return `${transactionType}-1`;
-    }
-  }
-  
-  // If inserting in the middle, we need to shift all subsequent permit numbers
-  // Get the permit number at the insertion position
-  const targetPermit = transactions[insertPosition].permit_number;
-  const targetNumber = parseInt(targetPermit.split('-')[1]) || 0;
-  
-  // Increment all permit numbers for transactions after this position
-  for (let i = insertPosition; i < transactions.length; i++) {
-    const currentPermit = transactions[i].permit_number;
-    const currentNumber = parseInt(currentPermit.split('-')[1]) || 0;
-    const newPermit = `${transactionType}-${currentNumber + 1}`;
-    
-    await connection.query(
-      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
-      [newPermit, transactions[i].transaction_group_id]
-    );
-  }
-  
-  return `${transactionType}-${targetNumber}`;
-}
-
-// Helper to recalculate permit numbers for a transaction type after a change
-async function recalculatePermitNumbers(connection, transactionType) {
-  // Get all transactions of this type ordered by epoch
-  const [transactions] = await connection.query(
-    'SELECT transaction_group_id FROM transaction_groups WHERE transaction_type = ? ORDER BY epoch ASC, transaction_group_id ASC',
-    [transactionType]
-  );
-  
-  // Reassign permit numbers sequentially
-  for (let i = 0; i < transactions.length; i++) {
-    const newPermit = `${transactionType}-${i + 1}`;
-    await connection.query(
-      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
-      [newPermit, transactions[i].transaction_group_id]
-    );
-  }
-}
+// Permit numbers are now fully manual - no automatic generation
 
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
@@ -502,12 +430,11 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
   );
   
   if (existing.length === 0) {
-    // Create new transaction group
-    const permitNumber = await getNextPermitNumber(connection, transactionType, transactionEpoch);
-    
+    // Create new transaction group - permit number will be set manually by user
+    // Set a default empty permit number, user will set it when editing
     await connection.query(
       'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
-      [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
+      [transactionGroupId, null, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
     );
   } else {
     // Update existing transaction group - increment items and add to total meters
@@ -2184,7 +2111,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
   }
 });
 
-// PUT /api/transaction-groups/:transaction_group_id/type - Update transaction type and recalculate permit numbers
+// PUT /api/transaction-groups/:transaction_group_id/type - Update transaction type (permit numbers are manual)
 app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
   try {
@@ -2213,19 +2140,14 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
     const oldType = currentGroup.transaction_type;
     const newEpoch = epoch || currentGroup.epoch;
     
-    // If type changed, we need to recalculate permit numbers
+    // If type changed, just update the type - permit numbers are manual
     if (oldType !== transaction_type) {
-      // Remove from old type's sequence (recalculate old type)
-      await recalculatePermitNumbers(connection, oldType);
-      
       // Update transaction group with new type and epoch
       await connection.query(
         'UPDATE transaction_groups SET transaction_type = ?, epoch = ? WHERE transaction_group_id = ?',
         [transaction_type, newEpoch, transactionGroupId]
       );
-      
-      // Recalculate new type's permit numbers (this will insert it in the right position)
-      await recalculatePermitNumbers(connection, transaction_type);
+      // Note: Permit number prefix should be updated by user if needed
     } else if (epoch && epoch !== currentGroup.epoch) {
       // Only epoch changed - DO NOT recalculate permit numbers (user wants manual control)
       // Just update the epoch and transaction_date
@@ -2330,20 +2252,20 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       });
     }
     
-    // Update permit number and transaction type (if type changed based on permit number)
-    // This ensures permit number and transaction type stay in sync
-    if (permitType === 'A' || permitType === 'B') {
-      await connection.query(
-        'UPDATE transaction_groups SET permit_number = ?, transaction_type = ? WHERE transaction_group_id = ?',
-        [cleanedPermit, permitType, transactionGroupId]
-      );
-    } else {
-      // Just update permit number if type can't be determined
-      await connection.query(
-        'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
-        [cleanedPermit, transactionGroupId]
-      );
+    // Validate that permit number prefix matches transaction type
+    if (permitType !== currentGroup.transaction_type) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: 'Permit number prefix must match transaction type',
+        message: `Permit number starts with "${permitType}" but transaction type is "${currentGroup.transaction_type}". Please change the transaction type first.`
+      });
     }
+    
+    // Update permit number only (transaction type is managed separately)
+    await connection.query(
+      'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
+      [cleanedPermit, transactionGroupId]
+    );
     
     await connection.commit();
     
