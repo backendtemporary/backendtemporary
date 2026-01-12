@@ -2287,7 +2287,7 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     
     // Clean and validate format: should be "A-1" or "B-1" format
     // Remove any curly braces and convert to uppercase
-    let cleanedPermit = permit_number.replace(/[{}]/g, '').trim().toUpperCase();
+    const cleanedPermit = permit_number.replace(/[{}]/g, '').trim().toUpperCase();
     
     const permitPattern = /^[AB]-\d+$/;
     if (!permitPattern.test(cleanedPermit)) {
@@ -2296,9 +2296,6 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
         received: permit_number
       });
     }
-    
-    // Use cleaned permit number
-    permit_number = cleanedPermit;
     
     await connection.beginTransaction();
     
@@ -2316,19 +2313,19 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     const currentGroup = groups[0];
     
     // Extract transaction type from permit number (A or B)
-    const permitType = permit_number.charAt(0).toUpperCase();
+    const permitType = cleanedPermit.charAt(0).toUpperCase();
     
     // Check if permit number already exists (excluding current transaction)
     const [existing] = await connection.query(
       'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_group_id != ?',
-      [permit_number, transactionGroupId]
+      [cleanedPermit, transactionGroupId]
     );
     
     if (existing.length > 0) {
       await connection.rollback();
       return res.status(409).json({ 
         error: 'Duplicate permit number',
-        message: `Another transaction already has permit number ${permit_number}`,
+        message: `Another transaction already has permit number ${cleanedPermit}`,
         conflictingTransaction: existing[0].transaction_group_id
       });
     }
@@ -2338,13 +2335,13 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     if (permitType === 'A' || permitType === 'B') {
       await connection.query(
         'UPDATE transaction_groups SET permit_number = ?, transaction_type = ? WHERE transaction_group_id = ?',
-        [permit_number, permitType, transactionGroupId]
+        [cleanedPermit, permitType, transactionGroupId]
       );
     } else {
       // Just update permit number if type can't be determined
       await connection.query(
         'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
-        [permit_number, transactionGroupId]
+        [cleanedPermit, transactionGroupId]
       );
     }
     
