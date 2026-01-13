@@ -258,7 +258,7 @@ const saveFabricStructure = async (fabricsArray) => {
     const [existingFabrics] = await connection.query('SELECT fabric_id, fabric_code, main_code FROM fabrics');
     const [existingColors] = await connection.query('SELECT color_id, fabric_id, color_name FROM colors');
     const [existingRolls] = await connection.query(
-      'SELECT roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status FROM rolls'
+      'SELECT roll_id, color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, lot, roll_nb FROM rolls'
     );
 
     const existingFabricIds = new Set(existingFabrics.map(f => f.fabric_id));
@@ -341,19 +341,21 @@ const saveFabricStructure = async (fabricsArray) => {
             length_yards: roll.length_yards,
             is_trimmable: roll.is_trimmable ?? roll.isTrimmable ?? false,
             weight: roll.weight || 'N/A',
-            status: roll.status || 'available'
+            status: roll.status || 'available',
+            lot: roll.lot || null,
+            roll_nb: roll.roll_nb || null
           };
 
           if (targetRollId && existingRollIds.has(targetRollId)) {
             await connection.query(
-              'UPDATE rolls SET date = ?, length_meters = ?, length_yards = ?, is_trimmable = ?, weight = ?, status = ? WHERE roll_id = ?',
-              [rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status, targetRollId]
+              'UPDATE rolls SET date = ?, length_meters = ?, length_yards = ?, is_trimmable = ?, weight = ?, status = ?, lot = ?, roll_nb = ? WHERE roll_id = ?',
+              [rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status, rollPayload.lot || null, rollPayload.roll_nb || null, targetRollId]
             );
             processedRollIds.add(targetRollId);
           } else {
             const [result] = await connection.query(
-              'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [colorId, fabricId, rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status]
+              'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, lot, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [colorId, fabricId, rollPayload.date, rollPayload.length_meters, rollPayload.length_yards, rollPayload.is_trimmable, rollPayload.weight, rollPayload.status, rollPayload.lot || null, rollPayload.roll_nb || null]
             );
             processedRollIds.add(result.insertId);
           }
@@ -900,6 +902,17 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/customers/:id/transaction-count - Get transaction count for a customer
+app.get('/api/customers/:id/transaction-count', authMiddleware, async (req, res) => {
+  try {
+    const [logs] = await db.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
+    res.json({ count: logs[0].count || 0 });
+  } catch (error) {
+    console.error('Error getting transaction count:', error);
+    res.status(500).json({ error: 'Failed to get transaction count' });
+  }
+});
+
 app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
   try {
     // Check if customer has associated logs
@@ -1301,7 +1314,7 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    const { date, length_meters, length_yards, is_trimmable, weight } = req.body;
+    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
 
     // Validation - date will default to today if not provided
     const lenM = parseFloat(length_meters);
@@ -1326,8 +1339,8 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
     // Insert roll - ensure date is valid, use today if missing
     const rollDate = date && date.trim() ? date.trim() : new Date().toISOString().split('T')[0];
     const [result] = await connection.query(
-      'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available']
+      'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, lot, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available', lot || null, roll_nb || null]
     );
 
     await connection.commit();
@@ -1354,7 +1367,7 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
-    const { date, length_meters, length_yards, is_trimmable, weight } = req.body;
+    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
 
     await connection.beginTransaction();
 
@@ -1397,6 +1410,14 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
     if (weight !== undefined) {
       updates.weight = weight;
       values.push(weight);
+    }
+    if (lot !== undefined) {
+      updates.lot = lot || null;
+      values.push(lot || null);
+    }
+    if (roll_nb !== undefined) {
+      updates.roll_nb = roll_nb || null;
+      values.push(roll_nb || null);
     }
 
     if (Object.keys(updates).length === 0) {
