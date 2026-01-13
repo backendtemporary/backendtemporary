@@ -517,7 +517,26 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Error during login:', error);
-    res.status(500).json({ error: 'Failed to login' });
+    
+    // Check for database connection errors
+    if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') {
+      return res.status(503).json({ 
+        error: 'Database connection failed',
+        message: 'Unable to connect to database. Please check database configuration.'
+      });
+    }
+    
+    // Check for authentication errors (wrong password, etc.)
+    if (error.message && error.message.includes('password')) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Generic error - include message in development for debugging
+    const isDevelopment = process.env.NODE_ENV !== 'production';
+    res.status(500).json({ 
+      error: 'Failed to login',
+      ...(isDevelopment && { detail: error.message, stack: error.stack })
+    });
   }
 });
 
