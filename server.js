@@ -2033,7 +2033,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         u.username as conducted_by_username,
         u.full_name as conducted_by_full_name,
         tg.transaction_type,
-        tg.permit_number
+        tg.permit_number,
+        tg.notes as transaction_group_notes
       FROM logs l
       LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
       LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
@@ -2093,7 +2094,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
       is_trimmable: Boolean(log.is_trimmable),
       weight: log.weight,
-      notes: log.notes,
+      notes: log.transaction_group_notes || log.notes,
       timestamp: log.timestamp,
       epoch: log.epoch,
       timezone: log.timezone,
