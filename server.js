@@ -180,11 +180,26 @@ const buildFabricStructure = async () => {
         formattedDate = dateStr.split('T')[0].split(' ')[0];
         // Ensure it's valid YYYY-MM-DD format
         if (!/^\d{4}-\d{2}-\d{2}$/.test(formattedDate)) {
+          console.warn('buildFabricStructure: Invalid date format from DB:', dateStr, 'for roll_id:', roll.roll_id)
           formattedDate = null;
         }
       }
-      // If still null (shouldn't happen for new rolls, but handle gracefully)
+      // CRITICAL FIX: Don't default to today if date is missing - use the date from DB even if null
+      // Only default if we absolutely can't parse it (shouldn't happen for valid dates)
+      if (!formattedDate && roll.date) {
+        // Date exists but couldn't parse - try one more time with different approach
+        try {
+          const dbDate = new Date(roll.date);
+          if (!isNaN(dbDate.getTime())) {
+            formattedDate = dbDate.toISOString().split('T')[0];
+          }
+        } catch (e) {
+          console.error('buildFabricStructure: Error parsing date:', roll.date, 'for roll_id:', roll.roll_id)
+        }
+      }
+      // Only default to today if date is truly missing from DB (shouldn't happen due to NOT NULL constraint)
       if (!formattedDate) {
+        console.warn('buildFabricStructure: Date missing for roll_id:', roll.roll_id, 'using today as fallback')
         formattedDate = new Date().toISOString().split('T')[0];
       }
       
@@ -1390,6 +1405,7 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
+    console.log('POST /api/colors/:color_id/rolls - Full req.body:', JSON.stringify(req.body))
     const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
 
     // Validation - date will default to today if not provided
@@ -1473,6 +1489,7 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
   const connection = await db.getConnection();
   try {
     const rollId = parseInt(req.params.roll_id);
+    console.log('PUT /api/rolls/:roll_id - Full req.body:', JSON.stringify(req.body))
     const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
 
     await connection.beginTransaction();
