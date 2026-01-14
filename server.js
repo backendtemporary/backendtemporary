@@ -2643,6 +2643,278 @@ app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, re
   }
 });
 
+// POST /api/logs/:log_id/cancel - Cancel a single log (restore roll, delete log, update transaction group)
+// If it's the last log in the transaction group, delete the group and decrease permit counter
+app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const logId = parseInt(req.params.log_id);
+    
+    await connection.beginTransaction();
+
+    // Step 1: Get the log
+    const [logs] = await connection.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+    if (logs.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Log not found' });
+    }
+    
+    const log = logs[0];
+    const transactionGroupId = log.transaction_group_id;
+    const rollId = log.roll_id;
+    const returnAmount = parseFloat(log.amount_meters) || 0;
+
+    // Step 2: Restore the roll (SAVE FIRST - before deleting log)
+    if ((log.type === 'sell' || log.type === 'trim') && rollId && returnAmount > 0) {
+      const [rolls] = await connection.query('SELECT * FROM rolls WHERE roll_id = ?', [rollId]);
+      
+      if (rolls.length > 0) {
+        const roll = rolls[0];
+        const isSold = roll.sold === true || roll.sold === 1 || roll.sold === '1' || Boolean(roll.sold);
+        
+        // Restore roll length
+        let newLengthM;
+        if (isSold || log.type === 'sell') {
+          // Restore to exactly the amount that was sold
+          newLengthM = returnAmount;
+        } else {
+          // Add to existing length for trim returns
+          const currentLength = parseFloat(roll.length_meters) || 0;
+          newLengthM = currentLength + returnAmount;
+        }
+        
+        const newLengthY = newLengthM * 1.0936;
+        
+        // Update roll - restore length and mark as not sold
+        await connection.query(
+          'UPDATE rolls SET length_meters = ?, length_yards = ?, sold = FALSE WHERE roll_id = ?',
+          [newLengthM, newLengthY, rollId]
+        );
+      } else {
+        // Roll doesn't exist (was sold), recreate it from log data
+        if (log.fabric_id && log.color_id) {
+          const newLengthY = returnAmount * 1.0936;
+          await connection.query(
+            'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, FALSE)',
+            [log.color_id, log.fabric_id, returnAmount, newLengthY, log.is_trimmable || 0, log.weight || 'N/A', 'available']
+          );
+        }
+      }
+    }
+
+    // Step 3: Delete the log
+    await connection.query('DELETE FROM logs WHERE log_id = ?', [logId]);
+
+    // Step 4: Check if this was the last log in the transaction group
+    let shouldDeleteGroup = false;
+    let permitNumber = null;
+    let transactionType = 'A';
+    
+    if (transactionGroupId) {
+      const [remainingLogs] = await connection.query(
+        'SELECT COUNT(*) as count FROM logs WHERE transaction_group_id = ?',
+        [transactionGroupId]
+      );
+      
+      if (remainingLogs[0].count === 0) {
+        // Last log deleted, get transaction group info before deleting
+        const [groups] = await connection.query(
+          'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+          [transactionGroupId]
+        );
+        
+        if (groups.length > 0) {
+          shouldDeleteGroup = true;
+          permitNumber = groups[0].permit_number;
+          transactionType = groups[0].transaction_type || 'A';
+          
+          // Delete the transaction group
+          await connection.query(
+            'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
+            [transactionGroupId]
+          );
+        }
+      } else {
+        // Update transaction group totals
+        const [groups] = await connection.query(
+          'SELECT total_items, total_meters FROM transaction_groups WHERE transaction_group_id = ?',
+          [transactionGroupId]
+        );
+        
+        if (groups.length > 0) {
+          const group = groups[0];
+          const newTotalItems = Math.max(0, group.total_items - 1);
+          const newTotalMeters = Math.max(0, parseFloat(group.total_meters) - returnAmount);
+          
+          await connection.query(
+            'UPDATE transaction_groups SET total_items = ?, total_meters = ? WHERE transaction_group_id = ?',
+            [newTotalItems, newTotalMeters, transactionGroupId]
+          );
+        }
+      }
+    }
+
+    // Step 5: Decrease permit number counter if we deleted the last transaction group
+    if (shouldDeleteGroup && permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
+      const permitNum = parseInt(permitNumber.substring(2));
+      
+      // Find the highest permit number for this transaction type that is less than the canceled one
+      const [result] = await connection.query(
+        `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as max_num 
+         FROM transaction_groups 
+         WHERE transaction_type = ? 
+         AND permit_number IS NOT NULL 
+         AND permit_number REGEXP ?
+         AND CAST(SUBSTRING(permit_number, 3) AS UNSIGNED) < ?`,
+        [transactionType, `^${transactionType}-[0-9]+$`, permitNum]
+      );
+      
+      const maxNum = result[0]?.max_num || 0;
+      console.log(`Canceled log ${logId} from transaction group ${transactionGroupId} with permit ${permitNumber}. Next permit will be ${transactionType}-${maxNum + 1}`);
+    }
+
+    await connection.commit();
+    
+    res.json({ 
+      success: true, 
+      message: `Log canceled. Roll restored.${shouldDeleteGroup ? ' Transaction group deleted.' : ''}` 
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error canceling log:', error);
+    res.status(500).json({ error: 'Failed to cancel log: ' + error.message });
+  } finally {
+    connection.release();
+  }
+});
+
+// POST /api/transactions/:transaction_group_id/cancel - Cancel entire transaction group
+// Restores all rolls, deletes all logs, decreases permit number counter
+app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const transactionGroupId = req.params.transaction_group_id;
+    
+    await connection.beginTransaction();
+
+    // Step 1: Get transaction group info
+    const [groups] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+    
+    if (groups.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Transaction group not found' });
+    }
+    
+    const group = groups[0];
+    const transactionType = group.transaction_type || 'A';
+    const permitNumber = group.permit_number;
+
+    // Step 2: Get all logs for this transaction group
+    const [logs] = await connection.query(
+      'SELECT * FROM logs WHERE transaction_group_id = ? ORDER BY epoch ASC',
+      [transactionGroupId]
+    );
+
+    // Step 3: Restore all rolls (SAVE FIRST - before deleting logs)
+    for (const log of logs) {
+      if (log.type === 'sell' || log.type === 'trim') {
+        const rollId = log.roll_id;
+        const returnAmount = parseFloat(log.amount_meters) || 0;
+        
+        if (rollId && returnAmount > 0) {
+          // Check if roll exists
+          const [rolls] = await connection.query('SELECT * FROM rolls WHERE roll_id = ?', [rollId]);
+          
+          if (rolls.length > 0) {
+            const roll = rolls[0];
+            const isSold = roll.sold === true || roll.sold === 1 || roll.sold === '1' || Boolean(roll.sold);
+            
+            // Restore roll length
+            let newLengthM;
+            if (isSold || log.type === 'sell') {
+              // Restore to exactly the amount that was sold
+              newLengthM = returnAmount;
+            } else {
+              // Add to existing length for trim returns
+              const currentLength = parseFloat(roll.length_meters) || 0;
+              newLengthM = currentLength + returnAmount;
+            }
+            
+            const newLengthY = newLengthM * 1.0936;
+            
+            // Update roll - restore length and mark as not sold
+            await connection.query(
+              'UPDATE rolls SET length_meters = ?, length_yards = ?, sold = FALSE WHERE roll_id = ?',
+              [newLengthM, newLengthY, rollId]
+            );
+          } else {
+            // Roll doesn't exist (was sold), recreate it from log data
+            if (log.fabric_id && log.color_id) {
+              const newLengthY = returnAmount * 1.0936;
+              await connection.query(
+                'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, FALSE)',
+                [log.color_id, log.fabric_id, returnAmount, newLengthY, log.is_trimmable || 0, log.weight || 'N/A', 'available']
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // Step 4: Delete all logs for this transaction group
+    await connection.query(
+      'DELETE FROM logs WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+
+    // Step 5: Delete the transaction group
+    await connection.query(
+      'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
+      [transactionGroupId]
+    );
+
+    // Step 6: Decrease permit number counter if permit number matches pattern
+    if (permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
+      const permitNum = parseInt(permitNumber.substring(2));
+      
+      // Find the highest permit number for this transaction type that is less than the canceled one
+      const [result] = await connection.query(
+        `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as max_num 
+         FROM transaction_groups 
+         WHERE transaction_type = ? 
+         AND permit_number IS NOT NULL 
+         AND permit_number REGEXP ?
+         AND CAST(SUBSTRING(permit_number, 3) AS UNSIGNED) < ?`,
+        [transactionType, `^${transactionType}-[0-9]+$`, permitNum]
+      );
+      
+      const maxNum = result[0]?.max_num || 0;
+      
+      // If there are no permit numbers below this one, we don't need to do anything
+      // The counter will naturally continue from the next highest number
+      // But if we want to "reuse" the canceled permit number, we could update the highest one
+      // For now, we'll just let it continue naturally (the canceled number is skipped)
+      console.log(`Canceled transaction ${transactionGroupId} with permit ${permitNumber}. Next permit will be ${transactionType}-${maxNum + 1}`);
+    }
+
+    await connection.commit();
+    
+    res.json({ 
+      success: true, 
+      message: `Transaction ${transactionGroupId} canceled. ${logs.length} logs deleted, rolls restored.` 
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error canceling transaction:', error);
+    res.status(500).json({ error: 'Failed to cancel transaction: ' + error.message });
+  } finally {
+    connection.release();
+  }
+});
+
 // ============================================
 // SALESPERSON MANAGEMENT ENDPOINTS
 // ============================================
