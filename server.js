@@ -1415,21 +1415,30 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
     // FIX DATE SAVE ISSUE: Properly handle date - preserve user-entered date
     // Accept date as string (YYYY-MM-DD) from date input
     let rollDate = date
-    // Convert to string if it's not already
-    if (rollDate != null) {
-      rollDate = String(rollDate).trim()
+    console.log('POST /api/colors/:color_id/rolls - Received date:', date, 'Type:', typeof date)
+    
+    // Convert to string if it's not already (handle null, undefined, Date objects)
+    if (rollDate != null && rollDate !== undefined) {
+      if (rollDate instanceof Date) {
+        rollDate = rollDate.toISOString().split('T')[0]
+      } else {
+        rollDate = String(rollDate).trim()
+      }
+    } else {
+      rollDate = ''
     }
+    
     // Only default to today if date is truly missing or invalid
-    if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined') {
-      console.log('Date missing or invalid, using today. Received:', date)
+    if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined' || rollDate === 'NaN') {
+      console.log('Date missing or invalid in POST, using today. Original received:', date)
       rollDate = new Date().toISOString().split('T')[0]
     } else {
       // Validate date format (YYYY-MM-DD)
       if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
-        console.warn('Invalid date format received, using today. Received:', rollDate)
+        console.warn('Invalid date format in POST, using today. Received:', rollDate, 'Original:', date)
         rollDate = new Date().toISOString().split('T')[0]
       } else {
-        console.log('Saving roll with date:', rollDate) // Debug log
+        console.log('POST: Saving roll with date:', rollDate) // Debug log
       }
     }
     // FIX ISSUE #5: Properly handle LOT and ROLL nb - trim and convert empty to null
@@ -1482,21 +1491,30 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
       // FIX DATE SAVE ISSUE: Properly handle date - preserve user-entered date
       // Accept date as string (YYYY-MM-DD) from date input
       let rollDate = date
-      // Convert to string if it's not already
-      if (rollDate != null) {
-        rollDate = String(rollDate).trim()
+      console.log('PUT /api/rolls/:roll_id - Received date:', date, 'Type:', typeof date)
+      
+      // Convert to string if it's not already (handle null, undefined, Date objects)
+      if (rollDate != null && rollDate !== undefined) {
+        if (rollDate instanceof Date) {
+          rollDate = rollDate.toISOString().split('T')[0]
+        } else {
+          rollDate = String(rollDate).trim()
+        }
+      } else {
+        rollDate = ''
       }
+      
       // Only default to today if date is truly missing or invalid
-      if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined') {
-        console.log('Date missing or invalid in update, using today. Received:', date)
+      if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined' || rollDate === 'NaN') {
+        console.log('Date missing or invalid in PUT, using today. Original received:', date)
         rollDate = new Date().toISOString().split('T')[0]
       } else {
         // Validate date format (YYYY-MM-DD)
         if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
-          console.warn('Invalid date format in update, using today. Received:', rollDate)
+          console.warn('Invalid date format in PUT, using today. Received:', rollDate, 'Original:', date)
           rollDate = new Date().toISOString().split('T')[0]
         } else {
-          console.log('Updating roll with date:', rollDate) // Debug log
+          console.log('PUT: Updating roll with date:', rollDate) // Debug log
         }
       }
       updates.date = rollDate;
