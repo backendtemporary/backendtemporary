@@ -415,7 +415,38 @@ function getLebanonTimestamp(date = new Date()) {
   return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
 }
 
-// Permit numbers are now fully manual - no automatic generation
+// Generate permit number automatically based on transaction type
+// Separate counters for Type A and Type B, auto-incrementing from last transaction
+async function generatePermitNumber(connection, transactionType) {
+  try {
+    // Validate transaction type
+    if (!['A', 'B'].includes(transactionType)) {
+      transactionType = 'A'; // Default to A if invalid
+    }
+    
+    // Get last permit number for this transaction type
+    // Extract numeric part from permit_number (e.g., "A-123" -> 123)
+    // Only consider permit numbers that match the pattern: A-{number} or B-{number}
+    const [result] = await connection.query(
+      `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as last_num 
+       FROM transaction_groups 
+       WHERE transaction_type = ? 
+       AND permit_number IS NOT NULL 
+       AND permit_number REGEXP ?`,
+      [transactionType, `^${transactionType}-[0-9]+$`]
+    );
+    
+    const lastNum = result[0]?.last_num || 0;
+    const nextNum = lastNum + 1;
+    
+    return `${transactionType}-${nextNum}`;
+  } catch (error) {
+    console.error('Error generating permit number:', error);
+    // Fallback: use timestamp-based permit number if query fails
+    const timestamp = Date.now();
+    return `${transactionType}-${timestamp}`;
+  }
+}
 
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
@@ -432,12 +463,34 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
   );
   
   if (existing.length === 0) {
-    // Create new transaction group - permit number will be set manually by user
-    // Set a default empty permit number, user will set it when editing
-    await connection.query(
-      'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
-      [transactionGroupId, null, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
-    );
+    // Create new transaction group - auto-generate permit number
+    // Generate permit number based on transaction type (separate counters for A and B)
+    let permitNumber = await generatePermitNumber(connection, transactionType);
+    
+    // Retry logic in case of duplicate permit number (race condition)
+    let retries = 3;
+    let inserted = false;
+    while (retries > 0 && !inserted) {
+      try {
+        await connection.query(
+          'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
+          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
+        );
+        inserted = true; // Success, exit retry loop
+      } catch (error) {
+        // If duplicate permit number error, regenerate and retry
+        if (error.code === 'ER_DUP_ENTRY' || error.message.includes('Duplicate entry')) {
+          retries--;
+          if (retries > 0) {
+            // Regenerate permit number and retry
+            permitNumber = await generatePermitNumber(connection, transactionType);
+            continue;
+          }
+        }
+        // Re-throw if not a duplicate error or out of retries
+        throw error;
+      }
+    }
   } else {
     // Update existing transaction group - increment items and add to total meters
     const current = existing[0];
@@ -1355,11 +1408,24 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
     }
     const fabricId = colors[0].fabric_id;
 
-    // Insert roll - ensure date is valid, use today if missing
-    const rollDate = date && date.trim() ? date.trim() : new Date().toISOString().split('T')[0];
+    // FIX ISSUE #2: Properly handle date - validate format and handle empty strings
+    let rollDate = date
+    if (!rollDate || typeof rollDate !== 'string' || rollDate.trim() === '') {
+      rollDate = new Date().toISOString().split('T')[0]
+    } else {
+      rollDate = rollDate.trim()
+      // Validate date format (YYYY-MM-DD)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
+        // If invalid format, use today
+        rollDate = new Date().toISOString().split('T')[0]
+      }
+    }
+    // FIX ISSUE #5: Properly handle LOT and ROLL nb - trim and convert empty to null
+    const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null
+    const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null
     const [result] = await connection.query(
       'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, lot, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available', lot || null, roll_nb || null]
+      [colorId, fabricId, rollDate, lenM, lenY, Boolean(is_trimmable), weight || 'N/A', 'available', lotValue, rollNbValue]
     );
 
     await connection.commit();
@@ -1401,8 +1467,19 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
     const updates = {};
     const values = [];
     if (date !== undefined) {
-      updates.date = date;
-      values.push(date);
+      // FIX ISSUE #2: Properly handle date - validate format and handle empty strings
+      let rollDate = date
+      if (!rollDate || typeof rollDate !== 'string' || rollDate.trim() === '') {
+        rollDate = new Date().toISOString().split('T')[0]
+      } else {
+        rollDate = rollDate.trim()
+        // Validate date format (YYYY-MM-DD)
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
+          rollDate = new Date().toISOString().split('T')[0]
+        }
+      }
+      updates.date = rollDate;
+      values.push(rollDate);
     }
     if (length_meters !== undefined) {
       const lenM = parseFloat(length_meters);
@@ -1431,12 +1508,16 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
       values.push(weight);
     }
     if (lot !== undefined) {
-      updates.lot = lot || null;
-      values.push(lot || null);
+      // FIX ISSUE #5: Properly handle LOT - trim and convert empty to null
+      const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
+      updates.lot = lotValue;
+      values.push(lotValue);
     }
     if (roll_nb !== undefined) {
-      updates.roll_nb = roll_nb || null;
-      values.push(roll_nb || null);
+      // FIX ISSUE #5: Properly handle ROLL nb - trim and convert empty to null
+      const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
+      updates.roll_nb = rollNbValue;
+      values.push(rollNbValue);
     }
 
     if (Object.keys(updates).length === 0) {
