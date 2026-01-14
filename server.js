@@ -188,6 +188,7 @@ const buildFabricStructure = async () => {
         formattedDate = new Date().toISOString().split('T')[0];
       }
       
+      // FIX DISPLAY ISSUE: Include lot and roll_nb in the roll object
       rollsByColor[roll.color_id].push({
         roll_id: roll.roll_id,
         color_id: roll.color_id,
@@ -199,6 +200,9 @@ const buildFabricStructure = async () => {
         isTrimmable: Boolean(roll.is_trimmable),
         weight: roll.weight || 'N/A',
         status: roll.status,
+        // FIX DISPLAY ISSUE: Include lot and roll_nb from database
+        lot: roll.lot || null,
+        roll_nb: roll.roll_nb || null,
         created_at: roll.created_at,
         updated_at: roll.updated_at
       });
@@ -1408,16 +1412,24 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
     }
     const fabricId = colors[0].fabric_id;
 
-    // FIX ISSUE #2: Properly handle date - validate format and handle empty strings
+    // FIX DATE SAVE ISSUE: Properly handle date - preserve user-entered date
+    // Accept date as string (YYYY-MM-DD) from date input
     let rollDate = date
-    if (!rollDate || typeof rollDate !== 'string' || rollDate.trim() === '') {
+    // Convert to string if it's not already
+    if (rollDate != null) {
+      rollDate = String(rollDate).trim()
+    }
+    // Only default to today if date is truly missing or invalid
+    if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined') {
+      console.log('Date missing or invalid, using today. Received:', date)
       rollDate = new Date().toISOString().split('T')[0]
     } else {
-      rollDate = rollDate.trim()
       // Validate date format (YYYY-MM-DD)
       if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
-        // If invalid format, use today
+        console.warn('Invalid date format received, using today. Received:', rollDate)
         rollDate = new Date().toISOString().split('T')[0]
+      } else {
+        console.log('Saving roll with date:', rollDate) // Debug log
       }
     }
     // FIX ISSUE #5: Properly handle LOT and ROLL nb - trim and convert empty to null
@@ -1467,15 +1479,24 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
     const updates = {};
     const values = [];
     if (date !== undefined) {
-      // FIX ISSUE #2: Properly handle date - validate format and handle empty strings
+      // FIX DATE SAVE ISSUE: Properly handle date - preserve user-entered date
+      // Accept date as string (YYYY-MM-DD) from date input
       let rollDate = date
-      if (!rollDate || typeof rollDate !== 'string' || rollDate.trim() === '') {
+      // Convert to string if it's not already
+      if (rollDate != null) {
+        rollDate = String(rollDate).trim()
+      }
+      // Only default to today if date is truly missing or invalid
+      if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined') {
+        console.log('Date missing or invalid in update, using today. Received:', date)
         rollDate = new Date().toISOString().split('T')[0]
       } else {
-        rollDate = rollDate.trim()
         // Validate date format (YYYY-MM-DD)
         if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
+          console.warn('Invalid date format in update, using today. Received:', rollDate)
           rollDate = new Date().toISOString().split('T')[0]
+        } else {
+          console.log('Updating roll with date:', rollDate) // Debug log
         }
       }
       updates.date = rollDate;
