@@ -1484,6 +1484,84 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
   }
 });
 
+// PUT /api/rolls/bulk - Bulk update multiple rolls in a single transaction - Admin only
+app.put('/api/rolls/bulk', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { updates } = req.body; // Array of { roll_id, date, lot, roll_nb, weight }
+    
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ error: 'Updates array is required' });
+    }
+
+    await connection.beginTransaction();
+
+    for (const { roll_id, date, lot, roll_nb, weight } of updates) {
+      const rollId = parseInt(roll_id);
+      if (isNaN(rollId)) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Invalid roll_id: ${roll_id}` });
+      }
+
+      // Check roll exists
+      const [rolls] = await connection.query('SELECT roll_id FROM rolls WHERE roll_id = ?', [rollId]);
+      if (rolls.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ error: `Roll ${rollId} not found` });
+      }
+
+      // Build update query dynamically
+      const updateFields = {};
+      const values = [];
+      
+      if (date !== undefined && date !== null && date !== '') {
+        let rollDate = String(date).trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Invalid date format for roll ${rollId}` });
+        }
+        updateFields.date = rollDate;
+        values.push(rollDate);
+      }
+      
+      if (lot !== undefined) {
+        const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
+        updateFields.lot = lotValue;
+        values.push(lotValue);
+      }
+      
+      if (roll_nb !== undefined) {
+        const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
+        updateFields.roll_nb = rollNbValue;
+        values.push(rollNbValue);
+      }
+      
+      if (weight !== undefined) {
+        updateFields.weight = weight || 'N/A';
+        values.push(weight || 'N/A');
+      }
+
+      if (Object.keys(updateFields).length > 0) {
+        const fields = Object.keys(updateFields).map(k => `${k} = ?`).join(', ');
+        values.push(rollId);
+        await connection.query(`UPDATE rolls SET ${fields} WHERE roll_id = ?`, values);
+      }
+    }
+
+    await connection.commit();
+
+    // Return updated fabric structure (only call once at the end)
+    const fabrics = await buildFabricStructure();
+    res.json({ fabrics, updated_count: updates.length });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error bulk updating rolls:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk update rolls' });
+  } finally {
+    connection.release();
+  }
+});
+
 // PUT /api/rolls/:roll_id - Update roll (length, date, weight, etc.) - Admin only
 app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();

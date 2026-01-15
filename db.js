@@ -13,8 +13,11 @@ function getPool() {
       waitForConnections: true,
       connectionLimit: 10,
       queueLimit: 0,
+      connectTimeout: 10000, // 10 seconds to establish connection
+      acquireTimeout: 60000, // 60 seconds to get connection from pool
+      timeout: 60000, // 60 seconds query timeout
     });
-    console.log('🔧 MySQL pool created');
+    console.log('🔧 MySQL pool created with timeouts');
   }
   return pool;
 }
