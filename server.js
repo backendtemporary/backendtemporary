@@ -2376,10 +2376,15 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const newYards = parseFloat(color.length_yards) || 0;
     const newYardsCalc = newMeters * 1.0936;
     
-    // Update color (subtract meters)
+    // Calculate new roll_count (decrease by roll_count from request, or default to 0 if not provided)
+    const currentRollCount = parseInt(color.roll_count) || 0;
+    const sellRollCount = parseInt(roll_count) || 0;
+    const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+    
+    // Update color (subtract meters and roll_count)
     await connection.query(
-      'UPDATE colors SET length_meters = ?, length_yards = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
-      [newMeters, newYardsCalc, newMeters, colorId]
+      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
+      [newMeters, newYardsCalc, newRollCount, newMeters, colorId]
     );
     
     // Handle transaction group
