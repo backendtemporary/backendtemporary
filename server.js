@@ -2437,6 +2437,104 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   }
 });
 
+// POST /api/fabrics/:fabric_id/colors/:color_id/return - Return fabric color (add back to inventory)
+app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const fabricId = parseInt(req.params.fabric_id);
+    const colorId = parseInt(req.params.color_id);
+    const { 
+      amount_meters, 
+      amount_yards, 
+      roll_count = 0,
+      customer_id, 
+      customer_name, 
+      notes,
+      reference_log_id,
+      timestamp,
+      epoch
+    } = req.body;
+    
+    // Validation
+    if (!fabricId || !colorId) {
+      return res.status(400).json({ error: 'Invalid fabric_id or color_id' });
+    }
+    
+    // Calculate amount in meters
+    let amountMeters = 0;
+    if (amount_yards !== undefined && amount_yards !== null) {
+      amountMeters = parseFloat(amount_yards) / 1.0936;
+    } else if (amount_meters !== undefined && amount_meters !== null) {
+      amountMeters = parseFloat(amount_meters);
+    } else {
+      return res.status(400).json({ error: 'Either amount_meters or amount_yards must be provided' });
+    }
+    
+    if (isNaN(amountMeters) || amountMeters <= 0) {
+      return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+    
+    await connection.beginTransaction();
+    
+    // Get color with lock
+    const color = await getColorForTransaction(connection, fabricId, colorId);
+    if (!color) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Color not found' });
+    }
+    
+    // Get fabric info
+    const [fabrics] = await connection.query('SELECT fabric_name, fabric_code FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (fabrics.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Fabric not found' });
+    }
+    const fabric = fabrics[0];
+    
+    // Add meters/yards back to color
+    const currentMeters = parseFloat(color.length_meters) || 0;
+    const currentYards = parseFloat(color.length_yards) || 0;
+    const newMeters = currentMeters + amountMeters;
+    const newYards = currentYards + (amountMeters * 1.0936);
+    
+    // Add roll_count back
+    const currentRollCount = parseInt(color.roll_count) || 0;
+    const returnRollCount = parseInt(roll_count) || 0;
+    const newRollCount = currentRollCount + returnRollCount;
+    
+    // Update color (add back meters and roll_count)
+    await connection.query(
+      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+      [newMeters, newYards, newRollCount, colorId]
+    );
+    
+    // Create log entry for return
+    const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
+    const salespersonId = req.body.salesperson_id || null;
+    const conductedByUserId = req.user ? req.user.user_id : null;
+    const lotValue = color.lot || null;
+    const rollNbValue = color.roll_nb || null;
+    
+    await connection.query(
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['return', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+    );
+    
+    await connection.commit();
+    
+    // Return updated aggregated structure
+    const updatedFabrics = await buildFabricColorAggregatedStructure();
+    const updatedFabric = updatedFabrics.find(f => f.fabric_id === fabricId);
+    res.json(updatedFabric || updatedFabrics);
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error returning color:', error);
+    res.status(500).json({ error: error.message || 'Failed to return color' });
+  } finally {
+    connection.release();
+  }
+});
+
 // POST /api/fabrics/:fabric_id/colors/:color_id/trim - DEPRECATED: Trim functionality removed
 /* app.post('/api/fabrics/:fabric_id/colors/:color_id/trim', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
