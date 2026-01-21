@@ -347,7 +347,7 @@ const buildFabricColorAggregatedStructure = async () => {
 
 // Get single fabric by index (0-based array position)
 const getFabricByIndex = async (index) => {
-  const fabrics = await buildFabricStructure();
+  const fabrics = await buildFabricColorAggregatedStructure();
   return fabrics[index] || null;
 };
 
@@ -1139,8 +1139,8 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Fabric not found' });
     }
 
-    // Build full structure for this fabric
-    const fabrics = await buildFabricStructure();
+    // Build aggregated structure for this fabric
+    const fabrics = await buildFabricColorAggregatedStructure();
     const fabric = fabrics.find(f => f.fabric_id === fabricId);
     
     res.json(fabric);
@@ -1175,8 +1175,8 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
       [fabric_name.trim(), fabric_code, main_code || null, source || null, design || 'none']
     );
 
-    // Return what DB actually created
-    const fabrics = await buildFabricStructure();
+    // Return aggregated structure for created fabric
+    const fabrics = await buildFabricColorAggregatedStructure();
     const created = fabrics.find(f => f.fabric_id === result.insertId);
     
     res.status(201).json(created);
@@ -1226,8 +1226,8 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
     
     await db.query(`UPDATE fabrics SET ${fields} WHERE fabric_id = ?`, values);
 
-    // Return DB reality after update
-    const fabrics = await buildFabricStructure();
+    // Return aggregated structure after update
+    const fabrics = await buildFabricColorAggregatedStructure();
     const updated = fabrics.find(f => f.fabric_id === fabricId);
     
     res.json(updated);
@@ -1357,8 +1357,8 @@ app.put('/api/fabrics', authMiddleware, async (req, res) => {
 
     await saveFabricStructure(fabricsArray);
     
-    // Return DB state
-    const updated = await buildFabricStructure();
+    // Return aggregated structure
+    const updated = await buildFabricColorAggregatedStructure();
     res.json(updated);
   } catch (error) {
     console.error('PUT /api/fabrics error:', error.message);
@@ -1409,8 +1409,8 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return full fabric structure with new color
-    const fabrics = await buildFabricStructure();
+    // Return aggregated fabric structure with new color
+    const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after creation' });
@@ -1468,8 +1468,8 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return full fabric structure with updated color
-    const fabrics = await buildFabricStructure();
+    // Return aggregated fabric structure with updated color
+    const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after color update' });
@@ -1552,8 +1552,8 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return full fabric structure with new roll
-    const fabrics = await buildFabricStructure();
+    // Return aggregated fabric structure with new roll
+    const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after roll creation' });
@@ -1635,8 +1635,8 @@ app.put('/api/rolls/bulk', authMiddleware, requireRole('admin'), async (req, res
 
     await connection.commit();
 
-    // Return updated fabric structure (only call once at the end)
-    const fabrics = await buildFabricStructure();
+    // Return updated aggregated fabric structure (only call once at the end)
+    const fabrics = await buildFabricColorAggregatedStructure();
     res.json({ fabrics, updated_count: updates.length });
   } catch (error) {
     await connection.rollback();
@@ -1751,18 +1751,27 @@ app.put('/api/rolls/:roll_id', authMiddleware, requireRole('admin'), async (req,
 
     await connection.commit();
 
-    // Return updated roll in fabric structure
-    const fabrics = await buildFabricStructure();
-    for (const fabric of fabrics) {
-      for (const color of fabric.colors || []) {
-        const roll = (color.rolls || []).find(r => r.roll_id === rollId);
-        if (roll) {
-          return res.json(fabric);
-        }
+    // Return updated aggregated fabric structure
+    const fabrics = await buildFabricColorAggregatedStructure();
+    const updatedFabric = fabrics.find(f => {
+      // Find fabric that contains this roll's color
+      return f.colors?.some(c => {
+        // We can't check individual rolls in aggregated structure, so return fabric if it has colors
+        // The roll update will be reflected in the aggregated totals
+        return true;
+      });
+    });
+    
+    // Find the fabric by checking which fabric_id the roll belongs to
+    const [rollData] = await db.query('SELECT fabric_id FROM rolls WHERE roll_id = ?', [rollId]);
+    if (rollData.length > 0) {
+      const fabric = fabrics.find(f => f.fabric_id === rollData[0].fabric_id);
+      if (fabric) {
+        return res.json(fabric);
       }
     }
-
-    res.status(404).json({ error: 'Roll not found in structure' });
+    
+    res.status(404).json({ error: 'Fabric not found for updated roll' });
   } catch (error) {
     await connection.rollback();
     console.error('Error updating roll:', error);
@@ -1858,8 +1867,8 @@ app.post('/api/rolls/:roll_id/trim', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return updated fabric structure
-    const updatedFabrics = await buildFabricStructure();
+    // Return updated aggregated fabric structure
+    const updatedFabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = updatedFabrics.find(f => f.fabric_id === roll.fabric_id);
     res.json(updatedFabric || updatedFabrics);
   } catch (error) {
@@ -1929,8 +1938,8 @@ app.post('/api/rolls/:roll_id/sell', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return updated fabric structure
-    const updatedFabrics = await buildFabricStructure();
+    // Return updated aggregated fabric structure
+    const updatedFabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = updatedFabrics.find(f => f.fabric_id === roll.fabric_id);
     res.json(updatedFabric || updatedFabrics);
   } catch (error) {
@@ -2168,8 +2177,8 @@ app.post('/api/rolls/:roll_id/return', authMiddleware, async (req, res) => {
 
     await connection.commit();
 
-    // Return updated fabric structure
-    const updatedFabrics = await buildFabricStructure();
+    // Return updated aggregated fabric structure
+    const updatedFabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = updatedFabrics.find(f => f.fabric_id === roll.fabric_id);
     res.json(updatedFabric || updatedFabrics);
   } catch (error) {
@@ -2286,78 +2295,111 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(400).json({ error: 'No available rolls found for this fabric and color' });
     }
     
-    // If subtracting by roll count, calculate total amount
-    if (rollCount !== null) {
-      amountMeters = selectedRolls.reduce((sum, roll) => sum + (parseFloat(roll.length_meters) || 0), 0);
-    }
-    
-    // Check if we have enough length
-    const totalAvailable = selectedRolls.reduce((sum, roll) => sum + (parseFloat(roll.length_meters) || 0), 0);
-    if (totalAvailable < amountMeters) {
-      await connection.rollback();
-      return res.status(400).json({ 
-        error: `Insufficient inventory. Available: ${totalAvailable.toFixed(2)}m, Requested: ${amountMeters.toFixed(2)}m` 
-      });
-    }
-    
     // Handle transaction group
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
     
-    if (transactionGroupId) {
-      await createOrUpdateTransactionGroup(
-        connection,
-        transactionGroupId,
-        customer_id,
-        customer_name,
-        notes,
-        amountMeters,
-        transactionType,
-        null
-      );
-    }
-    
-    // Process each roll
+    // Process based on transaction type: roll_count vs length
     const now = getLebanonTimestamp();
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     
-    let remainingAmount = amountMeters;
-    const processedRolls = [];
-    
-    for (const roll of selectedRolls) {
-      const rollLength = parseFloat(roll.length_meters) || 0;
-      const amountToSubtract = Math.min(remainingAmount, rollLength);
-      
-      if (amountToSubtract >= rollLength) {
-        // Mark entire roll as sold
-        await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [roll.roll_id]);
-        processedRolls.push({ roll_id: roll.roll_id, amount: rollLength, full_roll: true });
-      } else {
-        // Partial roll - mark as sold and create new roll with remaining length
-        const remainingLength = rollLength - amountToSubtract;
-        const remainingYards = remainingLength * 1.0936;
-        
-        // Mark original roll as sold
-        await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [roll.roll_id]);
-        
-        // Create new roll with remaining length
-        const [newRollResult] = await connection.query(
-          'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, CURDATE(), ?, ?, ?, ?, ?, FALSE)',
-          [colorId, fabricId, remainingLength, remainingYards, roll.is_trimmable, roll.weight || 'N/A', 'available']
-        );
-        
-        processedRolls.push({ roll_id: roll.roll_id, amount: amountToSubtract, full_roll: false, new_roll_id: newRollResult.insertId });
+    if (rollCount !== null) {
+      // Selling by roll count: mark all selected rolls as sold immediately, regardless of length
+      if (selectedRolls.length < rollCount) {
+        await connection.rollback();
+        return res.status(400).json({ 
+          error: `Insufficient rolls available. Requested: ${rollCount}, Available: ${selectedRolls.length}` 
+        });
       }
       
-      // Create log entry for this roll
-      await connection.query(
-        'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['sell', roll.roll_id, fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountToSubtract, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
-      );
+      // Calculate total amount from selected rolls for logging/transaction group purposes
+      amountMeters = selectedRolls.reduce((sum, roll) => sum + (parseFloat(roll.length_meters) || 0), 0);
       
-      remainingAmount -= amountToSubtract;
-      if (remainingAmount <= 0.001) break; // Small epsilon for floating point
+      // Create transaction group with calculated total
+      if (transactionGroupId) {
+        await createOrUpdateTransactionGroup(
+          connection,
+          transactionGroupId,
+          customer_id,
+          customer_name,
+          notes,
+          amountMeters,
+          transactionType,
+          null
+        );
+      }
+      
+      // Mark all selected rolls as sold (complete rolls, regardless of length)
+      for (const roll of selectedRolls) {
+        await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [roll.roll_id]);
+        
+        // Create log entry for this roll - use actual roll length for logging
+        const rollLength = parseFloat(roll.length_meters) || 0;
+        await connection.query(
+          'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          ['sell', roll.roll_id, fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, rollLength, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+        );
+      }
+    } else {
+      // Selling by length: process rolls until we have enough length
+      // Check if we have enough length
+      const totalAvailable = selectedRolls.reduce((sum, roll) => sum + (parseFloat(roll.length_meters) || 0), 0);
+      if (totalAvailable < amountMeters) {
+        await connection.rollback();
+        return res.status(400).json({ 
+          error: `Insufficient inventory. Available: ${totalAvailable.toFixed(2)}m, Requested: ${amountMeters.toFixed(2)}m` 
+        });
+      }
+      
+      // Create transaction group
+      if (transactionGroupId) {
+        await createOrUpdateTransactionGroup(
+          connection,
+          transactionGroupId,
+          customer_id,
+          customer_name,
+          notes,
+          amountMeters,
+          transactionType,
+          null
+        );
+      }
+      
+      // Process each roll by length
+      let remainingAmount = amountMeters;
+      
+      for (const roll of selectedRolls) {
+        const rollLength = parseFloat(roll.length_meters) || 0;
+        const amountToSubtract = Math.min(remainingAmount, rollLength);
+        
+        if (amountToSubtract >= rollLength) {
+          // Mark entire roll as sold
+          await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [roll.roll_id]);
+        } else {
+          // Partial roll - mark as sold and create new roll with remaining length
+          const remainingLength = rollLength - amountToSubtract;
+          const remainingYards = remainingLength * 1.0936;
+          
+          // Mark original roll as sold
+          await connection.query('UPDATE rolls SET sold = TRUE WHERE roll_id = ?', [roll.roll_id]);
+          
+          // Create new roll with remaining length
+          await connection.query(
+            'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, CURDATE(), ?, ?, ?, ?, ?, FALSE)',
+            [colorId, fabricId, remainingLength, remainingYards, roll.is_trimmable, roll.weight || 'N/A', 'available']
+          );
+        }
+        
+        // Create log entry for this roll
+        await connection.query(
+          'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          ['sell', roll.roll_id, fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountToSubtract, roll.is_trimmable, roll.weight || 'N/A', notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+        );
+        
+        remainingAmount -= amountToSubtract;
+        if (remainingAmount <= 0.001) break; // Small epsilon for floating point
+      }
     }
     
     await connection.commit();
