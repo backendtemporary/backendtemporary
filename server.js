@@ -1071,27 +1071,37 @@ app.get('/api/customers/:id/transaction-count', authMiddleware, async (req, res)
 });
 
 app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
   try {
-    // Check if customer has associated logs
-    const [logs] = await db.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
+    await connection.beginTransaction();
     
-    if (logs[0].count > 0) {
-      return res.status(409).json({ 
-        error: 'Cannot delete customer with transaction history',
-        detail: `This customer has ${logs[0].count} transaction(s). Consider archiving instead.`
-      });
-    }
-
-    const [result] = await db.query('DELETE FROM customers WHERE customer_id = ?', [req.params.id]);
+    // Check if customer has associated logs/transaction groups
+    const [logs] = await connection.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
+    const [groups] = await connection.query('SELECT COUNT(*) as count FROM transaction_groups WHERE customer_id = ?', [req.params.id]);
+    const transactionCount = (logs[0]?.count || 0) + (groups[0]?.count || 0);
+    
+    // Delete customer - this will set customer_id to NULL in logs due to ON DELETE SET NULL constraint
+    const [result] = await connection.query('DELETE FROM customers WHERE customer_id = ?', [req.params.id]);
     
     if (result.affectedRows === 0) {
+      await connection.rollback();
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    res.json({ success: true });
+    await connection.commit();
+    
+    res.json({ 
+      success: true,
+      message: transactionCount > 0 
+        ? `Customer deleted. ${transactionCount} transaction(s) have been updated to remove customer association.`
+        : 'Customer deleted successfully.'
+    });
   } catch (error) {
+    await connection.rollback();
     console.error('Error deleting customer:', error.message, error.code);
     res.status(500).json({ error: error.message || 'Failed to delete customer' });
+  } finally {
+    connection.release();
   }
 });
 
