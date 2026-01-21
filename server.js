@@ -278,6 +278,7 @@ const buildFabricColorAggregatedStructure = async () => {
         weight,
         lot,
         roll_nb,
+        roll_count,
         status,
         sold,
         created_at,
@@ -316,6 +317,7 @@ const buildFabricColorAggregatedStructure = async () => {
         weight: color.weight || 'N/A',
         lot: color.lot || null,
         roll_nb: color.roll_nb || null,
+        roll_count: parseInt(color.roll_count) || 0,
         status: color.status || 'available',
         sold: Boolean(color.sold)
       });
@@ -1245,8 +1247,7 @@ app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), asyn
 
     // IMPORTANT: Do NOT delete logs - they are append-only audit records
     // Logs will have fabric_id set to NULL via ON DELETE SET NULL constraint
-    // Cascade delete: rolls -> colors -> fabric (logs preserved)
-    await connection.query('DELETE FROM rolls WHERE fabric_id = ?', [fabricId]);
+    // Cascade delete: colors -> fabric (logs preserved, rolls table removed)
     await connection.query('DELETE FROM colors WHERE fabric_id = ?', [fabricId]);
     await connection.query('DELETE FROM fabrics WHERE fabric_id = ?', [fabricId]);
 
@@ -1276,8 +1277,7 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
       return res.status(404).json({ error: 'Color not found' });
     }
 
-    // Cascade delete: rolls -> color
-    await connection.query('DELETE FROM rolls WHERE color_id = ?', [colorId]);
+    // Cascade delete: color (rolls table removed, attributes are now on colors)
     await connection.query('DELETE FROM colors WHERE color_id = ?', [colorId]);
 
     await connection.commit();
