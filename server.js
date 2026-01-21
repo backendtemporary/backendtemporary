@@ -2528,7 +2528,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   } finally {
     connection.release();
   }
-});
+}); */
 
 // ============================================
 // LOGS ENDPOINTS (Accept fabricIndex/colorIndex, store fabricId/colorId)
