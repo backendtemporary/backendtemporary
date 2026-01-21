@@ -274,6 +274,8 @@ const buildFabricColorAggregatedStructure = async () => {
         color_name,
         length_meters,
         length_yards,
+        initial_length_meters,
+        initial_length_yards,
         date,
         weight,
         lot,
@@ -313,6 +315,8 @@ const buildFabricColorAggregatedStructure = async () => {
         total_yards: parseFloat(color.length_yards) || 0,
         length_meters: parseFloat(color.length_meters) || 0,
         length_yards: parseFloat(color.length_yards) || 0,
+        initial_length_meters: color.initial_length_meters ? parseFloat(color.initial_length_meters) : null,
+        initial_length_yards: color.initial_length_yards ? parseFloat(color.initial_length_yards) : null,
         date: color.date,
         weight: color.weight || 'N/A',
         lot: color.lot || null,
@@ -1416,13 +1420,18 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
 
     // Insert color with roll attributes
     const rollCountValue = parseInt(roll_count) || 0;
+    // Set initial length if this is the first length (non-zero)
+    const initialLenM = (lenM > 0) ? lenM : null;
+    const initialLenY = (lenY > 0) ? lenY : null;
     const [result] = await connection.query(
-      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, date, weight, lot, roll_nb, roll_count, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         fabricId, 
         color_name.trim(), 
         lenM, 
-        lenY, 
+        lenY,
+        initialLenM,
+        initialLenY,
         rollDate, 
         weight || 'N/A', 
         lotValue, 
@@ -1471,9 +1480,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
 
     await connection.beginTransaction();
 
-    // Check color exists and get fabric_id
+    // Check color exists and get fabric_id, initial_length
     const [colors] = await connection.query(
-      'SELECT color_id, fabric_id FROM colors WHERE color_id = ?',
+      'SELECT color_id, fabric_id, initial_length_meters, initial_length_yards FROM colors WHERE color_id = ?',
       [colorId]
     );
     if (colors.length === 0) {
@@ -1481,6 +1490,8 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Color not found' });
     }
     const fabricId = colors[0].fabric_id;
+    const currentInitialMeters = colors[0].initial_length_meters;
+    const currentInitialYards = colors[0].initial_length_yards;
 
     // Build dynamic update query
     const updates = [];
@@ -1512,6 +1523,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       }
       updates.push('length_meters = ?');
       values.push(lenM);
+      // Set initial_length_meters if it's null and new length > 0
+      if (!currentInitialMeters && lenM > 0) {
+        updates.push('initial_length_meters = ?');
+        values.push(lenM);
+      }
     }
 
     if (length_yards !== undefined) {
@@ -1522,6 +1538,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       }
       updates.push('length_yards = ?');
       values.push(lenY);
+      // Set initial_length_yards if it's null and new length > 0
+      if (!currentInitialYards && lenY > 0) {
+        updates.push('initial_length_yards = ?');
+        values.push(lenY);
+      }
     }
 
     if (date !== undefined) {
