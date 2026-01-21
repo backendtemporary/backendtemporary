@@ -1380,7 +1380,8 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       date, 
       weight, 
       lot, 
-      roll_nb 
+      roll_nb,
+      roll_count 
     } = req.body;
 
     if (!color_name || !color_name.trim()) {
@@ -1414,8 +1415,9 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
 
     // Insert color with roll attributes
+    const rollCountValue = parseInt(roll_count) || 0;
     const [result] = await connection.query(
-      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, date, weight, lot, roll_nb, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, date, weight, lot, roll_nb, roll_count, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         fabricId, 
         color_name.trim(), 
@@ -1425,6 +1427,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         weight || 'N/A', 
         lotValue, 
         rollNbValue,
+        rollCountValue,
         'available',
         0
       ]
@@ -1462,6 +1465,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       weight,
       lot,
       roll_nb,
+      roll_count,
       status
     } = req.body;
 
@@ -1541,6 +1545,12 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
       updates.push('roll_nb = ?');
       values.push(rollNbValue);
+    }
+
+    if (roll_count !== undefined) {
+      const rollCountValue = parseInt(roll_count) || 0;
+      updates.push('roll_count = ?');
+      values.push(rollCountValue);
     }
 
     if (status !== undefined) {
