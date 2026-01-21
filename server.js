@@ -267,25 +267,10 @@ const buildFabricColorAggregatedStructure = async () => {
   try {
     const [fabrics] = await db.query('SELECT * FROM fabrics ORDER BY fabric_id');
     // Colors now have roll attributes directly (length_meters, length_yards, date, etc.)
+    // Note: initial_length_meters and initial_length_yards may not exist in older schemas
+    // Using SELECT * to handle missing columns gracefully (they'll be undefined if not present)
     const [colors] = await db.query(`
-      SELECT 
-        color_id,
-        fabric_id,
-        color_name,
-        length_meters,
-        length_yards,
-        initial_length_meters,
-        initial_length_yards,
-        date,
-        weight,
-        lot,
-        roll_nb,
-        roll_count,
-        status,
-        sold,
-        created_at,
-        updated_at
-      FROM colors 
+      SELECT * FROM colors 
       WHERE (sold = FALSE OR sold IS NULL OR sold = 0)
       ORDER BY fabric_id, color_id
     `);
