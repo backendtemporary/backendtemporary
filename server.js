@@ -275,7 +275,6 @@ const buildFabricColorAggregatedStructure = async () => {
         length_meters,
         length_yards,
         date,
-        is_trimmable,
         weight,
         lot,
         roll_nb,
@@ -314,8 +313,6 @@ const buildFabricColorAggregatedStructure = async () => {
         length_meters: parseFloat(color.length_meters) || 0,
         length_yards: parseFloat(color.length_yards) || 0,
         date: color.date,
-        is_trimmable: Boolean(color.is_trimmable),
-        isTrimmable: Boolean(color.is_trimmable),
         weight: color.weight || 'N/A',
         lot: color.lot || null,
         roll_nb: color.roll_nb || null,
@@ -505,13 +502,10 @@ function getLebanonTimestamp(date = new Date()) {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
   });
-  // fmt.format returns "YYYY-MM-DD HH:mm:ss" in the specified timezone
+  // fmt.format returns "YYYY-MM-DD" in the specified timezone (date only, no time)
   const formatted = fmt.format(date);
-  const iso = formatted.replace(' ', 'T');
+  const iso = formatted + 'T00:00:00'; // Add time for ISO format but use midnight
   return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
 }
 
@@ -1384,7 +1378,6 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       length_meters, 
       length_yards, 
       date, 
-      is_trimmable, 
       weight, 
       lot, 
       roll_nb 
@@ -1422,14 +1415,13 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
 
     // Insert color with roll attributes
     const [result] = await connection.query(
-      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, date, is_trimmable, weight, lot, roll_nb, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, date, weight, lot, roll_nb, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         fabricId, 
         color_name.trim(), 
         lenM, 
         lenY, 
         rollDate, 
-        Boolean(is_trimmable), 
         weight || 'N/A', 
         lotValue, 
         rollNbValue,
@@ -1467,7 +1459,6 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       length_meters,
       length_yards,
       date,
-      is_trimmable,
       weight,
       lot,
       roll_nb,
@@ -1533,11 +1524,6 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       const rollDate = date ? String(date).trim() : null;
       updates.push('date = ?');
       values.push(rollDate);
-    }
-
-    if (is_trimmable !== undefined) {
-      updates.push('is_trimmable = ?');
-      values.push(Boolean(is_trimmable));
     }
 
     if (weight !== undefined) {
@@ -1655,12 +1641,11 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
        SET length_meters = ?, 
            length_yards = ?, 
            date = COALESCE(?, date),
-           is_trimmable = COALESCE(?, is_trimmable),
            weight = COALESCE(?, weight),
            lot = COALESCE(?, lot),
            roll_nb = COALESCE(?, roll_nb)
        WHERE color_id = ?`,
-      [newMeters, newYards, rollDate, Boolean(is_trimmable), weight || null, lotValue, rollNbValue, colorId]
+      [newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
     );
 
     await connection.commit();
@@ -2311,7 +2296,7 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
 async function getColorForTransaction(connection, fabricId, colorId) {
   const [colors] = await connection.query(
     `SELECT color_id, fabric_id, color_name, length_meters, length_yards, 
-            date, is_trimmable, weight, lot, roll_nb, status, sold
+            date, weight, lot, roll_nb, status, sold
      FROM colors 
      WHERE fabric_id = ? AND color_id = ? 
        AND (sold = FALSE OR sold IS NULL OR sold = 0)
@@ -2327,7 +2312,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const colorId = parseInt(req.params.color_id);
-    const { amount_meters, amount_yards, roll_count, lot, roll_nb, customer_id, customer_name, notes } = req.body;
+    const { amount_meters, amount_yards, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes } = req.body;
     
     // Validation
     if (!fabricId || !colorId) {
@@ -2412,8 +2397,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb;
     
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, Boolean(color.is_trimmable), color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['sell', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -2431,8 +2416,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   }
 });
 
-// POST /api/fabrics/:fabric_id/colors/:color_id/trim - Trim by meters (subtract from color, only if trimmable)
-app.post('/api/fabrics/:fabric_id/colors/:color_id/trim', authMiddleware, async (req, res) => {
+// POST /api/fabrics/:fabric_id/colors/:color_id/trim - DEPRECATED: Trim functionality removed
+/* app.post('/api/fabrics/:fabric_id/colors/:color_id/trim', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
@@ -2526,8 +2511,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/trim', authMiddleware, async 
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb;
     
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, true, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
