@@ -1357,7 +1357,8 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
 
 // PUT bulk update - DEPRECATED: Use granular endpoints instead
 // Kept for backward compatibility but should be phased out
-app.put('/api/fabrics', authMiddleware, async (req, res) => {
+// Requires admin role since it can delete colors
+app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     console.warn('PUT /api/fabrics: Bulk save endpoint is deprecated. Use granular endpoints instead.');
     
