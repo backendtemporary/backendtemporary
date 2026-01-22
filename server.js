@@ -275,6 +275,32 @@ const buildFabricColorAggregatedStructure = async () => {
       ORDER BY fabric_id, color_id
     `);
     
+    // Fetch all lots for all colors
+    const [lots] = await db.query(`
+      SELECT * FROM color_lots 
+      ORDER BY color_id, lot_id
+    `);
+    
+    // Group lots by color_id
+    const lotsByColor = {};
+    lots.forEach(lot => {
+      if (!lotsByColor[lot.color_id]) {
+        lotsByColor[lot.color_id] = [];
+      }
+      lotsByColor[lot.color_id].push({
+        lot_id: lot.lot_id,
+        color_id: lot.color_id,
+        lot_number: lot.lot_number,
+        length_meters: parseFloat(lot.length_meters) || 0,
+        length_yards: parseFloat(lot.length_yards) || 0,
+        date: lot.date,
+        weight: lot.weight || null,
+        roll_nb: lot.roll_nb || null,
+        created_at: lot.created_at,
+        updated_at: lot.updated_at
+      });
+    });
+    
     // Build colors with roll attributes directly
     const colorsByFabric = {};
     colors.forEach(color => {
@@ -308,7 +334,9 @@ const buildFabricColorAggregatedStructure = async () => {
         roll_nb: color.roll_nb || null,
         roll_count: parseInt(color.roll_count) || 0,
         status: color.status || 'available',
-        sold: Boolean(color.sold)
+        sold: Boolean(color.sold),
+        // Include lots array for this color
+        lots: lotsByColor[color.color_id] || []
       });
     });
     
@@ -1380,7 +1408,8 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       weight, 
       lot, 
       roll_nb,
-      roll_count 
+      roll_count,
+      lots  // Array of lots: [{ lot_number, length_meters, length_yards, date, weight, roll_nb }]
     } = req.body;
 
     if (!color_name || !color_name.trim()) {
@@ -1413,6 +1442,49 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
 
+    // Validate lots if provided
+    if (lots && Array.isArray(lots) && lots.length > 0) {
+      // Calculate sum of lot lengths
+      let sumMeters = 0;
+      let sumYards = 0;
+      const lotNumbers = new Set();
+      
+      for (const lotItem of lots) {
+        if (!lotItem.lot_number || !lotItem.lot_number.trim()) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'Each lot must have a lot_number' });
+        }
+        
+        // Check for duplicate lot numbers
+        const lotNum = lotItem.lot_number.trim();
+        if (lotNumbers.has(lotNum)) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Duplicate lot number: ${lotNum}` });
+        }
+        lotNumbers.add(lotNum);
+        
+        const lotM = parseFloat(lotItem.length_meters) || 0;
+        const lotY = parseFloat(lotItem.length_yards) || 0;
+        
+        if (lotM < 0 || lotY < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'Lot lengths must be non-negative' });
+        }
+        
+        sumMeters += lotM;
+        sumYards += lotY;
+      }
+      
+      // Validate that sum equals total (allow small floating point differences)
+      const tolerance = 0.01;
+      if (Math.abs(sumMeters - lenM) > tolerance || Math.abs(sumYards - lenY) > tolerance) {
+        await connection.rollback();
+        return res.status(400).json({ 
+          error: `Sum of lot lengths (${sumMeters}m, ${sumYards}yd) must equal total length (${lenM}m, ${lenY}yd)` 
+        });
+      }
+    }
+
     // Insert color with roll attributes
     const rollCountValue = parseInt(roll_count) || 0;
     // Set initial length if this is the first length (non-zero)
@@ -1436,6 +1508,26 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         0
       ]
     );
+
+    const colorId = result.insertId;
+
+    // Insert lots if provided
+    if (lots && Array.isArray(lots) && lots.length > 0) {
+      for (const lotItem of lots) {
+        const lotM = parseFloat(lotItem.length_meters) || 0;
+        const lotY = parseFloat(lotItem.length_yards) || 0;
+        const lotDate = lotItem.date ? String(lotItem.date).trim() : rollDate;
+        const lotWeight = (lotItem.weight && typeof lotItem.weight === 'string' && lotItem.weight.trim() !== '') 
+          ? lotItem.weight.trim() : null;
+        const lotRollNb = (lotItem.roll_nb && typeof lotItem.roll_nb === 'string' && lotItem.roll_nb.trim() !== '') 
+          ? lotItem.roll_nb.trim() : null;
+        
+        await connection.query(
+          'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [colorId, lotItem.lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb]
+        );
+      }
+    }
 
     await connection.commit();
 
@@ -1688,6 +1780,293 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
     await connection.rollback();
     console.error('Error adding meters to color:', error);
     res.status(500).json({ error: error.message || 'Failed to add meters to color' });
+  } finally {
+    connection.release();
+  }
+});
+
+// ============================================
+// COLOR LOTS ENDPOINTS
+// ============================================
+
+// GET /api/colors/:color_id/lots - Get all lots for a color
+app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
+  try {
+    const colorId = parseInt(req.params.color_id);
+    
+    // Verify color exists
+    const [colors] = await db.query('SELECT color_id FROM colors WHERE color_id = ?', [colorId]);
+    if (colors.length === 0) {
+      return res.status(404).json({ error: 'Color not found' });
+    }
+    
+    const [lots] = await db.query(
+      'SELECT * FROM color_lots WHERE color_id = ? ORDER BY lot_id',
+      [colorId]
+    );
+    
+    const formattedLots = lots.map(lot => ({
+      lot_id: lot.lot_id,
+      color_id: lot.color_id,
+      lot_number: lot.lot_number,
+      length_meters: parseFloat(lot.length_meters) || 0,
+      length_yards: parseFloat(lot.length_yards) || 0,
+      date: lot.date,
+      weight: lot.weight || null,
+      roll_nb: lot.roll_nb || null,
+      created_at: lot.created_at,
+      updated_at: lot.updated_at
+    }));
+    
+    res.json(formattedLots);
+  } catch (error) {
+    console.error('Error fetching lots:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch lots' });
+  }
+});
+
+// POST /api/colors/:color_id/lots - Add a lot to a color
+app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const colorId = parseInt(req.params.color_id);
+    const { lot_number, length_meters, length_yards, date, weight, roll_nb } = req.body;
+    
+    if (!lot_number || !lot_number.trim()) {
+      return res.status(400).json({ error: 'Lot number is required' });
+    }
+    
+    const lotM = parseFloat(length_meters) || 0;
+    const lotY = parseFloat(length_yards) || 0;
+    
+    if (lotM < 0 || lotY < 0) {
+      return res.status(400).json({ error: 'Lot lengths must be non-negative' });
+    }
+    
+    await connection.beginTransaction();
+    
+    // Verify color exists and get total length
+    const [colors] = await connection.query(
+      'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? FOR UPDATE',
+      [colorId]
+    );
+    if (colors.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Color not found' });
+    }
+    
+    const fabricId = colors[0].fabric_id;
+    const totalMeters = parseFloat(colors[0].length_meters) || 0;
+    const totalYards = parseFloat(colors[0].length_yards) || 0;
+    
+    // Check for duplicate lot number
+    const [existing] = await connection.query(
+      'SELECT lot_id FROM color_lots WHERE color_id = ? AND lot_number = ?',
+      [colorId, lot_number.trim()]
+    );
+    if (existing.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Lot number already exists for this color' });
+    }
+    
+    // Get current sum of lot lengths
+    const [currentLots] = await connection.query(
+      'SELECT SUM(length_meters) as sum_meters, SUM(length_yards) as sum_yards FROM color_lots WHERE color_id = ?',
+      [colorId]
+    );
+    const currentSumM = parseFloat(currentLots[0]?.sum_meters) || 0;
+    const currentSumY = parseFloat(currentLots[0]?.sum_yards) || 0;
+    
+    // Validate that adding this lot doesn't exceed total
+    const newSumM = currentSumM + lotM;
+    const newSumY = currentSumY + lotY;
+    const tolerance = 0.01;
+    
+    if (newSumM > totalMeters + tolerance || newSumY > totalYards + tolerance) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: `Adding this lot would exceed total length. Current sum: ${currentSumM}m/${currentSumY}yd, Adding: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd` 
+      });
+    }
+    
+    // Insert lot
+    const lotDate = date ? String(date).trim() : new Date().toISOString().split('T')[0];
+    const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
+    const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
+    
+    const [result] = await connection.query(
+      'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [colorId, lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb]
+    );
+    
+    await connection.commit();
+    
+    // Return updated fabric structure
+    const fabrics = await buildFabricColorAggregatedStructure();
+    const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
+    if (!updatedFabric) {
+      return res.status(404).json({ error: 'Fabric not found after adding lot' });
+    }
+    
+    res.status(201).json(updatedFabric);
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error adding lot:', error);
+    res.status(500).json({ error: error.message || 'Failed to add lot' });
+  } finally {
+    connection.release();
+  }
+});
+
+// PUT /api/colors/:color_id/lots/:lot_id - Update a lot
+app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const colorId = parseInt(req.params.color_id);
+    const lotId = parseInt(req.params.lot_id);
+    const { lot_number, length_meters, length_yards, date, weight, roll_nb } = req.body;
+    
+    if (!lot_number || !lot_number.trim()) {
+      return res.status(400).json({ error: 'Lot number is required' });
+    }
+    
+    const lotM = parseFloat(length_meters) || 0;
+    const lotY = parseFloat(length_yards) || 0;
+    
+    if (lotM < 0 || lotY < 0) {
+      return res.status(400).json({ error: 'Lot lengths must be non-negative' });
+    }
+    
+    await connection.beginTransaction();
+    
+    // Verify lot exists and belongs to color
+    const [lots] = await connection.query(
+      'SELECT lot_id, color_id FROM color_lots WHERE lot_id = ? AND color_id = ?',
+      [lotId, colorId]
+    );
+    if (lots.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Lot not found' });
+    }
+    
+    // Get color total length
+    const [colors] = await connection.query(
+      'SELECT fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? FOR UPDATE',
+      [colorId]
+    );
+    const fabricId = colors[0].fabric_id;
+    const totalMeters = parseFloat(colors[0].length_meters) || 0;
+    const totalYards = parseFloat(colors[0].length_yards) || 0;
+    
+    // Check for duplicate lot number (excluding current lot)
+    const [existing] = await connection.query(
+      'SELECT lot_id FROM color_lots WHERE color_id = ? AND lot_number = ? AND lot_id != ?',
+      [colorId, lot_number.trim(), lotId]
+    );
+    if (existing.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Lot number already exists for this color' });
+    }
+    
+    // Get current lot length for difference calculation
+    const [currentLot] = await connection.query(
+      'SELECT length_meters, length_yards FROM color_lots WHERE lot_id = ?',
+      [lotId]
+    );
+    const oldLotM = parseFloat(currentLot[0].length_meters) || 0;
+    const oldLotY = parseFloat(currentLot[0].length_yards) || 0;
+    
+    // Get current sum of all other lots (excluding this one)
+    const [otherLots] = await connection.query(
+      'SELECT SUM(length_meters) as sum_meters, SUM(length_yards) as sum_yards FROM color_lots WHERE color_id = ? AND lot_id != ?',
+      [colorId, lotId]
+    );
+    const otherSumM = parseFloat(otherLots[0]?.sum_meters) || 0;
+    const otherSumY = parseFloat(otherLots[0]?.sum_yards) || 0;
+    
+    // Validate that new sum doesn't exceed total
+    const newSumM = otherSumM + lotM;
+    const newSumY = otherSumY + lotY;
+    const tolerance = 0.01;
+    
+    if (newSumM > totalMeters + tolerance || newSumY > totalYards + tolerance) {
+      await connection.rollback();
+      return res.status(400).json({ 
+        error: `Updating this lot would exceed total length. Other lots sum: ${otherSumM}m/${otherSumY}yd, New lot: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd` 
+      });
+    }
+    
+    // Update lot
+    const lotDate = date ? String(date).trim() : null;
+    const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
+    const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
+    
+    await connection.query(
+      'UPDATE color_lots SET lot_number = ?, length_meters = ?, length_yards = ?, date = ?, weight = ?, roll_nb = ? WHERE lot_id = ?',
+      [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, lotId]
+    );
+    
+    await connection.commit();
+    
+    // Return updated fabric structure
+    const fabrics = await buildFabricColorAggregatedStructure();
+    const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
+    if (!updatedFabric) {
+      return res.status(404).json({ error: 'Fabric not found after updating lot' });
+    }
+    
+    res.json(updatedFabric);
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error updating lot:', error);
+    res.status(500).json({ error: error.message || 'Failed to update lot' });
+  } finally {
+    connection.release();
+  }
+});
+
+// DELETE /api/colors/:color_id/lots/:lot_id - Delete a lot
+app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const colorId = parseInt(req.params.color_id);
+    const lotId = parseInt(req.params.lot_id);
+    
+    await connection.beginTransaction();
+    
+    // Verify lot exists and get fabric_id
+    const [lots] = await connection.query(
+      'SELECT lot_id, color_id FROM color_lots WHERE lot_id = ? AND color_id = ?',
+      [lotId, colorId]
+    );
+    if (lots.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Lot not found' });
+    }
+    
+    const [colors] = await connection.query(
+      'SELECT fabric_id FROM colors WHERE color_id = ?',
+      [colorId]
+    );
+    const fabricId = colors[0].fabric_id;
+    
+    // Delete lot
+    await connection.query('DELETE FROM color_lots WHERE lot_id = ?', [lotId]);
+    
+    await connection.commit();
+    
+    // Return updated fabric structure
+    const fabrics = await buildFabricColorAggregatedStructure();
+    const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
+    if (!updatedFabric) {
+      return res.status(404).json({ error: 'Fabric not found after deleting lot' });
+    }
+    
+    res.json(updatedFabric);
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error deleting lot:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete lot' });
   } finally {
     connection.release();
   }
