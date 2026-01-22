@@ -293,6 +293,8 @@ const buildFabricColorAggregatedStructure = async () => {
         lot_number: lot.lot_number,
         length_meters: parseFloat(lot.length_meters) || 0,
         length_yards: parseFloat(lot.length_yards) || 0,
+        initial_length_meters: lot.initial_length_meters ? parseFloat(lot.initial_length_meters) : null,
+        initial_length_yards: lot.initial_length_yards ? parseFloat(lot.initial_length_yards) : null,
         date: lot.date,
         weight: lot.weight || null,
         roll_nb: lot.roll_nb || null,
@@ -1522,9 +1524,13 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         const lotRollNb = (lotItem.roll_nb && typeof lotItem.roll_nb === 'string' && lotItem.roll_nb.trim() !== '') 
           ? lotItem.roll_nb.trim() : null;
         
+        // Set initial length when creating lot (first non-zero length)
+        const initialLotM = (lotM > 0) ? lotM : null;
+        const initialLotY = (lotY > 0) ? lotY : null;
+        
         await connection.query(
-          'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [colorId, lotItem.lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb]
+          'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [colorId, lotItem.lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb]
         );
       }
     }
@@ -1811,6 +1817,8 @@ app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
       lot_number: lot.lot_number,
       length_meters: parseFloat(lot.length_meters) || 0,
       length_yards: parseFloat(lot.length_yards) || 0,
+      initial_length_meters: lot.initial_length_meters ? parseFloat(lot.initial_length_meters) : null,
+      initial_length_yards: lot.initial_length_yards ? parseFloat(lot.initial_length_yards) : null,
       date: lot.date,
       weight: lot.weight || null,
       roll_nb: lot.roll_nb || null,
@@ -1894,9 +1902,13 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
     const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
     const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
     
+    // Set initial length when creating lot (first non-zero length)
+    const initialLotM = (lotM > 0) ? lotM : null;
+    const initialLotY = (lotY > 0) ? lotY : null;
+    
     const [result] = await connection.query(
-      'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [colorId, lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb]
+      'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [colorId, lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb]
     );
     
     await connection.commit();
@@ -3756,43 +3768,50 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
     
     const log = logs[0];
     const transactionGroupId = log.transaction_group_id;
-    const rollId = log.roll_id;
     const returnAmount = parseFloat(log.amount_meters) || 0;
+    const returnAmountYards = returnAmount * 1.0936;
 
-    // Step 2: Restore the roll (SAVE FIRST - before deleting log)
-    if ((log.type === 'sell' || log.type === 'trim') && rollId && returnAmount > 0) {
-      const [rolls] = await connection.query('SELECT * FROM rolls WHERE roll_id = ?', [rollId]);
+    // Step 2: Restore length to color (and lot if applicable) - SAVE FIRST before deleting log
+    if ((log.type === 'sell' || log.type === 'trim') && log.fabric_id && log.color_id && returnAmount > 0) {
+      // Get color with lock
+      const [colors] = await connection.query(
+        'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
+        [log.color_id, log.fabric_id]
+      );
       
-      if (rolls.length > 0) {
-        const roll = rolls[0];
-        const isSold = roll.sold === true || roll.sold === 1 || roll.sold === '1' || Boolean(roll.sold);
+      if (colors.length > 0) {
+        const color = colors[0];
+        const currentMeters = parseFloat(color.length_meters) || 0;
+        const currentYards = parseFloat(color.length_yards) || 0;
         
-        // Restore roll length
-        let newLengthM;
-        if (isSold || log.type === 'sell') {
-          // Restore to exactly the amount that was sold
-          newLengthM = returnAmount;
-        } else {
-          // Add to existing length for trim returns
-          const currentLength = parseFloat(roll.length_meters) || 0;
-          newLengthM = currentLength + returnAmount;
-        }
+        // Add length back to color
+        const newMeters = currentMeters + returnAmount;
+        const newYards = currentYards + returnAmountYards;
         
-        const newLengthY = newLengthM * 1.0936;
-        
-        // Update roll - restore length and mark as not sold
         await connection.query(
-          'UPDATE rolls SET length_meters = ?, length_yards = ?, sold = FALSE WHERE roll_id = ?',
-          [newLengthM, newLengthY, rollId]
+          'UPDATE colors SET length_meters = ?, length_yards = ?, sold = 0 WHERE color_id = ?',
+          [newMeters, newYards, log.color_id]
         );
-      } else {
-        // Roll doesn't exist (was sold), recreate it from log data
-        if (log.fabric_id && log.color_id) {
-          const newLengthY = returnAmount * 1.0936;
-          await connection.query(
-            'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, FALSE)',
-            [log.color_id, log.fabric_id, returnAmount, newLengthY, log.is_trimmable || 0, log.weight || 'N/A', 'available']
+        
+        // If log has lot number, try to restore to that specific lot
+        if (log.lot && log.lot.trim()) {
+          const [lots] = await connection.query(
+            'SELECT lot_id, length_meters, length_yards FROM color_lots WHERE color_id = ? AND lot_number = ? FOR UPDATE',
+            [log.color_id, log.lot.trim()]
           );
+          
+          if (lots.length > 0) {
+            const lot = lots[0];
+            const currentLotM = parseFloat(lot.length_meters) || 0;
+            const currentLotY = parseFloat(lot.length_yards) || 0;
+            const newLotM = currentLotM + returnAmount;
+            const newLotY = currentLotY + returnAmountYards;
+            
+            await connection.query(
+              'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
+              [newLotM, newLotY, lot.lot_id]
+            );
+          }
         }
       }
     }
@@ -3913,47 +3932,85 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
       [transactionGroupId]
     );
 
-    // Step 3: Restore all rolls (SAVE FIRST - before deleting logs)
+    // Step 3: Restore length to colors (and lots if applicable) - SAVE FIRST before deleting logs
+    // Group by color_id to avoid multiple locks on same color
+    const colorRestoreMap = {};
+    
     for (const log of logs) {
-      if (log.type === 'sell' || log.type === 'trim') {
-        const rollId = log.roll_id;
+      if ((log.type === 'sell' || log.type === 'trim') && log.fabric_id && log.color_id) {
         const returnAmount = parseFloat(log.amount_meters) || 0;
         
-        if (rollId && returnAmount > 0) {
-          // Check if roll exists
-          const [rolls] = await connection.query('SELECT * FROM rolls WHERE roll_id = ?', [rollId]);
+        if (returnAmount > 0) {
+          const key = `${log.fabric_id}_${log.color_id}`;
+          if (!colorRestoreMap[key]) {
+            colorRestoreMap[key] = {
+              fabric_id: log.fabric_id,
+              color_id: log.color_id,
+              totalAmount: 0,
+              lots: {} // Map of lot_number -> amount
+            };
+          }
+          colorRestoreMap[key].totalAmount += returnAmount;
           
-          if (rolls.length > 0) {
-            const roll = rolls[0];
-            const isSold = roll.sold === true || roll.sold === 1 || roll.sold === '1' || Boolean(roll.sold);
-            
-            // Restore roll length
-            let newLengthM;
-            if (isSold || log.type === 'sell') {
-              // Restore to exactly the amount that was sold
-              newLengthM = returnAmount;
-            } else {
-              // Add to existing length for trim returns
-              const currentLength = parseFloat(roll.length_meters) || 0;
-              newLengthM = currentLength + returnAmount;
+          // Track lot-specific amounts if lot number exists
+          if (log.lot && log.lot.trim()) {
+            const lotNum = log.lot.trim();
+            if (!colorRestoreMap[key].lots[lotNum]) {
+              colorRestoreMap[key].lots[lotNum] = 0;
             }
+            colorRestoreMap[key].lots[lotNum] += returnAmount;
+          }
+        }
+      }
+    }
+    
+    // Restore to each color
+    for (const key in colorRestoreMap) {
+      const restore = colorRestoreMap[key];
+      const returnAmount = restore.totalAmount;
+      const returnAmountYards = returnAmount * 1.0936;
+      
+      // Get color with lock
+      const [colors] = await connection.query(
+        'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
+        [restore.color_id, restore.fabric_id]
+      );
+      
+      if (colors.length > 0) {
+        const color = colors[0];
+        const currentMeters = parseFloat(color.length_meters) || 0;
+        const currentYards = parseFloat(color.length_yards) || 0;
+        
+        // Add length back to color
+        const newMeters = currentMeters + returnAmount;
+        const newYards = currentYards + returnAmountYards;
+        
+        await connection.query(
+          'UPDATE colors SET length_meters = ?, length_yards = ?, sold = 0 WHERE color_id = ?',
+          [newMeters, newYards, restore.color_id]
+        );
+        
+        // Restore to specific lots if applicable
+        for (const lotNum in restore.lots) {
+          const lotAmount = restore.lots[lotNum];
+          const lotAmountYards = lotAmount * 1.0936;
+          
+          const [lots] = await connection.query(
+            'SELECT lot_id, length_meters, length_yards FROM color_lots WHERE color_id = ? AND lot_number = ? FOR UPDATE',
+            [restore.color_id, lotNum]
+          );
+          
+          if (lots.length > 0) {
+            const lot = lots[0];
+            const currentLotM = parseFloat(lot.length_meters) || 0;
+            const currentLotY = parseFloat(lot.length_yards) || 0;
+            const newLotM = currentLotM + lotAmount;
+            const newLotY = currentLotY + lotAmountYards;
             
-            const newLengthY = newLengthM * 1.0936;
-            
-            // Update roll - restore length and mark as not sold
             await connection.query(
-              'UPDATE rolls SET length_meters = ?, length_yards = ?, sold = FALSE WHERE roll_id = ?',
-              [newLengthM, newLengthY, rollId]
+              'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
+              [newLotM, newLotY, lot.lot_id]
             );
-          } else {
-            // Roll doesn't exist (was sold), recreate it from log data
-            if (log.fabric_id && log.color_id) {
-              const newLengthY = returnAmount * 1.0936;
-              await connection.query(
-                'INSERT INTO rolls (color_id, fabric_id, date, length_meters, length_yards, is_trimmable, weight, status, sold) VALUES (?, ?, NOW(), ?, ?, ?, ?, ?, FALSE)',
-                [log.color_id, log.fabric_id, returnAmount, newLengthY, log.is_trimmable || 0, log.weight || 'N/A', 'available']
-              );
-            }
           }
         }
       }
