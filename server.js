@@ -2803,8 +2803,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(404).json({ error: 'Color not found or already sold' });
     }
     
-    // Get fabric info
-    const [fabrics] = await connection.query('SELECT fabric_name, fabric_code FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    // Get fabric info (including design for log formatting)
+    const [fabrics] = await connection.query('SELECT fabric_name, fabric_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabrics.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Fabric not found' });
@@ -2859,7 +2859,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const newYardsCalc = newMeters * 1.0936;
     
     // Calculate new roll_count (decrease by roll_count from request, or default to 0 if not provided)
-    const currentRollCount = parseInt(color.roll_count) || 0;
+    // Ensure we're reading the current roll_count from the database, not from the color object which might be stale
+    const [currentColorData] = await connection.query(
+      'SELECT roll_count FROM colors WHERE color_id = ?',
+      [colorId]
+    );
+    const currentRollCount = currentColorData && currentColorData.length > 0 
+      ? (parseInt(currentColorData[0].roll_count) || 0) 
+      : (parseInt(color.roll_count) || 0);
     const sellRollCount = parseInt(roll_count) || 0;
     const newRollCount = Math.max(0, currentRollCount - sellRollCount);
     
@@ -2894,9 +2901,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const lotValue = lotNumber || ((lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot);
     const rollNbValue = selectedLot?.roll_nb || ((roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb);
     
+    // Format fabric name with design code for logs
+    const fabricNameForLog = fabric.design && fabric.design !== 'none' 
+      ? `${fabric.fabric_name} [${fabric.design}]` 
+      : fabric.fabric_name;
+    
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -2960,8 +2972,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       return res.status(404).json({ error: 'Color not found' });
     }
     
-    // Get fabric info
-    const [fabrics] = await connection.query('SELECT fabric_name, fabric_code FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    // Get fabric info (including design for log formatting)
+    const [fabrics] = await connection.query('SELECT fabric_name, fabric_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabrics.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Fabric not found' });
@@ -2992,9 +3004,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const lotValue = color.lot || null;
     const rollNbValue = color.roll_nb || null;
     
+    // Format fabric name with design code for logs
+    const fabricNameForLog = fabric.design && fabric.design !== 'none' 
+      ? `${fabric.fabric_name} [${fabric.design}]` 
+      : fabric.fabric_name;
+    
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
