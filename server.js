@@ -1569,7 +1569,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       lot,
       roll_nb,
       roll_count,
-      status
+      status,
+      initial_length_meters,  // Admin only
+      initial_length_yards      // Admin only
     } = req.body;
 
     await connection.beginTransaction();
@@ -1671,6 +1673,35 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     if (status !== undefined) {
       updates.push('status = ?');
       values.push(status);
+    }
+
+    // Allow admins to update initial_length (admin only)
+    if (initial_length_meters !== undefined || initial_length_yards !== undefined) {
+      // Check if user is admin
+      if (req.user.role !== 'admin') {
+        await connection.rollback();
+        return res.status(403).json({ error: 'Only admins can update initial length' });
+      }
+      
+      if (initial_length_meters !== undefined) {
+        const initM = parseFloat(initial_length_meters);
+        if (isNaN(initM) || initM < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'Invalid initial_length_meters' });
+        }
+        updates.push('initial_length_meters = ?');
+        values.push(initM);
+      }
+      
+      if (initial_length_yards !== undefined) {
+        const initY = parseFloat(initial_length_yards);
+        if (isNaN(initY) || initY < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'Invalid initial_length_yards' });
+        }
+        updates.push('initial_length_yards = ?');
+        values.push(initY);
+      }
     }
 
     if (updates.length === 0) {
