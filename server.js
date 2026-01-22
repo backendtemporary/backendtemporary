@@ -1428,20 +1428,21 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Fabric not found' });
     }
 
-    // Check for duplicate color name (enforced by unique constraint)
-    const [existing] = await connection.query(
-      'SELECT color_id FROM colors WHERE fabric_id = ? AND color_name = ?',
-      [fabricId, color_name.trim()]
-    );
-    if (existing.length > 0) {
-      await connection.rollback();
-      return res.status(409).json({ error: 'Color name already exists for this fabric' });
-    }
-
     // Parse roll attributes (default to 0 if not provided)
     const lenM = parseFloat(length_meters) || 0;
     const lenY = parseFloat(length_yards) || 0;
     const rollDate = date ? String(date).trim() : new Date().toISOString().split('T')[0];
+    
+    // Check for duplicate color name with same date (enforced by unique constraint)
+    // Note: NULL dates are treated as distinct by MySQL, so multiple NULL dates are allowed
+    const [existing] = await connection.query(
+      'SELECT color_id FROM colors WHERE fabric_id = ? AND color_name = ? AND date = ?',
+      [fabricId, color_name.trim(), rollDate]
+    );
+    if (existing.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Color name already exists for this fabric on this date' });
+    }
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
 
@@ -1598,14 +1599,23 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         await connection.rollback();
         return res.status(400).json({ error: 'Color name cannot be empty' });
       }
-      // Check for duplicate color name (excluding current color)
+      // Get current date to check for duplicates
+      const [currentColor] = await connection.query(
+        'SELECT date FROM colors WHERE color_id = ?',
+        [colorId]
+      );
+      const currentDate = currentColor[0]?.date || null;
+      
+      // Check for duplicate color name with same date (excluding current color)
+      // If date is being updated, check against new date; otherwise check against current date
+      const checkDate = date !== undefined ? (date ? String(date).trim() : null) : currentDate;
       const [existing] = await connection.query(
-        'SELECT color_id FROM colors WHERE fabric_id = ? AND color_name = ? AND color_id != ?',
-        [fabricId, color_name.trim(), colorId]
+        'SELECT color_id FROM colors WHERE fabric_id = ? AND color_name = ? AND date = ? AND color_id != ?',
+        [fabricId, color_name.trim(), checkDate, colorId]
       );
       if (existing.length > 0) {
         await connection.rollback();
-        return res.status(409).json({ error: 'Color name already exists for this fabric' });
+        return res.status(409).json({ error: 'Color name already exists for this fabric on this date' });
       }
       updates.push('color_name = ?');
       values.push(color_name.trim());
@@ -3478,7 +3488,8 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
 });
 
 // PUT /api/transaction-groups/:transaction_group_id/permit-number - Update permit number with duplicate validation
-app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, requireRole('admin'), async (req, res) => {
+// Allow both admin and limited users to update permit numbers
+app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
