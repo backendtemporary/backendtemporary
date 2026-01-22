@@ -2717,7 +2717,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const colorId = parseInt(req.params.color_id);
-    const { amount_meters, amount_yards, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes } = req.body;
+    const { amount_meters, amount_yards, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes, lot_id } = req.body;
     
     // Validation
     if (!fabricId || !colorId) {
@@ -2757,7 +2757,40 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     }
     const fabric = fabrics[0];
     
-    // Check if we have enough length
+    // Handle lot_id if provided
+    let selectedLot = null;
+    let lotNumber = null;
+    if (lot_id) {
+      const [lots] = await connection.query(
+        'SELECT * FROM color_lots WHERE lot_id = ? AND color_id = ? FOR UPDATE',
+        [lot_id, colorId]
+      );
+      if (lots.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ error: 'Lot not found' });
+      }
+      selectedLot = lots[0];
+      lotNumber = selectedLot.lot_number;
+      
+      // Check if lot has enough length
+      const lotMeters = parseFloat(selectedLot.length_meters) || 0;
+      if (lotMeters < amountMeters) {
+        await connection.rollback();
+        return res.status(400).json({ 
+          error: `Insufficient lot inventory. Available: ${lotMeters.toFixed(2)}m, Requested: ${amountMeters.toFixed(2)}m` 
+        });
+      }
+      
+      // Update lot length
+      const newLotMeters = lotMeters - amountMeters;
+      const newLotYards = newLotMeters * 1.0936;
+      await connection.query(
+        'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
+        [newLotMeters, newLotYards, lot_id]
+      );
+    }
+    
+    // Check if we have enough length in color total
     const currentMeters = parseFloat(color.length_meters) || 0;
     if (currentMeters < amountMeters) {
       await connection.rollback();
@@ -2803,8 +2836,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const now = getLebanonTimestamp();
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
-    const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot;
-    const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb;
+    // Use lot number from selected lot if lot_id provided, otherwise use provided lot or color.lot
+    const lotValue = lotNumber || ((lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot);
+    const rollNbValue = selectedLot?.roll_nb || ((roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb);
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
