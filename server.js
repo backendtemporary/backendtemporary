@@ -3354,9 +3354,15 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
     
     const group = groups[0];
     
-    // Get all related logs
+    // Get all related logs with fabric main_code
     const [logs] = await db.query(
-      'SELECT * FROM logs WHERE transaction_group_id = ? ORDER BY epoch ASC',
+      `SELECT 
+        l.*,
+        f.main_code as fabric_main_code
+      FROM logs l
+      LEFT JOIN fabrics f ON l.fabric_id = f.fabric_id
+      WHERE l.transaction_group_id = ? 
+      ORDER BY l.epoch ASC, l.log_id ASC`,
       [transactionGroupId]
     );
     
@@ -3371,7 +3377,9 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       fabric_name: log.fabric_name,
       color_name: log.color_name,
       customer_name: log.customer_name,
+      main_code: log.fabric_main_code || null,
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
       is_trimmable: Boolean(log.is_trimmable),
       weight: log.weight,
       notes: log.notes,
@@ -3390,7 +3398,9 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       fabricName: log.fabric_name,
       colorName: log.color_name,
       customerName: log.customer_name,
+      mainCode: log.fabric_main_code || null,
       length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
       tz: log.timezone,
       isTrimmable: Boolean(log.is_trimmable),
       transactionGroupId: log.transaction_group_id || null
