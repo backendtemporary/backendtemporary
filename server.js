@@ -1571,8 +1571,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       roll_nb,
       roll_count,
       status,
-      initial_length_meters,  // Admin only
-      initial_length_yards      // Admin only
+      initial_length_meters,  // Admin only (or with update_initial_to_match)
+      initial_length_yards,   // Admin only (or with update_initial_to_match)
+      update_initial_to_match // When setting length: allow any user to set initial = length
     } = req.body;
 
     await connection.beginTransaction();
@@ -1694,8 +1695,24 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       values.push(status);
     }
 
-    // Allow admins to update initial_length (admin only). Constraint: initial >= current length.
-    if (initial_length_meters !== undefined || initial_length_yards !== undefined) {
+    // update_initial_to_match: when setting length, allow any user to set initial = new length.
+    const doUpdateInitialToMatch = update_initial_to_match === true || update_initial_to_match === 'true';
+    if (doUpdateInitialToMatch && (length_meters !== undefined || length_yards !== undefined)) {
+      const initM = length_meters !== undefined ? parseFloat(length_meters) : newLenM;
+      const initY = length_yards !== undefined ? parseFloat(length_yards) : newLenY;
+      if (!isNaN(initM) && initM >= 0) {
+        updates.push('initial_length_meters = ?');
+        values.push(initM);
+        newInitM = initM;
+      }
+      if (!isNaN(initY) && initY >= 0) {
+        updates.push('initial_length_yards = ?');
+        values.push(initY);
+        newInitY = initY;
+      }
+    }
+    // Allow admins to update initial_length explicitly (admin only). Constraint: initial >= current length.
+    else if (initial_length_meters !== undefined || initial_length_yards !== undefined) {
       if (req.user.role !== 'admin') {
         await connection.rollback();
         return res.status(403).json({ error: 'Only admins can update initial length' });
@@ -1766,13 +1783,13 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   }
 });
 
-// Shared handler: Add meters/yards to color. Also increases initial_length by the same amount.
-// Used by both add-meters and add-roll. Constraint: current length never exceeds initial.
+// Shared handler: Add meters/yards to color. Only updates current length by default.
+// Pass update_initial_to_match: true to also set initial = new current (when user confirms in UI).
 async function addMetersToColorHandler(req, res) {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
+    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb, update_initial_to_match } = req.body;
 
     const lenM = parseFloat(length_meters);
     const lenY = parseFloat(length_yards);
@@ -1793,8 +1810,6 @@ async function addMetersToColorHandler(req, res) {
     const fabricId = colors[0].fabric_id;
     const currentMeters = parseFloat(colors[0].length_meters) || 0;
     const currentYards = parseFloat(colors[0].length_yards) || 0;
-    const initM = colors[0].initial_length_meters != null ? parseFloat(colors[0].initial_length_meters) : null;
-    const initY = colors[0].initial_length_yards != null ? parseFloat(colors[0].initial_length_yards) : null;
 
     let rollDate = date;
     if (rollDate != null && rollDate !== undefined) {
@@ -1811,25 +1826,35 @@ async function addMetersToColorHandler(req, res) {
 
     const newMeters = currentMeters + lenM;
     const newYards = currentYards + lenY;
-    // Increase initial by the same amount. If initial was null, use current as baseline so initial = new total.
-    const baseM = initM != null ? initM : currentMeters;
-    const baseY = initY != null ? initY : currentYards;
-    const newInitialMeters = baseM + lenM;
-    const newInitialYards = baseY + lenY;
 
-    await connection.query(
-      `UPDATE colors 
-       SET length_meters = ?, 
-           length_yards = ?, 
-           initial_length_meters = ?, 
-           initial_length_yards = ?,
-           date = COALESCE(?, date),
-           weight = COALESCE(?, weight),
-           lot = COALESCE(?, lot),
-           roll_nb = COALESCE(?, roll_nb)
-       WHERE color_id = ?`,
-      [newMeters, newYards, newInitialMeters, newInitialYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
-    );
+    const updateInitial = update_initial_to_match === true || update_initial_to_match === 'true';
+    if (updateInitial) {
+      await connection.query(
+        `UPDATE colors 
+         SET length_meters = ?, 
+             length_yards = ?, 
+             initial_length_meters = ?, 
+             initial_length_yards = ?,
+             date = COALESCE(?, date),
+             weight = COALESCE(?, weight),
+             lot = COALESCE(?, lot),
+             roll_nb = COALESCE(?, roll_nb)
+         WHERE color_id = ?`,
+        [newMeters, newYards, newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
+      );
+    } else {
+      await connection.query(
+        `UPDATE colors 
+         SET length_meters = ?, 
+             length_yards = ?, 
+             date = COALESCE(?, date),
+             weight = COALESCE(?, weight),
+             lot = COALESCE(?, lot),
+             roll_nb = COALESCE(?, roll_nb)
+         WHERE color_id = ?`,
+        [newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
+      );
+    }
 
     await connection.commit();
 
@@ -1849,7 +1874,7 @@ async function addMetersToColorHandler(req, res) {
   }
 }
 
-// POST /api/colors/:color_id/add-meters - Add meters/yards to color (also increases initial)
+// POST /api/colors/:color_id/add-meters - Add meters/yards to color
 app.post('/api/colors/:color_id/add-meters', authMiddleware, addMetersToColorHandler);
 
 // POST /api/colors/:color_id/rolls - Add roll (same as add-meters; used by Add Roll / Batch Add)
@@ -3003,26 +3028,27 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     }
     const fabric = fabrics[0];
     
-    // Add meters/yards back to color. Also increase initial by same amount (add-to-fabric rule).
+    // Add meters/yards back to color. Optionally set initial = new current when update_initial_to_match.
     const currentMeters = parseFloat(color.length_meters) || 0;
     const currentYards = parseFloat(color.length_yards) || 0;
-    const initM = color.initial_length_meters != null ? parseFloat(color.initial_length_meters) : null;
-    const initY = color.initial_length_yards != null ? parseFloat(color.initial_length_yards) : null;
     const newMeters = currentMeters + amountMeters;
     const newYards = currentYards + (amountMeters * 1.0936);
-    const baseM = initM != null ? initM : currentMeters;
-    const baseY = initY != null ? initY : currentYards;
-    const newInitialMeters = baseM + amountMeters;
-    const newInitialYards = baseY + (amountMeters * 1.0936);
-    
     const currentRollCount = parseInt(color.roll_count) || 0;
     const returnRollCount = parseInt(roll_count) || 0;
     const newRollCount = currentRollCount + returnRollCount;
-    
-    await connection.query(
-      'UPDATE colors SET length_meters = ?, length_yards = ?, initial_length_meters = ?, initial_length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
-      [newMeters, newYards, newInitialMeters, newInitialYards, newRollCount, colorId]
-    );
+    const updateInitial = req.body.update_initial_to_match === true || req.body.update_initial_to_match === 'true';
+
+    if (updateInitial) {
+      await connection.query(
+        'UPDATE colors SET length_meters = ?, length_yards = ?, initial_length_meters = ?, initial_length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+        [newMeters, newYards, newMeters, newYards, newRollCount, colorId]
+      );
+    } else {
+      await connection.query(
+        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+        [newMeters, newYards, newRollCount, colorId]
+      );
+    }
     
     // Create log entry for return
     const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
