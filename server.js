@@ -515,7 +515,7 @@ const saveFabricStructure = async (fabricsArray) => {
   }
 };
 
-// Helper to get Lebanon-local timestamp (ISO-like) and epoch ms
+// Helper to get Lebanon-local date-only (no time). iso = YYYY-MM-DDT00:00:00, epoch = start of that day.
 function getLebanonTimestamp(date = new Date()) {
   const fmt = new Intl.DateTimeFormat('sv', {
     timeZone: 'Asia/Beirut',
@@ -524,10 +524,19 @@ function getLebanonTimestamp(date = new Date()) {
     month: '2-digit',
     day: '2-digit',
   });
-  // fmt.format returns "YYYY-MM-DD" in the specified timezone (date only, no time)
   const formatted = fmt.format(date);
-  const iso = formatted + 'T00:00:00'; // Add time for ISO format but use midnight
-  return { iso, epoch: date.valueOf(), tz: 'Asia/Beirut' };
+  const iso = formatted + 'T00:00:00';
+  const epoch = new Date(formatted + 'T00:00:00').getTime();
+  return { iso, epoch, tz: 'Asia/Beirut' };
+}
+
+// Normalize client timestamp to date-only (YYYY-MM-DDT00:00:00). Accept YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss.
+function normalizeTimestampToDate(ts) {
+  if (!ts || typeof ts !== 'string') return null;
+  const s = ts.trim();
+  const datePart = s.split('T')[0].split(' ')[0] || '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
+  return datePart + 'T00:00:00';
 }
 
 // Generate permit number automatically based on transaction type
@@ -3050,8 +3059,11 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       );
     }
     
-    // Create log entry for return
-    const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
+    // Create log entry for return (date-only, no time)
+    const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
+    const now = iso
+      ? { iso, epoch: epoch != null ? Number(epoch) : new Date(iso).getTime(), tz: 'Asia/Beirut' }
+      : getLebanonTimestamp();
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     const lotValue = color.lot || null;
@@ -3521,14 +3533,14 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       // Note: Permit number prefix should be updated by user if needed
     } else if (epoch && epoch !== currentGroup.epoch) {
       // Only epoch changed - DO NOT recalculate permit numbers (user wants manual control)
-      // Just update the epoch and transaction_date
-      const timestamp = new Date(epoch);
-      const isoString = timestamp.toISOString().replace('T', ' ').substring(0, 19);
+      // Store date-only (no time)
+      const d = new Date(Number(epoch));
+      const datePart = d.toISOString().split('T')[0];
+      const isoString = datePart + 'T00:00:00';
       await connection.query(
         'UPDATE transaction_groups SET epoch = ?, transaction_date = ? WHERE transaction_group_id = ?',
         [newEpoch, isoString, transactionGroupId]
       );
-      // Also update all related logs' timestamps and epochs
       await connection.query(
         'UPDATE logs SET epoch = ?, timestamp = ? WHERE transaction_group_id = ?',
         [newEpoch, isoString, transactionGroupId]
@@ -3793,7 +3805,15 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.isTrimmable;
     if (updates.weight !== undefined) updateData.weight = updates.weight;
     if (updates.notes !== undefined) updateData.notes = updates.notes;
-    if (updates.timestamp !== undefined) updateData.timestamp = updates.timestamp;
+    if (updates.timestamp !== undefined && String(updates.timestamp || '').trim()) {
+      const normalized = normalizeTimestampToDate(updates.timestamp);
+      if (normalized) {
+        updateData.timestamp = normalized;
+        if (updates.epoch === undefined) updateData.epoch = new Date(normalized).getTime();
+      } else {
+        updateData.timestamp = updates.timestamp;
+      }
+    }
     if (updates.epoch !== undefined) updateData.epoch = updates.epoch;
     if (updates.salesperson_id !== undefined) updateData.salesperson_id = updates.salesperson_id;
 
