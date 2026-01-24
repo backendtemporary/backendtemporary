@@ -1577,9 +1577,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
 
     await connection.beginTransaction();
 
-    // Check color exists and get fabric_id, initial_length
+    // Check color exists and get fabric_id, length, initial_length
     const [colors] = await connection.query(
-      'SELECT color_id, fabric_id, initial_length_meters, initial_length_yards FROM colors WHERE color_id = ?',
+      'SELECT color_id, fabric_id, length_meters, length_yards, initial_length_meters, initial_length_yards FROM colors WHERE color_id = ?',
       [colorId]
     );
     if (colors.length === 0) {
@@ -1587,8 +1587,10 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Color not found' });
     }
     const fabricId = colors[0].fabric_id;
-    const currentInitialMeters = colors[0].initial_length_meters;
-    const currentInitialYards = colors[0].initial_length_yards;
+    const currentLenM = parseFloat(colors[0].length_meters) || 0;
+    const currentLenY = parseFloat(colors[0].length_yards) || 0;
+    const currentInitialMeters = colors[0].initial_length_meters != null ? parseFloat(colors[0].initial_length_meters) : null;
+    const currentInitialYards = colors[0].initial_length_yards != null ? parseFloat(colors[0].initial_length_yards) : null;
 
     // Build dynamic update query
     const updates = [];
@@ -1621,6 +1623,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       values.push(color_name.trim());
     }
 
+    let newLenM = currentLenM;
+    let newLenY = currentLenY;
+    let newInitM = currentInitialMeters;
+    let newInitY = currentInitialYards;
+
     if (length_meters !== undefined) {
       const lenM = parseFloat(length_meters);
       if (isNaN(lenM) || lenM < 0) {
@@ -1629,10 +1636,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       }
       updates.push('length_meters = ?');
       values.push(lenM);
-      // Set initial_length_meters if it's null and new length > 0
+      newLenM = lenM;
       if (!currentInitialMeters && lenM > 0) {
         updates.push('initial_length_meters = ?');
         values.push(lenM);
+        newInitM = lenM;
       }
     }
 
@@ -1644,10 +1652,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       }
       updates.push('length_yards = ?');
       values.push(lenY);
-      // Set initial_length_yards if it's null and new length > 0
+      newLenY = lenY;
       if (!currentInitialYards && lenY > 0) {
         updates.push('initial_length_yards = ?');
         values.push(lenY);
+        newInitY = lenY;
       }
     }
 
@@ -1685,14 +1694,12 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       values.push(status);
     }
 
-    // Allow admins to update initial_length (admin only)
+    // Allow admins to update initial_length (admin only). Constraint: initial >= current length.
     if (initial_length_meters !== undefined || initial_length_yards !== undefined) {
-      // Check if user is admin
       if (req.user.role !== 'admin') {
         await connection.rollback();
         return res.status(403).json({ error: 'Only admins can update initial length' });
       }
-      
       if (initial_length_meters !== undefined) {
         const initM = parseFloat(initial_length_meters);
         if (isNaN(initM) || initM < 0) {
@@ -1701,8 +1708,8 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         }
         updates.push('initial_length_meters = ?');
         values.push(initM);
+        newInitM = initM;
       }
-      
       if (initial_length_yards !== undefined) {
         const initY = parseFloat(initial_length_yards);
         if (isNaN(initY) || initY < 0) {
@@ -1711,7 +1718,20 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         }
         updates.push('initial_length_yards = ?');
         values.push(initY);
+        newInitY = initY;
       }
+    }
+
+    // Enforce: current length cannot exceed initial. Use effective new length/initial.
+    const effInitM = newInitM != null ? newInitM : null;
+    const effInitY = newInitY != null ? newInitY : null;
+    if (effInitM != null && newLenM > effInitM) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Current length (meters) cannot exceed initial length. Please increase initial or reduce current.' });
+    }
+    if (effInitY != null && newLenY > effInitY) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Current length (yards) cannot exceed initial length. Please increase initial or reduce current.' });
     }
 
     if (updates.length === 0) {
@@ -1746,15 +1766,14 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/colors/:color_id/add-meters - Add meters/yards to color (replaces old roll creation)
-// This adds to existing meters/yards on the color
-app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) => {
+// Shared handler: Add meters/yards to color. Also increases initial_length by the same amount.
+// Used by both add-meters and add-roll. Constraint: current length never exceeds initial.
+async function addMetersToColorHandler(req, res) {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
     const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb } = req.body;
 
-    // Validation - date will default to today if not provided
     const lenM = parseFloat(length_meters);
     const lenY = parseFloat(length_yards);
     if (isNaN(lenM) || lenM < 0 || isNaN(lenY) || lenY < 0) {
@@ -1763,9 +1782,8 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
 
     await connection.beginTransaction();
 
-    // Get color and fabric_id with current values
     const [colors] = await connection.query(
-      'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? FOR UPDATE',
+      'SELECT color_id, fabric_id, length_meters, length_yards, initial_length_meters, initial_length_yards FROM colors WHERE color_id = ? FOR UPDATE',
       [colorId]
     );
     if (colors.length === 0) {
@@ -1775,48 +1793,46 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
     const fabricId = colors[0].fabric_id;
     const currentMeters = parseFloat(colors[0].length_meters) || 0;
     const currentYards = parseFloat(colors[0].length_yards) || 0;
+    const initM = colors[0].initial_length_meters != null ? parseFloat(colors[0].initial_length_meters) : null;
+    const initY = colors[0].initial_length_yards != null ? parseFloat(colors[0].initial_length_yards) : null;
 
-    // Handle date - preserve user-entered date or use today
     let rollDate = date;
     if (rollDate != null && rollDate !== undefined) {
-      if (rollDate instanceof Date) {
-        rollDate = rollDate.toISOString().split('T')[0];
-      } else {
-        rollDate = String(rollDate).trim();
-      }
+      rollDate = rollDate instanceof Date ? rollDate.toISOString().split('T')[0] : String(rollDate).trim();
     } else {
       rollDate = '';
     }
-    
-    if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined' || rollDate === 'NaN') {
-      rollDate = new Date().toISOString().split('T')[0];
-    } else if (!/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
+    if (!rollDate || rollDate === '' || rollDate === 'Invalid Date' || rollDate === 'null' || rollDate === 'undefined' || rollDate === 'NaN' || !/^\d{4}-\d{2}-\d{2}$/.test(rollDate)) {
       rollDate = new Date().toISOString().split('T')[0];
     }
 
-    // Handle lot and roll_nb - trim and convert empty to null
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
 
-    // Add meters/yards to existing values and update roll attributes
     const newMeters = currentMeters + lenM;
     const newYards = currentYards + lenY;
+    // Increase initial by the same amount. If initial was null, use current as baseline so initial = new total.
+    const baseM = initM != null ? initM : currentMeters;
+    const baseY = initY != null ? initY : currentYards;
+    const newInitialMeters = baseM + lenM;
+    const newInitialYards = baseY + lenY;
 
     await connection.query(
       `UPDATE colors 
        SET length_meters = ?, 
            length_yards = ?, 
+           initial_length_meters = ?, 
+           initial_length_yards = ?,
            date = COALESCE(?, date),
            weight = COALESCE(?, weight),
            lot = COALESCE(?, lot),
            roll_nb = COALESCE(?, roll_nb)
        WHERE color_id = ?`,
-      [newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
+      [newMeters, newYards, newInitialMeters, newInitialYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
     );
 
     await connection.commit();
 
-    // Return aggregated fabric structure with updated color
     const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
@@ -1831,7 +1847,13 @@ app.post('/api/colors/:color_id/add-meters', authMiddleware, async (req, res) =>
   } finally {
     connection.release();
   }
-});
+}
+
+// POST /api/colors/:color_id/add-meters - Add meters/yards to color (also increases initial)
+app.post('/api/colors/:color_id/add-meters', authMiddleware, addMetersToColorHandler);
+
+// POST /api/colors/:color_id/rolls - Add roll (same as add-meters; used by Add Roll / Batch Add)
+app.post('/api/colors/:color_id/rolls', authMiddleware, addMetersToColorHandler);
 
 // ============================================
 // COLOR LOTS ENDPOINTS
@@ -2755,7 +2777,8 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
 async function getColorForTransaction(connection, fabricId, colorId) {
   const [colors] = await connection.query(
     `SELECT color_id, fabric_id, color_name, length_meters, length_yards, 
-            date, weight, lot, roll_nb, status, sold
+            initial_length_meters, initial_length_yards,
+            date, weight, lot, roll_nb, roll_count, status, sold
      FROM colors 
      WHERE fabric_id = ? AND color_id = ? 
        AND (sold = FALSE OR sold IS NULL OR sold = 0)
@@ -2980,21 +3003,25 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     }
     const fabric = fabrics[0];
     
-    // Add meters/yards back to color
+    // Add meters/yards back to color. Also increase initial by same amount (add-to-fabric rule).
     const currentMeters = parseFloat(color.length_meters) || 0;
     const currentYards = parseFloat(color.length_yards) || 0;
+    const initM = color.initial_length_meters != null ? parseFloat(color.initial_length_meters) : null;
+    const initY = color.initial_length_yards != null ? parseFloat(color.initial_length_yards) : null;
     const newMeters = currentMeters + amountMeters;
     const newYards = currentYards + (amountMeters * 1.0936);
+    const baseM = initM != null ? initM : currentMeters;
+    const baseY = initY != null ? initY : currentYards;
+    const newInitialMeters = baseM + amountMeters;
+    const newInitialYards = baseY + (amountMeters * 1.0936);
     
-    // Add roll_count back
     const currentRollCount = parseInt(color.roll_count) || 0;
     const returnRollCount = parseInt(roll_count) || 0;
     const newRollCount = currentRollCount + returnRollCount;
     
-    // Update color (add back meters and roll_count)
     await connection.query(
-      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
-      [newMeters, newYards, newRollCount, colorId]
+      'UPDATE colors SET length_meters = ?, length_yards = ?, initial_length_meters = ?, initial_length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+      [newMeters, newYards, newInitialMeters, newInitialYards, newRollCount, colorId]
     );
     
     // Create log entry for return
