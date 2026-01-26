@@ -265,14 +265,27 @@ const buildFabricStructure = async () => {
 // Returns fabrics with colors that have roll attributes directly
 const buildFabricColorAggregatedStructure = async () => {
   try {
-    const [fabrics] = await db.query('SELECT * FROM fabrics ORDER BY fabric_id');
+    const [fabrics] = await db.query(`
+      SELECT f.*, 
+        u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+        u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM fabrics f
+      LEFT JOIN users u_created ON f.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON f.updated_by_user_id = u_updated.user_id
+      ORDER BY f.fabric_id
+    `);
     // Colors now have roll attributes directly (length_meters, length_yards, date, etc.)
     // Note: initial_length_meters and initial_length_yards may not exist in older schemas
     // Using SELECT * to handle missing columns gracefully (they'll be undefined if not present)
     const [colors] = await db.query(`
-      SELECT * FROM colors 
-      WHERE (sold = FALSE OR sold IS NULL OR sold = 0)
-      ORDER BY fabric_id, color_id
+      SELECT c.*,
+        u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+        u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM colors c
+      LEFT JOIN users u_created ON c.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id
+      WHERE (c.sold = FALSE OR c.sold IS NULL OR c.sold = 0)
+      ORDER BY c.fabric_id, c.color_id
     `);
     
     // Fetch all lots for all colors
@@ -337,6 +350,10 @@ const buildFabricColorAggregatedStructure = async () => {
         roll_count: parseInt(color.roll_count) || 0,
         status: color.status || 'available',
         sold: Boolean(color.sold),
+        created_by_username: color.created_by_username,
+        created_by_full_name: color.created_by_full_name,
+        updated_by_username: color.updated_by_username,
+        updated_by_full_name: color.updated_by_full_name,
         // Include lots array for this color
         lots: lotsByColor[color.color_id] || []
       });
@@ -352,6 +369,10 @@ const buildFabricColorAggregatedStructure = async () => {
       design: fabric.design,
       created_at: fabric.created_at,
       updated_at: fabric.updated_at,
+      created_by_username: fabric.created_by_username,
+      created_by_full_name: fabric.created_by_full_name,
+      updated_by_username: fabric.updated_by_username,
+      updated_by_full_name: fabric.updated_by_full_name,
       colors: colorsByFabric[fabric.fabric_id] || []
     }));
   } catch (error) {
@@ -390,24 +411,27 @@ const saveFabricStructure = async (fabricsArray) => {
       // Priority: fabric_id > main_code > insert new
       if (fabricId && existingFabricIds.has(fabricId)) {
         // UPDATE by fabric_id
+        const userId = req.user ? req.user.user_id : null;
         await connection.query(
-          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ? WHERE fabric_id = ?',
-          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design, fabricId]
+          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ?, updated_by_user_id = ? WHERE fabric_id = ?',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design, userId, fabricId]
         );
         processedFabricIds.add(fabricId);
       } else if (fabric.main_code && existingFabricsByMainCode.has(fabric.main_code)) {
         // UPDATE by main_code if no fabric_id provided
         fabricId = existingFabricsByMainCode.get(fabric.main_code);
+        const userId = req.user ? req.user.user_id : null;
         await connection.query(
-          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ? WHERE fabric_id = ?',
-          [fabric.fabric_name, fabric.fabric_code, fabric.main_code, fabric.source, fabric.design, fabricId]
+          'UPDATE fabrics SET fabric_name = ?, fabric_code = ?, main_code = ?, source = ?, design = ?, updated_by_user_id = ? WHERE fabric_id = ?',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code, fabric.source, fabric.design, userId, fabricId]
         );
         processedFabricIds.add(fabricId);
       } else {
         // INSERT new fabric
+        const userId = req.user ? req.user.user_id : null;
         const [result] = await connection.query(
-          'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design) VALUES (?, ?, ?, ?, ?)',
-          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design]
+          'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+          [fabric.fabric_name, fabric.fabric_code, fabric.main_code || null, fabric.source, fabric.design, userId]
         );
         fabricId = result.insertId;
         processedFabricIds.add(fabricId);
@@ -424,16 +448,18 @@ const saveFabricStructure = async (fabricsArray) => {
 
         if (colorId && existingColorIds.has(colorId)) {
           // UPDATE existing color
+          const userId = req.user ? req.user.user_id : null;
           await connection.query(
-            'UPDATE colors SET color_name = ? WHERE color_id = ?',
-            [color.color_name, colorId]
+            'UPDATE colors SET color_name = ?, updated_by_user_id = ? WHERE color_id = ?',
+            [color.color_name, userId, colorId]
           );
           processedColorIds.add(colorId);
         } else {
           // INSERT new color
+          const userId = req.user ? req.user.user_id : null;
           const [result] = await connection.query(
-            'INSERT INTO colors (fabric_id, color_name) VALUES (?, ?)',
-            [fabricId, color.color_name]
+            'INSERT INTO colors (fabric_id, color_name, created_by_user_id) VALUES (?, ?, ?)',
+            [fabricId, color.color_name, userId]
           );
           colorId = result.insertId;
           processedColorIds.add(colorId);
@@ -1050,7 +1076,12 @@ app.put('/api/deletion-requests/:id/reject', authMiddleware, requireRole('admin'
 app.get('/api/customers', authMiddleware, async (req, res) => {
   try {
     const search = (req.query.search || '').trim();
-    let sql = 'SELECT * FROM customers';
+    let sql = `SELECT c.*,
+      u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+      u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM customers c
+      LEFT JOIN users u_created ON c.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id`;
     const params = [];
     if (search) {
       sql += ' WHERE customer_name LIKE ?';
@@ -1082,11 +1113,20 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
+    const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
-      'INSERT INTO customers (customer_name, phone, email, notes) VALUES (?, ?, ?, ?)',
-      [name.trim(), phone || null, email || null, notes || null]
+      'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
+      [name.trim(), phone || null, email || null, notes || null, userId]
     );
-    const [rows] = await db.query('SELECT * FROM customers WHERE customer_id = ?', [result.insertId]);
+    const [rows] = await db.query(`
+      SELECT c.*,
+        u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+        u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM customers c
+      LEFT JOIN users u_created ON c.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id
+      WHERE c.customer_id = ?
+    `, [result.insertId]);
     res.status(201).json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error creating customer:', error.message, error.code);
@@ -1107,6 +1147,8 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    const userId = req.user ? req.user.user_id : null;
+    updates.updated_by_user_id = userId;
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updates), req.params.id];
     await db.query(`UPDATE customers SET ${fields} WHERE customer_id = ?`, values);
@@ -1223,9 +1265,10 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
     }
 
     // Insert and return DB reality
+    const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
-      'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design) VALUES (?, ?, ?, ?, ?)',
-      [fabric_name.trim(), fabric_code, main_code || null, source || null, design || 'none']
+      'INSERT INTO fabrics (fabric_name, fabric_code, main_code, source, design, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [fabric_name.trim(), fabric_code, main_code || null, source || null, design || 'none', userId]
     );
 
     // Return aggregated structure for created fabric
@@ -1274,6 +1317,8 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    const userId = req.user ? req.user.user_id : null;
+    updates.updated_by_user_id = userId;
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updates), fabricId];
     
@@ -1525,8 +1570,9 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     // Set initial length if this is the first length (non-zero)
     const initialLenM = (lenM > 0) ? lenM : null;
     const initialLenY = (lenY > 0) ? lenY : null;
+    const userId = req.user ? req.user.user_id : null;
     const [result] = await connection.query(
-      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, status, sold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, status, sold, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         fabricId, 
         color_name.trim(), 
@@ -1540,7 +1586,8 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         rollNbValue,
         rollCountValue,
         'available',
-        0
+        0,
+        userId
       ]
     );
 
@@ -1561,9 +1608,10 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         const initialLotM = (lotM > 0) ? lotM : null;
         const initialLotY = (lotY > 0) ? lotY : null;
         
+        const userId = req.user ? req.user.user_id : null;
         await connection.query(
-          'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [colorId, lotItem.lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb]
+          'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [colorId, lotItem.lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb, userId]
         );
       }
     }
@@ -1787,6 +1835,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    const userId = req.user ? req.user.user_id : null;
+    updates.push('updated_by_user_id = ?');
+    values.push(userId);
     values.push(colorId);
 
     // Update color with roll attributes
@@ -2026,9 +2077,10 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
     const initialLotM = (lotM > 0) ? lotM : null;
     const initialLotY = (lotY > 0) ? lotY : null;
     
+    const userId = req.user ? req.user.user_id : null;
     const [result] = await connection.query(
-      'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [colorId, lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb]
+      'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [colorId, lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb, userId]
     );
     
     await connection.commit();
@@ -2133,9 +2185,10 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
     const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
     const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
     
+    const userId = req.user ? req.user.user_id : null;
     await connection.query(
-      'UPDATE color_lots SET lot_number = ?, length_meters = ?, length_yards = ?, date = ?, weight = ?, roll_nb = ? WHERE lot_id = ?',
-      [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, lotId]
+      'UPDATE color_lots SET lot_number = ?, length_meters = ?, length_yards = ?, date = ?, weight = ?, roll_nb = ?, updated_by_user_id = ? WHERE lot_id = ?',
+      [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, userId, lotId]
     );
     
     await connection.commit();
@@ -4322,7 +4375,12 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
 app.get('/api/salespersons', authMiddleware, async (req, res) => {
   try {
     const { active } = req.query;
-    let query = 'SELECT * FROM salespersons';
+    let query = `SELECT s.*,
+      u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+      u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM salespersons s
+      LEFT JOIN users u_created ON s.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id`;
     const params = [];
     
     if (active !== undefined) {
@@ -4357,12 +4415,21 @@ app.post('/api/salespersons', authMiddleware, async (req, res) => {
       }
     }
     
+    const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
-      'INSERT INTO salespersons (name, code, email, phone, active) VALUES (?, ?, ?, ?, ?)',
-      [name.trim(), code || null, email || null, phone || null, Boolean(active)]
+      'INSERT INTO salespersons (name, code, email, phone, active, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [name.trim(), code || null, email || null, phone || null, Boolean(active), userId]
     );
     
-    const [newSalesperson] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [result.insertId]);
+    const [newSalesperson] = await db.query(`
+      SELECT s.*,
+        u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+        u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM salespersons s
+      LEFT JOIN users u_created ON s.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
+      WHERE s.salesperson_id = ?
+    `, [result.insertId]);
     res.status(201).json(newSalesperson[0]);
   } catch (error) {
     console.error('Error creating salesperson:', error);
@@ -4409,11 +4476,21 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
     
+    const userId = req.user ? req.user.user_id : null;
+    updates.updated_by_user_id = userId;
     values.push(salespersonId);
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     await db.query(`UPDATE salespersons SET ${fields} WHERE salesperson_id = ?`, values);
     
-    const [updated] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+    const [updated] = await db.query(`
+      SELECT s.*,
+        u_created.username as created_by_username, u_created.full_name as created_by_full_name,
+        u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
+      FROM salespersons s
+      LEFT JOIN users u_created ON s.created_by_user_id = u_created.user_id
+      LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
+      WHERE s.salesperson_id = ?
+    `, [salespersonId]);
     res.json(updated[0]);
   } catch (error) {
     console.error('Error updating salesperson:', error);
@@ -4503,6 +4580,65 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'RisetexCo API is running' });
 });
 
+// Monthly sales report endpoint
+app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
+  try {
+    const { year, month } = req.query;
+    
+    let query = `
+      SELECT 
+        DATE_FORMAT(FROM_UNIXTIME(l.epoch / 1000), '%Y-%m') as month,
+        l.type,
+        COUNT(*) as transaction_count,
+        SUM(CASE WHEN l.type = 'sell' THEN l.length_meters ELSE l.amount_meters END) as total_meters,
+        SUM(CASE WHEN l.type = 'sell' THEN l.length_meters * 1.0936 ELSE l.amount_meters * 1.0936 END) as total_yards,
+        SUM(COALESCE(l.roll_count, 0)) as total_rolls
+      FROM logs l
+      WHERE l.type IN ('sell', 'trim', 'return')
+    `;
+    const params = [];
+    
+    if (year) {
+      query += ' AND YEAR(FROM_UNIXTIME(l.epoch / 1000)) = ?';
+      params.push(parseInt(year));
+    }
+    if (month) {
+      query += ' AND MONTH(FROM_UNIXTIME(l.epoch / 1000)) = ?';
+      params.push(parseInt(month));
+    }
+    
+    query += ' GROUP BY month, l.type ORDER BY month DESC, l.type';
+    
+    const [results] = await db.query(query, params);
+    
+    // Group by month
+    const monthlyData = {};
+    results.forEach(row => {
+      if (!monthlyData[row.month]) {
+        monthlyData[row.month] = {
+          month: row.month,
+          sell: { count: 0, meters: 0, yards: 0, rolls: 0 },
+          trim: { count: 0, meters: 0, yards: 0, rolls: 0 },
+          return: { count: 0, meters: 0, yards: 0, rolls: 0 }
+        };
+      }
+      // Update the type data
+      if (monthlyData[row.month][row.type]) {
+        monthlyData[row.month][row.type] = {
+          count: row.transaction_count,
+          meters: parseFloat(row.total_meters || 0),
+          yards: parseFloat(row.total_yards || 0),
+          rolls: parseInt(row.total_rolls || 0)
+        };
+      }
+    });
+    
+    res.json(Object.values(monthlyData));
+  } catch (error) {
+    console.error('Error fetching monthly sales report:', error);
+    res.status(500).json({ error: 'Failed to fetch monthly sales report' });
+  }
+});
 
 ///TEST
 
