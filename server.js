@@ -9,13 +9,7 @@ import db from './db.js';
 
 import pool from "./db.js";
 
-// JWT_SECRET is required for security - fail if not set
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error('FATAL: JWT_SECRET environment variable is required');
-  console.error('Please set JWT_SECRET in your environment variables before starting the server');
-  process.exit(1);
-}
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,24 +30,9 @@ app.get("/api/__prove", (req, res) => {
 
 
 // Middleware
-// CORS: Whitelist specific origins for security
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
-  : ['http://localhost:5173', 'http://localhost:3000']; // Default to common dev ports
-
+// CORS: permissive config to avoid preflight timeouts in production
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, Postman, or curl)
-    if (!origin) {
-      return callback(null, true);
-    }
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn(`CORS blocked request from origin: ${origin}`);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -61,17 +40,6 @@ app.use(cors({
 
 app.options('*', cors());
 app.use(express.json());
-
-// Helper function to sanitize error messages for production
-const sanitizeError = (error, defaultMessage) => {
-  const isDevelopment = process.env.NODE_ENV === 'development';
-  if (isDevelopment) {
-    // In development, show full error details for debugging
-    return error?.message || defaultMessage;
-  }
-  // In production, only return safe default messages
-  return defaultMessage;
-};
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -1122,7 +1090,7 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
     res.status(201).json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error creating customer:', error.message, error.code);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to create customer') });
+    res.status(500).json({ error: error.message || 'Failed to create customer' });
   }
 });
 
@@ -1148,7 +1116,7 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
     res.json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error updating customer:', error.message, error.code);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to update customer') });
+    res.status(500).json({ error: error.message || 'Failed to update customer' });
   }
 });
 
@@ -1192,7 +1160,7 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error deleting customer:', error.message, error.code);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to delete customer') });
+    res.status(500).json({ error: error.message || 'Failed to delete customer' });
   } finally {
     connection.release();
   }
@@ -1453,7 +1421,7 @@ app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) =
   } catch (error) {
     console.error('PUT /api/fabrics error:', error.message);
     console.error('Error stack:', error.stack);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to update fabrics') });
+    res.status(500).json({ error: error.message || 'Failed to update fabrics' });
   }
 });
 
@@ -1613,7 +1581,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error creating color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to create color') });
+    res.status(500).json({ error: error.message || 'Failed to create color' });
   } finally {
     connection.release();
   }
@@ -1840,7 +1808,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error updating color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to update color') });
+    res.status(500).json({ error: error.message || 'Failed to update color' });
   } finally {
     connection.release();
   }
@@ -1931,7 +1899,7 @@ async function addMetersToColorHandler(req, res) {
   } catch (error) {
     await connection.rollback();
     console.error('Error adding meters to color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to add meters to color') });
+    res.status(500).json({ error: error.message || 'Failed to add meters to color' });
   } finally {
     connection.release();
   }
@@ -1981,7 +1949,7 @@ app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
     res.json(formattedLots);
   } catch (error) {
     console.error('Error fetching lots:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to fetch lots') });
+    res.status(500).json({ error: error.message || 'Failed to fetch lots' });
   }
 });
 
@@ -2076,7 +2044,7 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Error adding lot:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to add lot') });
+    res.status(500).json({ error: error.message || 'Failed to add lot' });
   } finally {
     connection.release();
   }
@@ -2183,7 +2151,7 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
   } catch (error) {
     await connection.rollback();
     console.error('Error updating lot:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to update lot') });
+    res.status(500).json({ error: error.message || 'Failed to update lot' });
   } finally {
     connection.release();
   }
@@ -2230,7 +2198,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error deleting lot:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to delete lot') });
+    res.status(500).json({ error: error.message || 'Failed to delete lot' });
   } finally {
     connection.release();
   }
@@ -2308,7 +2276,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error bulk updating rolls:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to bulk update rolls') });
+    res.status(500).json({ error: error.message || 'Failed to bulk update rolls' });
   } finally {
     connection.release();
   }
@@ -2442,7 +2410,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error updating roll:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to update roll') });
+    res.status(500).json({ error: error.message || 'Failed to update roll' });
   } finally {
     connection.release();
   }
@@ -2541,7 +2509,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error trimming roll:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to trim roll') });
+    res.status(500).json({ error: error.message || 'Failed to trim roll' });
   } finally {
     connection.release();
   }
@@ -2612,7 +2580,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error selling roll:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to sell roll') });
+    res.status(500).json({ error: error.message || 'Failed to sell roll' });
   } finally {
     connection.release();
   }
@@ -2851,7 +2819,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   } catch (error) {
     await connection.rollback();
     console.error('Error returning roll:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to return roll') });
+    res.status(500).json({ error: error.message || 'Failed to return roll' });
   } finally {
     connection.release();
   }
@@ -3038,7 +3006,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   } catch (error) {
     await connection.rollback();
     console.error('Error selling color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to sell color') });
+    res.status(500).json({ error: error.message || 'Failed to sell color' });
   } finally {
     connection.release();
   }
@@ -3160,7 +3128,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
   } catch (error) {
     await connection.rollback();
     console.error('Error returning color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to return color') });
+    res.status(500).json({ error: error.message || 'Failed to return color' });
   } finally {
     connection.release();
   }
@@ -3277,7 +3245,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
   } catch (error) {
     await connection.rollback();
     console.error('Error trimming color:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to trim color') });
+    res.status(500).json({ error: error.message || 'Failed to trim color' });
   } finally {
     connection.release();
   }
@@ -4149,7 +4117,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
   } catch (error) {
     await connection.rollback();
     console.error('Error canceling log:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to cancel log') });
+    res.status(500).json({ error: 'Failed to cancel log: ' + error.message });
   } finally {
     connection.release();
   }
@@ -4340,7 +4308,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
   } catch (error) {
     await connection.rollback();
     console.error('Error canceling transaction:', error);
-    res.status(500).json({ error: sanitizeError(error, 'Failed to cancel transaction') });
+    res.status(500).json({ error: 'Failed to cancel transaction: ' + error.message });
   } finally {
     connection.release();
   }
