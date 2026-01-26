@@ -574,11 +574,32 @@ async function generatePermitNumber(connection, transactionType) {
 
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
-async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null) {
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null) {
   if (!transactionGroupId) return;
   
   const now = getLebanonTimestamp();
   const transactionEpoch = epoch || now.epoch;
+  
+  // Use provided transaction_date if available, otherwise use current timestamp
+  let transactionDateValue = now.iso;
+  let transactionTimezone = now.tz;
+  
+  if (transactionDate) {
+    // If transaction_date is provided, use it and convert to proper format
+    // transactionDate should be in YYYY-MM-DD format
+    if (typeof transactionDate === 'string' && transactionDate.trim()) {
+      // Ensure it's a valid date string
+      const dateStr = transactionDate.trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        // Convert to datetime format (YYYY-MM-DD HH:MM:SS) using midnight
+        transactionDateValue = `${dateStr} 00:00:00`;
+        // Use the epoch if provided, otherwise calculate from the date
+        if (!epoch) {
+          transactionEpoch = new Date(dateStr + 'T00:00:00').getTime();
+        }
+      }
+    }
+  }
   
   // Check if transaction group already exists
   const [existing] = await connection.query(
@@ -598,7 +619,7 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
       try {
         await connection.query(
           'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
-          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, now.iso, transactionEpoch, now.tz, amountMeters, notes || null]
+          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, amountMeters, notes || null]
         );
         inserted = true; // Success, exit retry loop
       } catch (error) {
@@ -2835,18 +2856,23 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(400).json({ error: 'Invalid fabric_id or color_id' });
     }
     
-    // Calculate amount in meters
+    // Calculate amount - prioritize yards as primary unit
     let amountMeters = 0;
+    let amountYards = 0;
     
-    if (amount_yards !== undefined && amount_yards !== null) {
-      amountMeters = parseFloat(amount_yards) / 1.0936;
-    } else if (amount_meters !== undefined && amount_meters !== null) {
+    if (amount_yards !== undefined && amount_yards !== null && amount_yards > 0) {
+      // Yards is primary - use it directly and convert to meters for storage
+      amountYards = parseFloat(amount_yards);
+      amountMeters = amountYards / 1.0936;
+    } else if (amount_meters !== undefined && amount_meters !== null && amount_meters > 0) {
+      // Fallback to meters if yards not provided
       amountMeters = parseFloat(amount_meters);
+      amountYards = amountMeters * 1.0936;
     } else {
       return res.status(400).json({ error: 'Either amount_meters or amount_yards must be provided' });
     }
     
-    if (isNaN(amountMeters) || amountMeters <= 0) {
+    if (isNaN(amountMeters) || amountMeters <= 0 || isNaN(amountYards) || amountYards <= 0) {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
     
@@ -2883,37 +2909,37 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       selectedLot = lots[0];
       lotNumber = selectedLot.lot_number;
       
-      // Check if lot has enough length
-      const lotMeters = parseFloat(selectedLot.length_meters) || 0;
-      if (lotMeters < amountMeters) {
+      // Check if lot has enough length - use yards as primary
+      const lotYards = parseFloat(selectedLot.length_yards) || 0;
+      if (lotYards < amountYards) {
         await connection.rollback();
         return res.status(400).json({ 
-          error: `Insufficient lot inventory. Available: ${lotMeters.toFixed(2)}m, Requested: ${amountMeters.toFixed(2)}m` 
+          error: `Insufficient lot inventory. Available: ${lotYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd` 
         });
       }
       
-      // Update lot length
-      const newLotMeters = lotMeters - amountMeters;
-      const newLotYards = newLotMeters * 1.0936;
+      // Update lot length - subtract yards directly
+      const newLotYards = lotYards - amountYards;
+      const newLotMeters = newLotYards / 1.0936; // Convert to meters for storage
       await connection.query(
         'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
         [newLotMeters, newLotYards, lot_id]
       );
     }
     
-    // Check if we have enough length in color total
-    const currentMeters = parseFloat(color.length_meters) || 0;
-    if (currentMeters < amountMeters) {
+    // Check if we have enough length in color total - use yards as primary
+    const currentYards = parseFloat(color.length_yards) || 0;
+    if (currentYards < amountYards) {
       await connection.rollback();
       return res.status(400).json({ 
-        error: `Insufficient inventory. Available: ${currentMeters.toFixed(2)}m, Requested: ${amountMeters.toFixed(2)}m` 
+        error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd` 
       });
     }
     
-    // Calculate new length
-    const newMeters = currentMeters - amountMeters;
-    const newYards = parseFloat(color.length_yards) || 0;
-    const newYardsCalc = newMeters * 1.0936;
+    // Calculate new length - use yards as primary for calculation
+    const currentYards = parseFloat(color.length_yards) || 0;
+    const newYards = currentYards - amountYards; // Subtract yards directly
+    const newMeters = newYards / 1.0936; // Convert back to meters for storage
     
     // Calculate new roll_count (decrease by roll_count from request, or default to 0 if not provided)
     // Ensure we're reading the current roll_count from the database, not from the color object which might be stale
@@ -2927,15 +2953,17 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const sellRollCount = parseInt(roll_count) || 0;
     const newRollCount = Math.max(0, currentRollCount - sellRollCount);
     
-    // Update color (subtract meters and roll_count)
+    // Update color (subtract yards directly, convert to meters for storage)
     await connection.query(
       'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
-      [newMeters, newYardsCalc, newRollCount, newMeters, colorId]
+      [newMeters, newYards, newRollCount, newMeters, colorId]
     );
     
     // Handle transaction group
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
+    const transactionDate = req.body.transaction_date || null;
+    const transactionEpoch = req.body.epoch || null;
     
     if (transactionGroupId) {
       await createOrUpdateTransactionGroup(
@@ -2946,7 +2974,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         notes,
         amountMeters,
         transactionType,
-        null
+        transactionEpoch,
+        transactionDate
       );
     }
     
@@ -3178,6 +3207,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     // Handle transaction group
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
+    const transactionDate = req.body.transaction_date || null;
+    const transactionEpoch = req.body.epoch || null;
     
     if (transactionGroupId) {
       await createOrUpdateTransactionGroup(
@@ -3188,7 +3219,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
         notes,
         amountMeters,
         transactionType,
-        null
+        transactionEpoch,
+        transactionDate
       );
     }
     
