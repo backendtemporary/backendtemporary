@@ -3022,6 +3022,18 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     
     await connection.beginTransaction();
     
+    // If reference_log_id is provided and roll_count is not explicitly set, get roll_count from the reference log
+    let finalRollCount = parseInt(roll_count) || 0;
+    if (reference_log_id && (roll_count === undefined || roll_count === null || roll_count === 0)) {
+      const [refLogs] = await connection.query(
+        'SELECT roll_count FROM logs WHERE log_id = ?',
+        [reference_log_id]
+      );
+      if (refLogs.length > 0 && refLogs[0].roll_count !== null && refLogs[0].roll_count !== undefined) {
+        finalRollCount = parseInt(refLogs[0].roll_count) || 0;
+      }
+    }
+    
     // Get color with lock
     const color = await getColorForTransaction(connection, fabricId, colorId);
     if (!color) {
@@ -3043,8 +3055,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const newMeters = currentMeters + amountMeters;
     const newYards = currentYards + (amountMeters * 1.0936);
     const currentRollCount = parseInt(color.roll_count) || 0;
-    const returnRollCount = parseInt(roll_count) || 0;
-    const newRollCount = currentRollCount + returnRollCount;
+    const newRollCount = currentRollCount + finalRollCount;
     const updateInitial = req.body.update_initial_to_match === true || req.body.update_initial_to_match === 'true';
 
     if (updateInitial) {
@@ -3076,7 +3087,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3914,11 +3925,11 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
     const returnAmount = parseFloat(log.amount_meters) || 0;
     const returnAmountYards = returnAmount * 1.0936;
 
-    // Step 2: Restore length to color (and lot if applicable) - SAVE FIRST before deleting log
-    if ((log.type === 'sell' || log.type === 'trim') && log.fabric_id && log.color_id && returnAmount > 0) {
+    // Step 2: Restore/revert length to color (and lot if applicable) - SAVE FIRST before deleting log
+    if ((log.type === 'sell' || log.type === 'trim' || log.type === 'return') && log.fabric_id && log.color_id && returnAmount > 0) {
       // Get color with lock
       const [colors] = await connection.query(
-        'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
+        'SELECT color_id, fabric_id, length_meters, length_yards, roll_count FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
         [log.color_id, log.fabric_id]
       );
       
@@ -3926,17 +3937,31 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
         const color = colors[0];
         const currentMeters = parseFloat(color.length_meters) || 0;
         const currentYards = parseFloat(color.length_yards) || 0;
+        const currentRollCount = parseInt(color.roll_count) || 0;
         
-        // Add length back to color
-        const newMeters = currentMeters + returnAmount;
-        const newYards = currentYards + returnAmountYards;
+        // Get roll_count from log
+        const logRollCount = parseInt(log.roll_count) || 0;
+        
+        let newMeters, newYards, newRollCount;
+        
+        if (log.type === 'return') {
+          // For return deletions: subtract length and roll_count (revert the return)
+          newMeters = Math.max(0, currentMeters - returnAmount);
+          newYards = Math.max(0, currentYards - returnAmountYards);
+          newRollCount = Math.max(0, currentRollCount - logRollCount);
+        } else {
+          // For sell/trim deletions: add length and roll_count back to color
+          newMeters = currentMeters + returnAmount;
+          newYards = currentYards + returnAmountYards;
+          newRollCount = currentRollCount + logRollCount;
+        }
         
         await connection.query(
-          'UPDATE colors SET length_meters = ?, length_yards = ?, sold = 0 WHERE color_id = ?',
-          [newMeters, newYards, log.color_id]
+          'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+          [newMeters, newYards, newRollCount, log.color_id]
         );
         
-        // If log has lot number, try to restore to that specific lot
+        // If log has lot number, try to restore/revert to that specific lot
         if (log.lot && log.lot.trim()) {
           const [lots] = await connection.query(
             'SELECT lot_id, length_meters, length_yards FROM color_lots WHERE color_id = ? AND lot_number = ? FOR UPDATE',
@@ -3947,8 +3972,17 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
             const lot = lots[0];
             const currentLotM = parseFloat(lot.length_meters) || 0;
             const currentLotY = parseFloat(lot.length_yards) || 0;
-            const newLotM = currentLotM + returnAmount;
-            const newLotY = currentLotY + returnAmountYards;
+            
+            let newLotM, newLotY;
+            if (log.type === 'return') {
+              // For return deletions: subtract from lot
+              newLotM = Math.max(0, currentLotM - returnAmount);
+              newLotY = Math.max(0, currentLotY - returnAmountYards);
+            } else {
+              // For sell/trim deletions: add back to lot
+              newLotM = currentLotM + returnAmount;
+              newLotY = currentLotY + returnAmountYards;
+            }
             
             await connection.query(
               'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
@@ -4075,13 +4109,14 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
       [transactionGroupId]
     );
 
-    // Step 3: Restore length to colors (and lots if applicable) - SAVE FIRST before deleting logs
+    // Step 3: Restore/revert length to colors (and lots if applicable) - SAVE FIRST before deleting logs
     // Group by color_id to avoid multiple locks on same color
     const colorRestoreMap = {};
     
     for (const log of logs) {
-      if ((log.type === 'sell' || log.type === 'trim') && log.fabric_id && log.color_id) {
+      if ((log.type === 'sell' || log.type === 'trim' || log.type === 'return') && log.fabric_id && log.color_id) {
         const returnAmount = parseFloat(log.amount_meters) || 0;
+        const logRollCount = parseInt(log.roll_count) || 0;
         
         if (returnAmount > 0) {
           const key = `${log.fabric_id}_${log.color_id}`;
@@ -4090,32 +4125,54 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
               fabric_id: log.fabric_id,
               color_id: log.color_id,
               totalAmount: 0,
-              lots: {} // Map of lot_number -> amount
+              totalRollCount: 0,
+              lots: {}, // Map of lot_number -> amount
+              hasReturns: false // Track if any returns are in this group
             };
           }
-          colorRestoreMap[key].totalAmount += returnAmount;
           
-          // Track lot-specific amounts if lot number exists
-          if (log.lot && log.lot.trim()) {
-            const lotNum = log.lot.trim();
-            if (!colorRestoreMap[key].lots[lotNum]) {
-              colorRestoreMap[key].lots[lotNum] = 0;
+          if (log.type === 'return') {
+            // For returns: subtract (revert the return)
+            colorRestoreMap[key].totalAmount -= returnAmount;
+            colorRestoreMap[key].totalRollCount -= logRollCount;
+            colorRestoreMap[key].hasReturns = true;
+            
+            // Track lot-specific amounts if lot number exists
+            if (log.lot && log.lot.trim()) {
+              const lotNum = log.lot.trim();
+              if (!colorRestoreMap[key].lots[lotNum]) {
+                colorRestoreMap[key].lots[lotNum] = 0;
+              }
+              colorRestoreMap[key].lots[lotNum] -= returnAmount;
             }
-            colorRestoreMap[key].lots[lotNum] += returnAmount;
+          } else {
+            // For sell/trim: add back
+            colorRestoreMap[key].totalAmount += returnAmount;
+            colorRestoreMap[key].totalRollCount += logRollCount;
+            
+            // Track lot-specific amounts if lot number exists
+            if (log.lot && log.lot.trim()) {
+              const lotNum = log.lot.trim();
+              if (!colorRestoreMap[key].lots[lotNum]) {
+                colorRestoreMap[key].lots[lotNum] = 0;
+              }
+              colorRestoreMap[key].lots[lotNum] += returnAmount;
+            }
           }
         }
       }
     }
     
-    // Restore to each color
+    // Restore/revert to each color
     for (const key in colorRestoreMap) {
       const restore = colorRestoreMap[key];
       const returnAmount = restore.totalAmount;
       const returnAmountYards = returnAmount * 1.0936;
+      const returnRollCount = restore.totalRollCount;
       
       // Get color with lock
       const [colors] = await connection.query(
-        'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
+        'SELECT color_id, fabric_id, length_meters, length_yards, roll_count FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
         [restore.color_id, restore.fabric_id]
       );
       
@@ -4123,17 +4180,19 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
         const color = colors[0];
         const currentMeters = parseFloat(color.length_meters) || 0;
         const currentYards = parseFloat(color.length_yards) || 0;
+        const currentRollCount = parseInt(color.roll_count) || 0;
         
-        // Add length back to color
-        const newMeters = currentMeters + returnAmount;
-        const newYards = currentYards + returnAmountYards;
+        // Apply net change (could be positive for sell/trim deletions, negative for return deletions)
+        const newMeters = Math.max(0, currentMeters + returnAmount);
+        const newYards = Math.max(0, currentYards + returnAmountYards);
+        const newRollCount = Math.max(0, currentRollCount + returnRollCount);
         
         await connection.query(
-          'UPDATE colors SET length_meters = ?, length_yards = ?, sold = 0 WHERE color_id = ?',
-          [newMeters, newYards, restore.color_id]
+          'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+          [newMeters, newYards, newRollCount, restore.color_id]
         );
         
-        // Restore to specific lots if applicable
+        // Restore/revert to specific lots if applicable
         for (const lotNum in restore.lots) {
           const lotAmount = restore.lots[lotNum];
           const lotAmountYards = lotAmount * 1.0936;
@@ -4147,8 +4206,9 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
             const lot = lots[0];
             const currentLotM = parseFloat(lot.length_meters) || 0;
             const currentLotY = parseFloat(lot.length_yards) || 0;
-            const newLotM = currentLotM + lotAmount;
-            const newLotY = currentLotY + lotAmountYards;
+            // Apply net change (could be positive or negative)
+            const newLotM = Math.max(0, currentLotM + lotAmount);
+            const newLotY = Math.max(0, currentLotY + lotAmountYards);
             
             await connection.query(
               'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
