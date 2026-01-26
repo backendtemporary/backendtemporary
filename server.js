@@ -128,6 +128,134 @@ const requireRole = (...allowedRoles) => {
 // Public routes are handled individually
 
 // ============================================
+// AUDIT LOGGING HELPER FUNCTIONS
+// ============================================
+
+/**
+ * Log an audit entry for database changes
+ * @param {Object} params - Audit log parameters
+ * @param {string} params.table_name - Name of the table
+ * @param {number} params.record_id - ID of the record
+ * @param {string} params.action - 'INSERT', 'UPDATE', or 'DELETE'
+ * @param {Object} params.user - User object from req.user (optional)
+ * @param {string} params.field_name - Field name (for single field updates)
+ * @param {*} params.old_value - Old value (for UPDATE/DELETE)
+ * @param {*} params.new_value - New value (for INSERT/UPDATE)
+ * @param {Object} params.changes - Object with all field changes (for multi-field UPDATE)
+ * @param {Object} params.req - Express request object (optional, for IP/user agent)
+ * @param {string} params.notes - Additional notes
+ */
+const logAudit = async ({ table_name, record_id, action, user = null, field_name = null, old_value = null, new_value = null, changes = null, req = null, notes = null }) => {
+  try {
+    const userId = user ? user.user_id : null;
+    const username = user ? user.username : null;
+    const ipAddress = req ? (req.ip || req.connection?.remoteAddress || req.headers['x-forwarded-for']?.split(',')[0]?.trim()) : null;
+    const userAgent = req ? req.headers['user-agent'] : null;
+
+    // Convert old_value and new_value to strings for storage
+    const oldValueStr = old_value !== null && old_value !== undefined ? String(old_value) : null;
+    const newValueStr = new_value !== null && new_value !== undefined ? String(new_value) : null;
+
+    // If changes object provided, convert to JSON string
+    let changesJson = null;
+    if (changes && typeof changes === 'object') {
+      try {
+        changesJson = JSON.stringify(changes);
+      } catch (e) {
+        console.error('Error stringifying changes for audit log:', e);
+      }
+    }
+
+    await db.query(
+      `INSERT INTO audit_logs 
+       (table_name, record_id, action, user_id, username, field_name, old_value, new_value, changes, ip_address, user_agent, notes) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [table_name, record_id, action, userId, username, field_name, oldValueStr, newValueStr, changesJson, ipAddress, userAgent, notes]
+    );
+  } catch (error) {
+    // Don't throw - audit logging should never break the main operation
+    console.error('Error logging audit entry:', error);
+  }
+};
+
+/**
+ * Log an INSERT action
+ */
+const logInsert = async (table_name, record_id, user, newRecord, req = null, notes = null) => {
+  // For INSERT, log all fields as changes
+  const changes = {};
+  for (const [key, value] of Object.entries(newRecord || {})) {
+    if (value !== null && value !== undefined) {
+      changes[key] = { old: null, new: value };
+    }
+  }
+  await logAudit({
+    table_name,
+    record_id,
+    action: 'INSERT',
+    user,
+    changes: Object.keys(changes).length > 0 ? changes : null,
+    req,
+    notes
+  });
+};
+
+/**
+ * Log an UPDATE action with before/after comparison
+ */
+const logUpdate = async (table_name, record_id, user, oldRecord, newRecord, req = null, notes = null) => {
+  // Compare old and new records to find changes
+  const changes = {};
+  const allKeys = new Set([...Object.keys(oldRecord || {}), ...Object.keys(newRecord || {})]);
+  
+  for (const key of allKeys) {
+    const oldVal = oldRecord?.[key];
+    const newVal = newRecord?.[key];
+    
+    // Only log if value actually changed
+    if (oldVal !== newVal) {
+      changes[key] = {
+        old: oldVal !== null && oldVal !== undefined ? oldVal : null,
+        new: newVal !== null && newVal !== undefined ? newVal : null
+      };
+    }
+  }
+
+  if (Object.keys(changes).length > 0) {
+    await logAudit({
+      table_name,
+      record_id,
+      action: 'UPDATE',
+      user,
+      changes: changes,
+      req,
+      notes
+    });
+  }
+};
+
+/**
+ * Log a DELETE action
+ */
+const logDelete = async (table_name, record_id, user, deletedRecord, req = null, notes = null) => {
+  const changes = {};
+  for (const [key, value] of Object.entries(deletedRecord || {})) {
+    if (value !== null && value !== undefined) {
+      changes[key] = { old: value, new: null };
+    }
+  }
+  await logAudit({
+    table_name,
+    record_id,
+    action: 'DELETE',
+    user,
+    changes: Object.keys(changes).length > 0 ? changes : null,
+    req,
+    notes
+  });
+};
+
+// ============================================
 // DATABASE HELPER FUNCTIONS
 // ============================================
 // DESIGN NOTE: saveFabricStructure() uses incremental updates to preserve data:
@@ -1127,6 +1255,10 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id
       WHERE c.customer_id = ?
     `, [result.insertId]);
+    
+    // Log audit entry
+    await logInsert('customers', result.insertId, req.user, rows[0], req, `Created customer: ${name.trim()}`);
+    
     res.status(201).json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error creating customer:', error.message, error.code);
@@ -1179,6 +1311,14 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
     await connection.beginTransaction();
     
     // Check if customer has associated logs/transaction groups
+    // Get customer record before deletion
+    const [customerRows] = await connection.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
+    if (customerRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    const customerRecord = customerRows[0];
+
     const [logs] = await connection.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
     const [groups] = await connection.query('SELECT COUNT(*) as count FROM transaction_groups WHERE customer_id = ?', [req.params.id]);
     const transactionCount = (logs[0]?.count || 0) + (groups[0]?.count || 0);
@@ -1186,10 +1326,8 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
     // Delete customer - this will set customer_id to NULL in logs due to ON DELETE SET NULL constraint
     const [result] = await connection.query('DELETE FROM customers WHERE customer_id = ?', [req.params.id]);
     
-    if (result.affectedRows === 0) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Customer not found' });
-    }
+    // Log audit entry
+    await logDelete('customers', parseInt(req.params.id), req.user, customerRecord, req, `Deleted customer: ${customerRecord.customer_name} (had ${transactionCount} transactions)`);
 
     await connection.commit();
     
@@ -1271,6 +1409,10 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
       [fabric_name.trim(), fabric_code, main_code || null, source || null, design || 'none', userId]
     );
 
+    // Get created fabric for audit
+    const [newFabricRows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [result.insertId]);
+    await logInsert('fabrics', result.insertId, req.user, newFabricRows[0], req, `Created fabric: ${fabric_name.trim()}`);
+
     // Return aggregated structure for created fabric
     const fabrics = await buildFabricColorAggregatedStructure();
     const created = fabrics.find(f => f.fabric_id === result.insertId);
@@ -1317,12 +1459,21 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    // Get old record before update
+    const [oldFabricRows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (oldFabricRows.length === 0) return res.status(404).json({ error: 'Fabric not found' });
+    const oldFabricRecord = oldFabricRows[0];
+
     const userId = req.user ? req.user.user_id : null;
     updates.updated_by_user_id = userId;
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updates), fabricId];
     
     await db.query(`UPDATE fabrics SET ${fields} WHERE fabric_id = ?`, values);
+
+    // Get updated record for audit
+    const [newFabricRows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    await logUpdate('fabrics', fabricId, req.user, oldFabricRecord, newFabricRows[0], req, `Updated fabric: ${newFabricRows[0].fabric_name}`);
 
     // Return aggregated structure after update
     const fabrics = await buildFabricColorAggregatedStructure();
@@ -1593,6 +1744,10 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
 
     const colorId = result.insertId;
 
+    // Get created color for audit
+    const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    await logInsert('colors', colorId, req.user, newColorRows[0], req, `Created color: ${color_name.trim()} (${lenY}yd/${lenM}m)`);
+
     // Insert lots if provided
     if (lots && Array.isArray(lots) && lots.length > 0) {
       for (const lotItem of lots) {
@@ -1840,11 +1995,22 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     values.push(userId);
     values.push(colorId);
 
+    // Get full old record for audit
+    const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const oldColorRecord = oldColorRows[0];
+
     // Update color with roll attributes
     await connection.query(
       `UPDATE colors SET ${updates.join(', ')} WHERE color_id = ?`,
       values
     );
+
+    // Get updated record for audit
+    const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const newColorRecord = newColorRows[0];
+
+    // Log audit entry - especially important for length updates
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Updated color: ${newColorRecord.color_name || oldColorRecord.color_name}`);
 
     await connection.commit();
 
@@ -4430,6 +4596,11 @@ app.post('/api/salespersons', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
       WHERE s.salesperson_id = ?
     `, [result.insertId]);
+    
+    // Log audit entry
+    const [salespersonRow] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [result.insertId]);
+    await logInsert('salespersons', result.insertId, req.user, salespersonRow[0], req, `Created salesperson: ${name.trim()}`);
+    
     res.status(201).json(newSalesperson[0]);
   } catch (error) {
     console.error('Error creating salesperson:', error);
@@ -4476,6 +4647,11 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
     
+    // Get old record before update
+    const [oldSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+    if (oldSalespersonRows.length === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    const oldSalespersonRecord = oldSalespersonRows[0];
+
     const userId = req.user ? req.user.user_id : null;
     updates.updated_by_user_id = userId;
     values.push(salespersonId);
@@ -4491,6 +4667,11 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
       WHERE s.salesperson_id = ?
     `, [salespersonId]);
+    
+    // Get updated record for audit
+    const [newSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+    await logUpdate('salespersons', salespersonId, req.user, oldSalespersonRecord, newSalespersonRows[0], req, `Updated salesperson: ${newSalespersonRows[0].name}`);
+    
     res.json(updated[0]);
   } catch (error) {
     console.error('Error updating salesperson:', error);
@@ -4512,6 +4693,11 @@ app.delete('/api/salespersons/:id', authMiddleware, requireRole('admin'), async 
       res.json({ success: true, message: 'Salesperson deactivated (has transactions)' });
     } else {
       // Hard delete - no transactions exist
+      // Get record before deletion
+      const [oldSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+      if (oldSalespersonRows.length > 0) {
+        await logDelete('salespersons', salespersonId, req.user, oldSalespersonRows[0], req, `Deleted salesperson: ${oldSalespersonRows[0].name}`);
+      }
       await db.query('DELETE FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
       res.json({ success: true, message: 'Salesperson deleted' });
     }
@@ -4637,6 +4823,101 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error fetching monthly sales report:', error);
     res.status(500).json({ error: 'Failed to fetch monthly sales report' });
+  }
+});
+
+// ============================================
+// AUDIT LOGS ENDPOINT (Admin Only)
+// ============================================
+
+// GET /api/audit-logs - Get audit logs (admin only)
+app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const {
+      table_name,
+      record_id,
+      action,
+      user_id,
+      start_date,
+      end_date,
+      limit = 100,
+      offset = 0
+    } = req.query;
+
+    let query = `
+      SELECT 
+        a.*,
+        u.full_name as user_full_name,
+        u.email as user_email
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.user_id
+      WHERE 1=1
+    `;
+    const params = [];
+
+    if (table_name) {
+      query += ' AND a.table_name = ?';
+      params.push(table_name);
+    }
+
+    if (record_id) {
+      query += ' AND a.record_id = ?';
+      params.push(parseInt(record_id));
+    }
+
+    if (action) {
+      query += ' AND a.action = ?';
+      params.push(action);
+    }
+
+    if (user_id) {
+      query += ' AND a.user_id = ?';
+      params.push(parseInt(user_id));
+    }
+
+    if (start_date) {
+      query += ' AND a.created_at >= ?';
+      params.push(new Date(parseInt(start_date)).toISOString());
+    }
+
+    if (end_date) {
+      query += ' AND a.created_at <= ?';
+      params.push(new Date(parseInt(end_date)).toISOString());
+    }
+
+    query += ' ORDER BY a.created_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    const [logs] = await db.query(query, params);
+
+    // Get total count for pagination
+    let countQuery = 'SELECT COUNT(*) as total FROM audit_logs WHERE 1=1';
+    const countParams = [];
+    if (table_name) { countQuery += ' AND table_name = ?'; countParams.push(table_name); }
+    if (record_id) { countQuery += ' AND record_id = ?'; countParams.push(parseInt(record_id)); }
+    if (action) { countQuery += ' AND action = ?'; countParams.push(action); }
+    if (user_id) { countQuery += ' AND user_id = ?'; countParams.push(parseInt(user_id)); }
+    if (start_date) { countQuery += ' AND created_at >= ?'; countParams.push(new Date(parseInt(start_date)).toISOString()); }
+    if (end_date) { countQuery += ' AND created_at <= ?'; countParams.push(new Date(parseInt(end_date)).toISOString()); }
+
+    const [countResult] = await db.query(countQuery, countParams);
+    const total = countResult[0]?.total || 0;
+
+    // Parse JSON changes if present
+    const formattedLogs = logs.map(log => ({
+      ...log,
+      changes: log.changes ? JSON.parse(log.changes) : null
+    }));
+
+    res.json({
+      logs: formattedLogs,
+      total,
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (error) {
+    console.error('Error fetching audit logs:', error);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
   }
 });
 
