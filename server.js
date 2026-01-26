@@ -581,7 +581,8 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
   const transactionEpoch = epoch || now.epoch;
   
   // Use provided transaction_date if available, otherwise use current timestamp
-  let transactionDateValue = now.iso;
+  // Convert now.iso from YYYY-MM-DDT00:00:00 to YYYY-MM-DD HH:MM:SS format for MySQL
+  let transactionDateValue = now.iso.replace('T', ' ');
   let transactionTimezone = now.tz;
   
   if (transactionDate) {
@@ -2937,7 +2938,6 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     }
     
     // Calculate new length - use yards as primary for calculation
-    const currentYards = parseFloat(color.length_yards) || 0;
     const newYards = currentYards - amountYards; // Subtract yards directly
     const newMeters = newYards / 1.0936; // Convert back to meters for storage
     
