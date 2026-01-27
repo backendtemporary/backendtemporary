@@ -3654,6 +3654,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       color_name: log.color_name,
       customer_name: log.customer_name,
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      // For sell logs, also expose length_meters (same as amount_meters for compatibility)
+      length_meters: log.type === 'sell' ? (log.amount_meters ? parseFloat(log.amount_meters) : 0) : null,
       roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
       lot: log.lot || null,
       roll_nb: log.roll_nb || null,
