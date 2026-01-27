@@ -1158,6 +1158,18 @@ app.post('/api/deletion-requests', authMiddleware, async (req, res) => {
 // GET /api/deletion-requests - Get deletion requests (admin sees all, limited users see their own)
 app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
   try {
+    // Check if table exists
+    const [tables] = await db.query(`
+      SELECT TABLE_NAME 
+      FROM information_schema.TABLES 
+      WHERE TABLE_SCHEMA = DATABASE() 
+      AND TABLE_NAME = 'deletion_requests'
+    `);
+    
+    if (tables.length === 0) {
+      return res.status(200).json([]); // Return empty array if table doesn't exist
+    }
+
     let sql = `
       SELECT 
         dr.*,
@@ -1182,7 +1194,9 @@ app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
     res.json(requests);
   } catch (error) {
     console.error('Error fetching deletion requests:', error);
-    res.status(500).json({ error: 'Failed to fetch deletion requests' });
+    console.error('Error details:', error.message, error.code, error.sqlMessage);
+    // Return empty array instead of error to prevent frontend crashes
+    res.status(200).json([]);
   }
 });
 
@@ -4960,8 +4974,8 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
         DATE_FORMAT(FROM_UNIXTIME(l.epoch / 1000), '%Y-%m') as month,
         l.type,
         COUNT(*) as transaction_count,
-        SUM(CASE WHEN l.type = 'sell' THEN l.length_meters ELSE l.amount_meters END) as total_meters,
-        SUM(CASE WHEN l.type = 'sell' THEN l.length_meters * 1.0936 ELSE l.amount_meters * 1.0936 END) as total_yards,
+        SUM(l.amount_meters) as total_meters,
+        SUM(l.amount_meters * 1.0936) as total_yards,
         SUM(COALESCE(l.roll_count, 0)) as total_rolls
       FROM logs l
       WHERE l.type IN ('sell', 'trim', 'return')
