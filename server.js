@@ -748,7 +748,7 @@ async function generatePermitNumber(connection, transactionType) {
 
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
-async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null) {
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null) {
   if (!transactionGroupId) return;
   
   const now = getLebanonTimestamp();
@@ -776,9 +776,14 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
     }
   }
   
+  // Round to 2 decimals - yards is primary, meters is secondary
+  const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+  const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
+  const finalAmountMeters = round2(amountMeters);
+  
   // Check if transaction group already exists
   const [existing] = await connection.query(
-    'SELECT transaction_group_id, total_items, total_meters, notes, permit_number, transaction_type, epoch FROM transaction_groups WHERE transaction_group_id = ?',
+    'SELECT transaction_group_id, total_items, total_meters, total_yards, notes, permit_number, transaction_type, epoch FROM transaction_groups WHERE transaction_group_id = ?',
     [transactionGroupId]
   );
   
@@ -793,8 +798,8 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
     while (retries > 0 && !inserted) {
       try {
         await connection.query(
-          'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)',
-          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, amountMeters, notes || null]
+          'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)',
+          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
         );
         inserted = true; // Success, exit retry loop
       } catch (error) {
@@ -812,13 +817,18 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
       }
     }
   } else {
-    // Update existing transaction group - increment items and add to total meters
+    // Update existing transaction group - increment items and add to totals
+    // Sum yards directly (primary unit), meters is secondary
     const current = existing[0];
+    const currentTotalYards = parseFloat(current.total_yards) || (parseFloat(current.total_meters) * 1.0936);
+    const newTotalYards = round2(currentTotalYards + finalAmountYards);
+    const newTotalMeters = round2(parseFloat(current.total_meters) + finalAmountMeters);
+    
     // Preserve existing notes if new notes are null/empty, otherwise use new notes
     const finalNotes = (notes && notes.trim()) ? notes : (current.notes || null);
     await connection.query(
-      'UPDATE transaction_groups SET total_items = ?, total_meters = ?, notes = ? WHERE transaction_group_id = ?',
-      [current.total_items + 1, parseFloat(current.total_meters) + amountMeters, finalNotes, transactionGroupId]
+      'UPDATE transaction_groups SET total_items = ?, total_meters = ?, total_yards = ?, notes = ? WHERE transaction_group_id = ?',
+      [current.total_items + 1, newTotalMeters, newTotalYards, finalNotes, transactionGroupId]
     );
   }
 }
@@ -2843,6 +2853,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
     // Calculate new length
     const newLengthM = Math.max(0, currentLength - trimAmount);
     const newLengthY = newLengthM * 1.0936;
+    const trimAmountYards = trimAmount * 1.0936; // Convert trim amount to yards for transaction group
 
     // Update roll (or mark as sold if length becomes 0)
     // We keep the roll in the database so roll_id can be used for returns/cancels
@@ -2868,7 +2879,9 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
         notes,
         trimAmount,
         transaction_type,
-        null // Use current time
+        null, // Use current time
+        null, // transactionDate
+        trimAmountYards // Pass yards as primary unit
       );
     }
 
@@ -2927,6 +2940,7 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
     const transaction_group_id = req.body.transaction_group_id || null;
     const transaction_type = req.body.transaction_type || 'A'; // Default to 'A' if not provided
     const rollLengthMeters = parseFloat(roll.length_meters);
+    const rollLengthYards = parseFloat(roll.length_yards) || (rollLengthMeters * 1.0936);
     if (transaction_group_id) {
       await createOrUpdateTransactionGroup(
         connection,
@@ -2936,7 +2950,9 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
         notes,
         rollLengthMeters,
         transaction_type,
-        null // Use current time
+        null, // Use current time
+        null, // transactionDate
+        rollLengthYards // Pass yards as primary unit
       );
     }
 
@@ -3354,7 +3370,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const sellYards = currentYards - newYards;
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color`);
     
-    // Handle transaction group
+    // Round to 2 decimals - yards is primary, meters is secondary
+    const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
+    const finalAmountMeters = round2(amountMeters);
+    
+    // Handle transaction group - use yards as primary unit
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
     const transactionDate = req.body.transaction_date || null;
@@ -3367,10 +3388,11 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         customer_id,
         customer_name,
         notes,
-        amountMeters,
+        finalAmountMeters,
         transactionType,
         transactionEpoch,
-        transactionDate
+        transactionDate,
+        finalAmountYards // Pass yards as primary unit
       );
     }
     
@@ -3386,10 +3408,6 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const fabricNameForLog = fabric.design && fabric.design !== 'none' 
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
-    
-    const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
-    const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
-    const finalAmountMeters = round2(amountMeters);
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -3618,7 +3636,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       [newMeters, newYards, newMeters, colorId]
     );
     
-    // Handle transaction group
+    // Round to 2 decimals - yards is primary, meters is secondary
+    const round2Trim = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const { amount_yards: trimAmountYardsInput } = req.body;
+    const trimAmountYards = round2Trim(trimAmountYardsInput !== undefined && trimAmountYardsInput !== null ? parseFloat(trimAmountYardsInput) : (amountMeters * 1.0936));
+    const trimAmountMeters = round2Trim(amountMeters);
+    
+    // Handle transaction group - use yards as primary unit
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
     const transactionDate = req.body.transaction_date || null;
@@ -3631,10 +3655,11 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
         customer_id,
         customer_name,
         notes,
-        amountMeters,
+        trimAmountMeters,
         transactionType,
         transactionEpoch,
-        transactionDate
+        transactionDate,
+        trimAmountYards // Pass yards as primary unit
       );
     }
     
@@ -4659,20 +4684,25 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           );
         }
       } else {
-        // Update transaction group totals
+        // Update transaction group totals - subtract from both meters and yards
         const [groups] = await connection.query(
-          'SELECT total_items, total_meters FROM transaction_groups WHERE transaction_group_id = ?',
+          'SELECT total_items, total_meters, total_yards FROM transaction_groups WHERE transaction_group_id = ?',
           [transactionGroupId]
         );
         
         if (groups.length > 0) {
           const group = groups[0];
+          const returnAmountMeters = parseFloat(log.amount_meters) || 0;
+          const returnAmountYards = parseFloat(log.amount_yards) || (returnAmountMeters * 1.0936);
+          const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
           const newTotalItems = Math.max(0, group.total_items - 1);
-          const newTotalMeters = Math.max(0, parseFloat(group.total_meters) - returnAmount);
+          const currentTotalYards = parseFloat(group.total_yards) || (parseFloat(group.total_meters) * 1.0936);
+          const newTotalMeters = round2(Math.max(0, parseFloat(group.total_meters) - returnAmountMeters));
+          const newTotalYards = round2(Math.max(0, currentTotalYards - returnAmountYards));
           
           await connection.query(
-            'UPDATE transaction_groups SET total_items = ?, total_meters = ? WHERE transaction_group_id = ?',
-            [newTotalItems, newTotalMeters, transactionGroupId]
+            'UPDATE transaction_groups SET total_items = ?, total_meters = ?, total_yards = ? WHERE transaction_group_id = ?',
+            [newTotalItems, newTotalMeters, newTotalYards, transactionGroupId]
           );
         }
       }
