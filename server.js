@@ -4362,13 +4362,14 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     const transactionGroupId = oldLogRecord.transaction_group_id;
     if (transactionGroupId && (updateData.amount_meters !== undefined || updateData.amount_yards !== undefined)) {
       // Get updated log to get new amounts
-      const [updatedLogRows] = await db.query('SELECT amount_meters, amount_yards, length_meters, length_yards FROM logs WHERE log_id = ?', [logId]);
+      // logs table has amount_meters, amount_yards only (no length_meters/length_yards)
+      const [updatedLogRows] = await db.query('SELECT amount_meters, amount_yards FROM logs WHERE log_id = ?', [logId]);
       if (updatedLogRows.length > 0) {
         const updatedLog = updatedLogRows[0];
-        const oldAmountMeters = parseFloat(oldLogRecord.amount_meters || oldLogRecord.length_meters || 0);
-        const oldAmountYards = parseFloat(oldLogRecord.amount_yards || oldLogRecord.length_yards || (oldAmountMeters * 1.0936));
-        const newAmountMeters = parseFloat(updatedLog.amount_meters || updatedLog.length_meters || 0);
-        const newAmountYards = parseFloat(updatedLog.amount_yards || updatedLog.length_yards || (newAmountMeters * 1.0936));
+        const oldAmountMeters = parseFloat(oldLogRecord.amount_meters || 0);
+        const oldAmountYards = parseFloat(oldLogRecord.amount_yards || (oldAmountMeters * 1.0936));
+        const newAmountMeters = parseFloat(updatedLog.amount_meters || 0);
+        const newAmountYards = parseFloat(updatedLog.amount_yards || (newAmountMeters * 1.0936));
         
         const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
         const amountDeltaMeters = newAmountMeters - oldAmountMeters;
