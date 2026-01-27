@@ -204,20 +204,40 @@ const logInsert = async (table_name, record_id, user, newRecord, req = null, not
  * Log an UPDATE action with before/after comparison
  */
 const logUpdate = async (table_name, record_id, user, oldRecord, newRecord, req = null, notes = null) => {
+  // Fields to exclude from audit logs (auto-managed by database)
+  const excludedFields = new Set([
+    'created_at',
+    'updated_at',
+    'created_by_user_id',  // We track this separately
+    'updated_by_user_id'   // We track this separately
+  ]);
+  
   // Compare old and new records to find changes
   const changes = {};
   const allKeys = new Set([...Object.keys(oldRecord || {}), ...Object.keys(newRecord || {})]);
   
   for (const key of allKeys) {
+    // Skip excluded fields
+    if (excludedFields.has(key)) {
+      continue;
+    }
+    
     const oldVal = oldRecord?.[key];
     const newVal = newRecord?.[key];
     
-    // Only log if value actually changed
+    // Only log if value actually changed (and both aren't null/undefined)
     if (oldVal !== newVal) {
-      changes[key] = {
-        old: oldVal !== null && oldVal !== undefined ? oldVal : null,
-        new: newVal !== null && newVal !== undefined ? newVal : null
-      };
+      // Convert dates to strings for consistent comparison
+      const oldValStr = oldVal instanceof Date ? oldVal.toISOString() : oldVal;
+      const newValStr = newVal instanceof Date ? newVal.toISOString() : newVal;
+      
+      // Only log if they're actually different after string conversion
+      if (String(oldValStr) !== String(newValStr)) {
+        changes[key] = {
+          old: oldValStr !== null && oldValStr !== undefined ? oldValStr : null,
+          new: newValStr !== null && newValStr !== undefined ? newValStr : null
+        };
+      }
     }
   }
 
@@ -4833,6 +4853,19 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
 // GET /api/audit-logs - Get audit logs (admin only)
 app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
+    // Check if audit_logs table exists
+    try {
+      await db.query('SELECT 1 FROM audit_logs LIMIT 1');
+    } catch (tableError) {
+      if (tableError.code === 'ER_NO_SUCH_TABLE' || tableError.message?.includes("doesn't exist")) {
+        return res.status(503).json({ 
+          error: 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql',
+          migration_required: true
+        });
+      }
+      throw tableError;
+    }
+
     const {
       table_name,
       record_id,
@@ -4886,8 +4919,12 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     }
 
     query += ' ORDER BY a.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    const limitInt = parseInt(limit) || 100;
+    const offsetInt = parseInt(offset) || 0;
+    params.push(limitInt, offsetInt);
 
+    console.log('Executing audit logs query:', query.substring(0, 200) + '...');
+    console.log('Query params:', params);
     const [logs] = await db.query(query, params);
 
     // Get total count for pagination
@@ -4904,10 +4941,20 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     const total = countResult[0]?.total || 0;
 
     // Parse JSON changes if present
-    const formattedLogs = logs.map(log => ({
-      ...log,
-      changes: log.changes ? JSON.parse(log.changes) : null
-    }));
+    const formattedLogs = logs.map(log => {
+      try {
+        return {
+          ...log,
+          changes: log.changes ? (typeof log.changes === 'string' ? JSON.parse(log.changes) : log.changes) : null
+        };
+      } catch (parseError) {
+        console.error('Error parsing changes JSON for audit log:', log.audit_id, parseError);
+        return {
+          ...log,
+          changes: null
+        };
+      }
+    });
 
     res.json({
       logs: formattedLogs,
@@ -4917,7 +4964,24 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     });
   } catch (error) {
     console.error('Error fetching audit logs:', error);
-    res.status(500).json({ error: 'Failed to fetch audit logs' });
+    console.error('Error stack:', error.stack);
+    console.error('Error code:', error.code);
+    // Provide more detailed error information
+    let errorMessage = error.message || 'Failed to fetch audit logs';
+    
+    if (error.code === 'ER_NO_SUCH_TABLE' || error.message?.includes("doesn't exist")) {
+      errorMessage = 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql';
+    } else if (error.code === 'ER_BAD_FIELD_ERROR') {
+      errorMessage = `Database column error: ${error.message}. The audit_logs table structure may be incorrect.`;
+    } else if (error.code === 'ER_PARSE_ERROR') {
+      errorMessage = `SQL syntax error: ${error.message}`;
+    }
+    
+    res.status(500).json({ 
+      error: errorMessage,
+      code: error.code,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
