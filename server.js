@@ -1070,6 +1070,11 @@ app.put('/api/users/:id', authMiddleware, requireRole('admin'), async (req, res)
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    // Get old record before update
+    const [oldUserRows] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    if (oldUserRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const oldUserRecord = oldUserRows[0];
+
     values.push(userId);
     const sql = `UPDATE users SET ${updates.join(', ')} WHERE user_id = ?`;
     await db.query(sql, values);
@@ -1078,6 +1083,10 @@ app.put('/api/users/:id', authMiddleware, requireRole('admin'), async (req, res)
       'SELECT user_id, username, email, role, full_name, created_at, updated_at FROM users WHERE user_id = ?',
       [userId]
     );
+
+    // Get updated record for audit
+    const [newUserRows] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    await logUpdate('users', userId, req.user, oldUserRecord, newUserRows[0], req, `Updated user: ${newUserRows[0].username || oldUserRecord.username}`);
 
     res.json(updated[0]);
   } catch (error) {
@@ -1096,7 +1105,18 @@ app.delete('/api/users/:id', authMiddleware, requireRole('admin'), async (req, r
       return res.status(403).json({ error: 'Cannot delete your own account' });
     }
 
+    // Get record before deletion
+    const [oldUserRows] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    if (oldUserRows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const oldUserRecord = oldUserRows[0];
+
     await db.query('DELETE FROM users WHERE user_id = ?', [userId]);
+    
+    // Log audit entry
+    await logDelete('users', userId, req.user, oldUserRecord, req, `Deleted user: ${oldUserRecord.username}`);
+    
     res.json({ success: true, message: 'User deleted' });
   } catch (error) {
     console.error('Error deleting user:', error);
@@ -1299,6 +1319,11 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    // Get old record before update
+    const [oldCustomerRows] = await db.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
+    if (oldCustomerRows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    const oldCustomerRecord = oldCustomerRows[0];
+
     const userId = req.user ? req.user.user_id : null;
     updates.updated_by_user_id = userId;
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
@@ -1307,6 +1332,10 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
 
     const [rows] = await db.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Customer not found' });
+    
+    // Log audit entry
+    await logUpdate('customers', parseInt(req.params.id), req.user, oldCustomerRecord, rows[0], req, `Updated customer: ${rows[0].customer_name || oldCustomerRecord.customer_name}`);
+    
     res.json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error updating customer:', error.message, error.code);
@@ -1521,11 +1550,18 @@ app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), asyn
       return res.status(404).json({ error: 'Fabric not found' });
     }
 
+    // Get fabric record before deletion
+    const [fabricRows] = await connection.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    const fabricRecord = fabricRows[0];
+    
     // IMPORTANT: Do NOT delete logs - they are append-only audit records
     // Logs will have fabric_id set to NULL via ON DELETE SET NULL constraint
     // Cascade delete: colors -> fabric (logs preserved, rolls table removed)
     await connection.query('DELETE FROM colors WHERE fabric_id = ?', [fabricId]);
     await connection.query('DELETE FROM fabrics WHERE fabric_id = ?', [fabricId]);
+
+    // Log audit entry
+    await logDelete('fabrics', fabricId, req.user, fabricRecord, req, `Deleted fabric: ${fabricRecord.fabric_name}`);
 
     await connection.commit();
     res.json({ success: true });
@@ -1546,15 +1582,19 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
     
     await connection.beginTransaction();
 
-    // Check if color exists
-    const [existing] = await connection.query('SELECT color_id FROM colors WHERE color_id = ?', [colorId]);
+    // Check if color exists and get record before deletion
+    const [existing] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     if (existing.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Color not found' });
     }
+    const colorRecord = existing[0];
 
     // Cascade delete: color (rolls table removed, attributes are now on colors)
     await connection.query('DELETE FROM colors WHERE color_id = ?', [colorId]);
+
+    // Log audit entry
+    await logDelete('colors', colorId, req.user, colorRecord, req, `Deleted color: ${colorRecord.color_name}`);
 
     await connection.commit();
     res.json({ success: true });
@@ -2092,6 +2132,10 @@ async function addMetersToColorHandler(req, res) {
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : null;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
 
+    // Get old record for audit
+    const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const oldColorRecord = oldColorRows[0];
+
     const newMeters = currentMeters + lenM;
     const newYards = currentYards + lenY;
 
@@ -2123,6 +2167,13 @@ async function addMetersToColorHandler(req, res) {
         [newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
       );
     }
+
+    // Get updated record for audit
+    const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const newColorRecord = newColorRows[0];
+    
+    // Log audit entry for length addition
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m to color`);
 
     await connection.commit();
 
@@ -2269,6 +2320,10 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
       [colorId, lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb, userId]
     );
     
+    // Get created lot for audit
+    const [newLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [result.insertId]);
+    await logInsert('color_lots', result.insertId, req.user, newLotRows[0], req, `Created lot: ${lot_number.trim()} (${lotY}yd/${lotM}m)`);
+    
     await connection.commit();
     
     // Return updated fabric structure
@@ -2338,13 +2393,15 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
       return res.status(409).json({ error: 'Lot number already exists for this color' });
     }
     
-    // Get current lot length for difference calculation
-    const [currentLot] = await connection.query(
-      'SELECT length_meters, length_yards FROM color_lots WHERE lot_id = ?',
-      [lotId]
-    );
-    const oldLotM = parseFloat(currentLot[0].length_meters) || 0;
-    const oldLotY = parseFloat(currentLot[0].length_yards) || 0;
+    // Get old record for audit
+    const [oldLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [lotId]);
+    if (oldLotRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Lot not found' });
+    }
+    const oldLotRecord = oldLotRows[0];
+    const oldLotM = parseFloat(oldLotRecord.length_meters) || 0;
+    const oldLotY = parseFloat(oldLotRecord.length_yards) || 0;
     
     // Get current sum of all other lots (excluding this one)
     const [otherLots] = await connection.query(
@@ -2377,6 +2434,10 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
       [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, userId, lotId]
     );
     
+    // Get updated record for audit
+    const [newLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [lotId]);
+    await logUpdate('color_lots', lotId, req.user, oldLotRecord, newLotRows[0], req, `Updated lot: ${lot_number.trim()}`);
+    
     await connection.commit();
     
     // Return updated fabric structure
@@ -2405,15 +2466,16 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
     
     await connection.beginTransaction();
     
-    // Verify lot exists and get fabric_id
+    // Verify lot exists and get record before deletion
     const [lots] = await connection.query(
-      'SELECT lot_id, color_id FROM color_lots WHERE lot_id = ? AND color_id = ?',
+      'SELECT * FROM color_lots WHERE lot_id = ? AND color_id = ?',
       [lotId, colorId]
     );
     if (lots.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Lot not found' });
     }
+    const lotRecord = lots[0];
     
     const [colors] = await connection.query(
       'SELECT fabric_id FROM colors WHERE color_id = ?',
@@ -2423,6 +2485,9 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
     
     // Delete lot
     await connection.query('DELETE FROM color_lots WHERE lot_id = ?', [lotId]);
+    
+    // Log audit entry
+    await logDelete('color_lots', lotId, req.user, lotRecord, req, `Deleted lot: ${lotRecord.lot_number}`);
     
     await connection.commit();
     
@@ -3192,11 +3257,25 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const sellRollCount = parseInt(roll_count) || 0;
     const newRollCount = Math.max(0, currentRollCount - sellRollCount);
     
+    // Get old record for audit
+    const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const oldColorRecord = oldColorRows[0];
+    
     // Update color (subtract yards directly, convert to meters for storage)
     await connection.query(
       'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
       [newMeters, newYards, newRollCount, newMeters, colorId]
     );
+
+    // Get updated record for audit
+    const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const newColorRecord = newColorRows[0];
+    
+    // Log audit entry for sell operation
+    const currentMeters = parseFloat(color.length_meters) || 0;
+    const sellMeters = currentMeters - newMeters;
+    const sellYards = currentYards - newYards;
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color`);
     
     // Handle transaction group
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3317,6 +3396,10 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     }
     const fabric = fabrics[0];
     
+    // Get old record for audit
+    const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const oldColorRecord = oldColorRows[0];
+
     // Add meters/yards back to color. Optionally set initial = new current when update_initial_to_match.
     const currentMeters = parseFloat(color.length_meters) || 0;
     const currentYards = parseFloat(color.length_yards) || 0;
@@ -3337,6 +3420,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
         [newMeters, newYards, newRollCount, colorId]
       );
     }
+
+    // Get updated record for audit
+    const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+    const newColorRecord = newColorRows[0];
+    
+    // Log audit entry for return operation
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${(amountMeters * 1.0936).toFixed(2)}yd/${amountMeters.toFixed(2)}m to color`);
     
     // Create log entry for return (date-only, no time)
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
@@ -3805,6 +3895,9 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
     const oldType = currentGroup.transaction_type;
     const newEpoch = epoch || currentGroup.epoch;
     
+    // Get old record for audit
+    const oldGroupRecord = { ...currentGroup };
+    
     // If type changed, just update the type - permit numbers are manual
     if (oldType !== transaction_type) {
       // Update transaction group with new type and epoch
@@ -3829,6 +3922,10 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       );
       // DO NOT call recalculatePermitNumbers - permit numbers are manually controlled
     }
+    
+    // Get updated record for audit
+    const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
+    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated transaction group type: ${oldType} → ${transaction_type}`);
     
     await connection.commit();
     
@@ -3900,6 +3997,9 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     
     const currentGroup = groups[0];
     
+    // Get old record for audit
+    const oldGroupRecord = { ...currentGroup };
+    
     // Extract transaction type from permit number (A or B)
     const permitType = cleanedPermit.charAt(0).toUpperCase();
     
@@ -3932,6 +4032,10 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
       [cleanedPermit, transactionGroupId]
     );
+    
+    // Get updated record for audit
+    const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
+    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated permit number: ${oldGroupRecord.permit_number || 'none'} → ${cleanedPermit}`);
     
     await connection.commit();
     
@@ -4115,6 +4219,11 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       return res.status(400).json({ error: 'No fields to update' });
     }
 
+    // Get old record before update
+    const [oldLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+    if (oldLogRows.length === 0) return res.status(404).json({ error: 'Log not found' });
+    const oldLogRecord = oldLogRows[0];
+
     const fields = Object.keys(updateData).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updateData), logId];
     
@@ -4130,6 +4239,10 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       WHERE l.log_id = ?
     `, [logId]);
     const log = updated[0];
+    
+    // Get updated record for audit
+    const [newLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+    await logUpdate('logs', logId, req.user, oldLogRecord, newLogRows[0], req, `Updated log entry`);
     
     res.json({
       log_id: log.log_id,
@@ -4175,8 +4288,17 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
 
 app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
+    // Get record before deletion
+    const [oldLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [req.params.id]);
+    if (oldLogRows.length === 0) {
+      return res.status(404).json({ error: 'Log not found' });
+    }
+    const oldLogRecord = oldLogRows[0];
+    
     const [result] = await db.query('DELETE FROM logs WHERE log_id = ?', [req.params.id]);
     if (result.affectedRows > 0) {
+      // Log audit entry
+      await logDelete('logs', parseInt(req.params.id), req.user, oldLogRecord, req, `Deleted log entry`);
       res.json({ success: true });
     } else {
       res.status(404).json({ error: 'Log not found' });
@@ -4239,10 +4361,24 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           newRollCount = currentRollCount + logRollCount;
         }
         
+        // Get old record for audit
+        const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [log.color_id]);
+        const oldColorRecord = oldColorRows.length > 0 ? oldColorRows[0] : null;
+
         await connection.query(
           'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
           [newMeters, newYards, newRollCount, log.color_id]
         );
+
+        // Get updated record for audit
+        const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [log.color_id]);
+        const newColorRecord = newColorRows[0];
+        
+        // Log audit entry for transaction cancellation/restoration
+        if (oldColorRecord) {
+          const action = log.type === 'return' ? 'Reverted return' : `Restored from ${log.type}`;
+          await logUpdate('colors', log.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmount.toFixed(2)}m`);
+        }
         
         // If log has lot number, try to restore/revert to that specific lot
         if (log.lot && log.lot.trim()) {
@@ -4470,10 +4606,24 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
         const newYards = Math.max(0, currentYards + returnAmountYards);
         const newRollCount = Math.max(0, currentRollCount + returnRollCount);
         
+        // Get old record for audit
+        const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [restore.color_id]);
+        const oldColorRecord = oldColorRows.length > 0 ? oldColorRows[0] : null;
+
         await connection.query(
           'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
           [newMeters, newYards, newRollCount, restore.color_id]
         );
+
+        // Get updated record for audit
+        const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [restore.color_id]);
+        const newColorRecord = newColorRows[0];
+        
+        // Log audit entry for transaction group cancellation
+        if (oldColorRecord) {
+          const action = restore.hasReturns ? 'Cancelled transaction group (mixed)' : 'Cancelled transaction group';
+          await logUpdate('colors', restore.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmount.toFixed(2)}m`);
+        }
         
         // Restore/revert to specific lots if applicable
         for (const lotNum in restore.lots) {
@@ -4707,9 +4857,21 @@ app.delete('/api/salespersons/:id', authMiddleware, requireRole('admin'), async 
     // Check if salesperson has transactions
     const [hasTransactions] = await db.query('SELECT COUNT(*) as count FROM logs WHERE salesperson_id = ?', [salespersonId]);
     
+    // Get old record before update/delete
+    const [oldSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+    if (oldSalespersonRows.length === 0) {
+      return res.status(404).json({ error: 'Salesperson not found' });
+    }
+    const oldSalespersonRecord = oldSalespersonRows[0];
+    
     if (hasTransactions[0].count > 0) {
       // Soft delete - set active to false
       await db.query('UPDATE salespersons SET active = FALSE WHERE salesperson_id = ?', [salespersonId]);
+      
+      // Get updated record for audit
+      const [newSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
+      await logUpdate('salespersons', salespersonId, req.user, oldSalespersonRecord, newSalespersonRows[0], req, `Deactivated salesperson: ${oldSalespersonRecord.name}`);
+      
       res.json({ success: true, message: 'Salesperson deactivated (has transactions)' });
     } else {
       // Hard delete - no transactions exist
@@ -4923,8 +5085,6 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     const offsetInt = parseInt(offset) || 0;
     params.push(limitInt, offsetInt);
 
-    console.log('Executing audit logs query:', query.substring(0, 200) + '...');
-    console.log('Query params:', params);
     const [logs] = await db.query(query, params);
 
     // Get total count for pagination
@@ -4982,6 +5142,98 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
       code: error.code,
       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
+  }
+});
+
+// GET /api/audit-logs/statistics - Get audit log statistics (admin only)
+app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    // Check if audit_logs table exists
+    try {
+      await db.query('SELECT 1 FROM audit_logs LIMIT 1');
+    } catch (tableError) {
+      if (tableError.code === 'ER_NO_SUCH_TABLE' || tableError.message?.includes("doesn't exist")) {
+        return res.status(503).json({ 
+          error: 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql',
+          migration_required: true
+        });
+      }
+      throw tableError;
+    }
+
+    const { start_date, end_date } = req.query;
+    let dateFilter = '';
+    const params = [];
+
+    if (start_date) {
+      dateFilter += ' AND created_at >= ?';
+      params.push(new Date(parseInt(start_date)).toISOString());
+    }
+    if (end_date) {
+      dateFilter += ' AND created_at <= ?';
+      params.push(new Date(parseInt(end_date)).toISOString());
+    }
+
+    // Most active users
+    const [activeUsers] = await db.query(`
+      SELECT 
+        a.user_id,
+        u.username,
+        u.full_name,
+        COUNT(*) as action_count
+      FROM audit_logs a
+      LEFT JOIN users u ON a.user_id = u.user_id
+      WHERE 1=1 ${dateFilter}
+      GROUP BY a.user_id, u.username, u.full_name
+      ORDER BY action_count DESC
+      LIMIT 10
+    `, params);
+
+    // Most changed tables
+    const [activeTables] = await db.query(`
+      SELECT 
+        table_name,
+        COUNT(*) as change_count,
+        SUM(CASE WHEN action = 'INSERT' THEN 1 ELSE 0 END) as inserts,
+        SUM(CASE WHEN action = 'UPDATE' THEN 1 ELSE 0 END) as updates,
+        SUM(CASE WHEN action = 'DELETE' THEN 1 ELSE 0 END) as deletes
+      FROM audit_logs
+      WHERE 1=1 ${dateFilter}
+      GROUP BY table_name
+      ORDER BY change_count DESC
+    `, params);
+
+    // Actions by hour (for activity pattern)
+    const [hourlyActivity] = await db.query(`
+      SELECT 
+        HOUR(created_at) as hour,
+        COUNT(*) as action_count
+      FROM audit_logs
+      WHERE 1=1 ${dateFilter}
+      GROUP BY HOUR(created_at)
+      ORDER BY hour
+    `, params);
+
+    // Recent activity (last 7 days)
+    const [recentActivity] = await db.query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as action_count
+      FROM audit_logs
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ${dateFilter ? 'AND' + dateFilter.replace('AND', '') : ''}
+      GROUP BY DATE(created_at)
+      ORDER BY date DESC
+    `, params);
+
+    res.json({
+      activeUsers,
+      activeTables,
+      hourlyActivity,
+      recentActivity
+    });
+  } catch (error) {
+    console.error('Error fetching audit statistics:', error);
+    res.status(500).json({ error: 'Failed to fetch audit statistics' });
   }
 });
 
