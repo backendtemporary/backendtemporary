@@ -3906,17 +3906,17 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       // Note: Permit number prefix should be updated by user if needed
     } else if (epoch && epoch !== currentGroup.epoch) {
       // Only epoch changed - DO NOT recalculate permit numbers (user wants manual control)
-      // Store date-only (no time)
+      // Store date-only (no time). MySQL DATETIME expects "YYYY-MM-DD HH:MM:SS", not "YYYY-MM-DDT00:00:00"
       const d = new Date(Number(epoch));
       const datePart = d.toISOString().split('T')[0];
-      const isoString = datePart + 'T00:00:00';
+      const mysqlDatetime = datePart + ' 00:00:00';
       await connection.query(
         'UPDATE transaction_groups SET epoch = ?, transaction_date = ? WHERE transaction_group_id = ?',
-        [newEpoch, isoString, transactionGroupId]
+        [newEpoch, mysqlDatetime, transactionGroupId]
       );
       await connection.query(
         'UPDATE logs SET epoch = ?, timestamp = ? WHERE transaction_group_id = ?',
-        [newEpoch, isoString, transactionGroupId]
+        [newEpoch, mysqlDatetime, transactionGroupId]
       );
       // DO NOT call recalculatePermitNumbers - permit numbers are manually controlled
     }
@@ -3951,7 +3951,10 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
   } catch (error) {
     await connection.rollback();
     console.error('Error updating transaction type:', error);
-    res.status(500).json({ error: 'Failed to update transaction type' });
+    res.status(500).json({
+      error: 'Failed to update transaction type',
+      message: error.message || (error.sqlMessage || String(error))
+    });
   } finally {
     connection.release();
   }
@@ -4330,13 +4333,14 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.timestamp !== undefined && String(updates.timestamp || '').trim()) {
       const normalized = normalizeTimestampToDate(updates.timestamp);
       if (normalized) {
-        updateData.timestamp = normalized;
+        // MySQL DATETIME expects "YYYY-MM-DD HH:MM:SS", not "YYYY-MM-DDT00:00:00"
+        updateData.timestamp = normalized.replace('T', ' ');
         if (updates.epoch === undefined) updateData.epoch = new Date(normalized).getTime();
       } else {
         updateData.timestamp = updates.timestamp;
       }
     }
-    if (updates.epoch !== undefined) updateData.epoch = updates.epoch;
+    if (updates.epoch !== undefined) updateData.epoch = Number(updates.epoch);
     if (updates.salesperson_id !== undefined) updateData.salesperson_id = updates.salesperson_id;
 
     if (Object.keys(updateData).length === 0) {
@@ -4444,7 +4448,10 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     });
   } catch (error) {
     console.error('Error updating log:', error);
-    res.status(500).json({ error: 'Failed to update log' });
+    res.status(500).json({
+      error: 'Failed to update log',
+      message: error.message || (error.sqlMessage || String(error))
+    });
   }
 });
 
