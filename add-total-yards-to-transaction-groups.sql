@@ -10,4 +10,4 @@ UPDATE `transaction_groups`
 SET `total_yards` = ROUND(`total_meters` * 1.0936, 2)
 WHERE `transaction_group_id` > ''
   AND `total_meters` IS NOT NULL 
-  AND `total_meters` > 0;
+  AND `total_meters` > 0;g
