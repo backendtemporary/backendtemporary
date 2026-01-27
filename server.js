@@ -3387,12 +3387,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
-    // Use amountYards already calculated above (line 3245) if available, otherwise calculate from amountMeters
-    const finalAmountYards = amountYards || (amountMeters * 1.0936);
+    const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
+    const finalAmountMeters = round2(amountMeters);
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, finalAmountYards, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, finalAmountMeters, finalAmountYards, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3523,13 +3524,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
-    // Use amount_yards from request if provided, otherwise calculate from amountMeters
-    // Note: amountMeters is calculated from amount_yards if provided (line 3558-3562)
-    const returnAmountYards = amount_yards !== undefined && amount_yards !== null ? parseFloat(amount_yards) : (amountMeters * 1.0936);
+    const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const returnAmountYards = round2Ret(amount_yards !== undefined && amount_yards !== null ? parseFloat(amount_yards) : (amountMeters * 1.0936));
+    const returnAmountMeters = round2Ret(amountMeters);
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, returnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, returnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3644,14 +3645,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb;
     
-    // Get amount_yards from request body if provided
     const { amount_yards: trimAmountYardsInput } = req.body;
-    // Include amount_yards if provided, otherwise calculate from amountMeters
-    const trimAmountYards = trimAmountYardsInput !== undefined && trimAmountYardsInput !== null ? parseFloat(trimAmountYardsInput) : (amountMeters * 1.0936);
+    const round2Trim = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const trimAmountYards = round2Trim(trimAmountYardsInput !== undefined && trimAmountYardsInput !== null ? parseFloat(trimAmountYardsInput) : (amountMeters * 1.0936));
+    const trimAmountMeters = round2Trim(amountMeters);
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, trimAmountYards, 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, trimAmountMeters, trimAmountYards, 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3731,8 +3732,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
     
     const [logs] = await db.query(query, params);
     
-    // Convert database format to JSON format (expose DB columns + camelCase for compatibility)
-    const formattedLogs = logs.map(log => ({
+    const r2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+    const formattedLogs = logs.map(log => {
+      const am = log.amount_meters ? parseFloat(log.amount_meters) : 0;
+      const ay = log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0);
+      return {
       log_id: log.log_id,
       type: log.type,
       roll_id: log.roll_id,
@@ -3742,11 +3746,10 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       fabric_name: log.fabric_name,
       color_name: log.color_name,
       customer_name: log.customer_name,
-      amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      amount_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
-      // For sell logs, also expose length_meters and length_yards (same as amount_meters/amount_yards for compatibility)
-      length_meters: log.type === 'sell' ? (log.amount_meters ? parseFloat(log.amount_meters) : 0) : null,
-      length_yards: log.type === 'sell' ? (log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0)) : null,
+      amount_meters: r2(am),
+      amount_yards: r2(ay),
+      length_meters: log.type === 'sell' ? r2(am) : null,
+      length_yards: log.type === 'sell' ? r2(ay) : null,
       roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
       lot: log.lot || null,
       roll_nb: log.roll_nb || null,
@@ -3765,9 +3768,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       conducted_by_full_name: log.conducted_by_full_name || null,
       created_at: log.created_at,
       updated_at: log.updated_at,
-      // compatibility camelCase aliases
       id: log.log_id,
-      log_id: log.log_id,
       rollId: log.roll_id,
       fabricId: log.fabric_id || null,
       colorId: log.color_id || null,
@@ -3775,9 +3776,9 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       fabricName: log.fabric_name,
       colorName: log.color_name,
       customerName: log.customer_name,
-      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      length_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
-      amount_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
+      length_meters: log.type === 'sell' ? r2(am) : null,
+      length_yards: log.type === 'sell' ? r2(ay) : null,
+      amount_yards: r2(ay),
       rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
       rollNb: log.roll_nb || null,
       tz: log.timezone,
@@ -3790,7 +3791,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       salespersonName: log.salesperson_name || null,
       conductedByUserId: log.conducted_by_user_id || null,
       conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
-    }));
+      };
+    });
 
     res.json(formattedLogs);
   } catch (error) {
@@ -4294,10 +4296,11 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.colorName !== undefined) updateData.color_name = updates.colorName;
     if (updates.customerId !== undefined) updateData.customer_id = updates.customerId;
     if (updates.customerName !== undefined) updateData.customer_name = updates.customerName;
-    if (updates.amount_meters !== undefined) updateData.amount_meters = updates.amount_meters;
-    if (updates.amount_yards !== undefined) updateData.amount_yards = updates.amount_yards;
-    if (updates.length_meters !== undefined) updateData.amount_meters = updates.length_meters; // length_meters maps to amount_meters for sell logs
-    if (updates.length_yards !== undefined) updateData.amount_yards = updates.length_yards; // length_yards maps to amount_yards for sell logs
+    const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    if (updates.amount_meters !== undefined) updateData.amount_meters = round2(updates.amount_meters);
+    if (updates.amount_yards !== undefined) updateData.amount_yards = round2(updates.amount_yards);
+    if (updates.length_meters !== undefined) updateData.amount_meters = round2(updates.length_meters); // length_meters -> amount_meters for sell logs
+    if (updates.length_yards !== undefined) updateData.amount_yards = round2(updates.length_yards); // length_yards -> amount_yards for sell logs
     if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.is_trimmable;
     
     // Handle direct inventory adjustment when editing transactions (no new log entries)
@@ -4357,6 +4360,23 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
               newMeters = currentMeters;
               newYards = currentYards;
               newRollCount = currentRollCount;
+            }
+            
+            // When increasing sell/trim amount, ensure we have enough inventory
+            if ((log.type === 'sell' || log.type === 'trim') && deltaYards > 0) {
+              if (currentYards < deltaYards) {
+                return res.status(400).json({
+                  error: 'Insufficient inventory',
+                  message: `Cannot increase ${log.type} amount: not enough inventory. Available: ${currentYards.toFixed(2)} yd, need ${deltaYards.toFixed(2)} yd more.`
+                });
+              }
+            }
+            // When decreasing return amount, ensure we don't go negative
+            if (log.type === 'return' && deltaYards < 0 && (currentYards + deltaYards) < 0) {
+              return res.status(400).json({
+                error: 'Insufficient inventory',
+                message: `Cannot decrease return amount: would leave negative inventory. Available: ${currentYards.toFixed(2)} yd.`
+              });
             }
             
             // Ensure non-negative
