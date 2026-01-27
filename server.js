@@ -1158,18 +1158,29 @@ app.post('/api/deletion-requests', authMiddleware, async (req, res) => {
 // GET /api/deletion-requests - Get deletion requests (admin sees all, limited users see their own)
 app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
   try {
-    // Check if table exists
-    const [tables] = await db.query(`
-      SELECT TABLE_NAME 
-      FROM information_schema.TABLES 
-      WHERE TABLE_SCHEMA = DATABASE() 
-      AND TABLE_NAME = 'deletion_requests'
-    `);
-    
-    if (tables.length === 0) {
-      return res.status(200).json([]); // Return empty array if table doesn't exist
+    // Try to determine which column name to use (reviewed_by_user_id or approved_by_user_id)
+    let reviewerColumn = 'reviewed_by_user_id';
+    try {
+      const [columns] = await db.query(`
+        SELECT COLUMN_NAME 
+        FROM information_schema.COLUMNS 
+        WHERE TABLE_SCHEMA = DATABASE() 
+        AND TABLE_NAME = 'deletion_requests'
+        AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id')
+      `);
+      
+      if (columns.length > 0) {
+        // Determine which column name to use (prefer reviewed_by_user_id, fallback to approved_by_user_id)
+        reviewerColumn = columns.find(c => c.COLUMN_NAME === 'reviewed_by_user_id') 
+          ? 'reviewed_by_user_id' 
+          : 'approved_by_user_id';
+      }
+    } catch (schemaError) {
+      // If we can't query information_schema, try reviewed_by_user_id first, then fallback
+      console.warn('Could not query information_schema, using default column name:', schemaError.message);
     }
 
+    // Use COALESCE to handle both column names safely
     let sql = `
       SELECT 
         dr.*,
@@ -1178,7 +1189,9 @@ app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
         reviewer.username as reviewed_by_username
       FROM deletion_requests dr
       JOIN users u ON dr.requested_by_user_id = u.user_id
-      LEFT JOIN users reviewer ON dr.reviewed_by_user_id = reviewer.user_id
+      LEFT JOIN users reviewer ON (
+        COALESCE(dr.reviewed_by_user_id, dr.approved_by_user_id) = reviewer.user_id
+      )
     `;
     const params = [];
 
@@ -1216,16 +1229,38 @@ app.put('/api/deletion-requests/:id/approve', authMiddleware, requireRole('admin
       return res.status(400).json({ error: 'Request is not pending' });
     }
 
-    // Mark as approved
-    await db.query(
-      'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
-      ['approved', req.user.user_id, requestId]
-    );
+    // Check which column exists
+    const [columns] = await db.query(`
+      SELECT COLUMN_NAME 
+      FROM information_schema.COLUMNS 
+      WHERE TABLE_SCHEMA = DATABASE() 
+      AND TABLE_NAME = 'deletion_requests'
+      AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id', 'reviewed_at', 'approved_at')
+    `);
+    
+    const hasReviewedBy = columns.some(c => c.COLUMN_NAME === 'reviewed_by_user_id');
+    const hasReviewedAt = columns.some(c => c.COLUMN_NAME === 'reviewed_at');
+    const hasApprovedBy = columns.some(c => c.COLUMN_NAME === 'approved_by_user_id');
+    const hasApprovedAt = columns.some(c => c.COLUMN_NAME === 'approved_at');
 
-    // Execute the deletion based on request type
-    // Note: The actual deletion logic will be handled by existing endpoints
-    // This just marks the request as approved - the admin will still need to perform the actual deletion
-    // OR you can implement the deletion here directly
+    // Build update query based on available columns
+    if (hasReviewedBy && hasReviewedAt) {
+      await db.query(
+        'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
+        ['approved', req.user.user_id, requestId]
+      );
+    } else if (hasApprovedBy && hasApprovedAt) {
+      await db.query(
+        'UPDATE deletion_requests SET status = ?, approved_by_user_id = ?, approved_at = NOW() WHERE request_id = ?',
+        ['approved', req.user.user_id, requestId]
+      );
+    } else {
+      // Fallback: just update status
+      await db.query(
+        'UPDATE deletion_requests SET status = ? WHERE request_id = ?',
+        ['approved', requestId]
+      );
+    }
 
     res.json({ success: true, message: 'Request approved' });
   } catch (error) {
@@ -1239,10 +1274,38 @@ app.put('/api/deletion-requests/:id/reject', authMiddleware, requireRole('admin'
   try {
     const requestId = parseInt(req.params.id);
 
-    await db.query(
-      'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
-      ['rejected', req.user.user_id, requestId]
-    );
+    // Check which column exists
+    const [columns] = await db.query(`
+      SELECT COLUMN_NAME 
+      FROM information_schema.COLUMNS 
+      WHERE TABLE_SCHEMA = DATABASE() 
+      AND TABLE_NAME = 'deletion_requests'
+      AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id', 'reviewed_at', 'approved_at')
+    `);
+    
+    const hasReviewedBy = columns.some(c => c.COLUMN_NAME === 'reviewed_by_user_id');
+    const hasReviewedAt = columns.some(c => c.COLUMN_NAME === 'reviewed_at');
+    const hasApprovedBy = columns.some(c => c.COLUMN_NAME === 'approved_by_user_id');
+    const hasApprovedAt = columns.some(c => c.COLUMN_NAME === 'approved_at');
+
+    // Build update query based on available columns
+    if (hasReviewedBy && hasReviewedAt) {
+      await db.query(
+        'UPDATE deletion_requests SET status = ?, reviewed_by_user_id = ?, reviewed_at = NOW() WHERE request_id = ?',
+        ['rejected', req.user.user_id, requestId]
+      );
+    } else if (hasApprovedBy && hasApprovedAt) {
+      await db.query(
+        'UPDATE deletion_requests SET status = ?, approved_by_user_id = ?, approved_at = NOW() WHERE request_id = ?',
+        ['rejected', req.user.user_id, requestId]
+      );
+    } else {
+      // Fallback: just update status
+      await db.query(
+        'UPDATE deletion_requests SET status = ? WHERE request_id = ?',
+        ['rejected', requestId]
+      );
+    }
 
     res.json({ success: true, message: 'Request rejected' });
   } catch (error) {
@@ -3324,9 +3387,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
+    // Use amountYards already calculated above (line 3245) if available, otherwise calculate from amountMeters
+    const finalAmountYards = amountYards || (amountMeters * 1.0936);
+    
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, finalAmountYards, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3457,9 +3523,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
+    // Use amount_yards from request if provided, otherwise calculate from amountMeters
+    // Note: amountMeters is calculated from amount_yards if provided (line 3558-3562)
+    const returnAmountYards = amount_yards !== undefined && amount_yards !== null ? parseFloat(amount_yards) : (amountMeters * 1.0936);
+    
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, amountMeters, returnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3574,9 +3644,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const lotValue = (lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot;
     const rollNbValue = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb;
     
+    // Get amount_yards from request body if provided
+    const { amount_yards: trimAmountYardsInput } = req.body;
+    // Include amount_yards if provided, otherwise calculate from amountMeters
+    const trimAmountYards = trimAmountYardsInput !== undefined && trimAmountYardsInput !== null ? parseFloat(trimAmountYardsInput) : (amountMeters * 1.0936);
+    
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['trim', fabricId, colorId, fabric.fabric_name, color.color_name, customer_id || null, customer_name || null, amountMeters, trimAmountYards, 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3668,8 +3743,10 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       color_name: log.color_name,
       customer_name: log.customer_name,
       amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      // For sell logs, also expose length_meters (same as amount_meters for compatibility)
+      amount_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
+      // For sell logs, also expose length_meters and length_yards (same as amount_meters/amount_yards for compatibility)
       length_meters: log.type === 'sell' ? (log.amount_meters ? parseFloat(log.amount_meters) : 0) : null,
+      length_yards: log.type === 'sell' ? (log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0)) : null,
       roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
       lot: log.lot || null,
       roll_nb: log.roll_nb || null,
@@ -3699,6 +3776,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       colorName: log.color_name,
       customerName: log.customer_name,
       length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+      length_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
+      amount_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
       rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
       rollNb: log.roll_nb || null,
       tz: log.timezone,
@@ -4122,6 +4201,7 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       customer_id: entry.customerId || null,
       customer_name: entry.customerName || null,
       amount_meters: entry.amount_meters || entry.length_meters || 0,
+      amount_yards: entry.amount_yards || entry.length_yards || (entry.amount_meters || entry.length_meters ? (parseFloat(entry.amount_meters || entry.length_meters || 0) * 1.0936) : null),
       is_trimmable: entry.isTrimmable || false,
       weight: entry.weight || 'N/A',
       notes: entry.notes || null,
@@ -4132,9 +4212,20 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       conducted_by_user_id: req.user ? req.user.user_id : null
     };
 
+    // Build INSERT query with optional amount_yards field
+    const insertFields = ['type', 'roll_id', 'fabric_id', 'color_id', 'fabric_name', 'color_name', 'customer_id', 'customer_name', 'amount_meters', 'is_trimmable', 'weight', 'notes', 'timestamp', 'epoch', 'timezone', 'salesperson_id', 'conducted_by_user_id'];
+    const insertValues = [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone, logData.salesperson_id, logData.conducted_by_user_id];
+    
+    // Add amount_yards if provided
+    if (logData.amount_yards !== undefined && logData.amount_yards !== null) {
+      insertFields.push('amount_yards');
+      insertValues.push(logData.amount_yards);
+    }
+    
+    const placeholders = insertFields.map(() => '?').join(', ');
     const [result] = await db.query(
-      'INSERT INTO logs (type, roll_id, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, is_trimmable, weight, notes, timestamp, epoch, timezone, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone, logData.salesperson_id, logData.conducted_by_user_id]
+      `INSERT INTO logs (${insertFields.join(', ')}) VALUES (${placeholders})`,
+      insertValues
     );
 
     // Return DB reality
@@ -4204,7 +4295,94 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.customerId !== undefined) updateData.customer_id = updates.customerId;
     if (updates.customerName !== undefined) updateData.customer_name = updates.customerName;
     if (updates.amount_meters !== undefined) updateData.amount_meters = updates.amount_meters;
-    if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.isTrimmable;
+    if (updates.amount_yards !== undefined) updateData.amount_yards = updates.amount_yards;
+    if (updates.length_meters !== undefined) updateData.amount_meters = updates.length_meters; // length_meters maps to amount_meters for sell logs
+    if (updates.length_yards !== undefined) updateData.amount_yards = updates.length_yards; // length_yards maps to amount_yards for sell logs
+    if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.is_trimmable;
+    
+    // Handle direct inventory adjustment when editing transactions (no new log entries)
+    if (updates.adjustInventory !== undefined && updates.adjustInventory === true) {
+      const logId = parseInt(req.params.id);
+      const [logRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
+      if (logRows.length > 0) {
+        const log = logRows[0];
+        const fabricId = log.fabric_id;
+        const colorId = log.color_id;
+        
+        if (fabricId && colorId) {
+          // Get old amounts - use stored yards if available, otherwise convert from meters
+          const oldAmountMeters = parseFloat(log.amount_meters) || 0;
+          const oldAmountYards = parseFloat(log.amount_yards) || (oldAmountMeters * 1.0936);
+          
+          // Get new amounts - use the unit that was selected
+          const newAmountMeters = parseFloat(updates.amount_meters || updates.length_meters || 0);
+          const newAmountYards = parseFloat(updates.amount_yards || updates.length_yards || 0);
+          
+          // Calculate delta - use yards as primary unit for inventory calculation
+          const deltaYards = newAmountYards - oldAmountYards;
+          const deltaMeters = newAmountMeters - oldAmountMeters;
+          
+          // Get current color inventory
+          const [colors] = await db.query('SELECT length_meters, length_yards, roll_count FROM colors WHERE color_id = ?', [colorId]);
+          if (colors.length > 0) {
+            const color = colors[0];
+            const currentMeters = parseFloat(color.length_meters) || 0;
+            const currentYards = parseFloat(color.length_yards) || 0;
+            const currentRollCount = parseInt(color.roll_count) || 0;
+            
+            // Calculate new inventory based on transaction type
+            let newMeters, newYards, newRollCount;
+            const oldRollCount = parseInt(log.roll_count) || 0;
+            const newRollCountFromLog = parseInt(updates.roll_count) || oldRollCount;
+            const rollCountDelta = newRollCountFromLog - oldRollCount;
+            
+            // Calculate inventory adjustment based on transaction type
+            // For sell/trim: subtracting from inventory, so if we increase the transaction amount, we decrease inventory more
+            // For return: adding to inventory, so if we increase the transaction amount, we increase inventory more
+            if (log.type === 'sell' || log.type === 'trim') {
+              // Transaction amount increased -> inventory decreases more
+              // Transaction amount decreased -> inventory increases (we're returning some)
+              // Use yards as primary unit for calculation
+              newYards = currentYards - deltaYards;
+              newMeters = newYards / 1.0936; // Convert back to meters for storage
+              newRollCount = Math.max(0, currentRollCount - rollCountDelta);
+            } else if (log.type === 'return') {
+              // Transaction amount increased -> inventory increases more
+              // Transaction amount decreased -> inventory decreases (we're taking back some)
+              newYards = currentYards + deltaYards;
+              newMeters = newYards / 1.0936; // Convert back to meters for storage
+              newRollCount = Math.max(0, currentRollCount + rollCountDelta);
+            } else {
+              // No inventory change for other types
+              newMeters = currentMeters;
+              newYards = currentYards;
+              newRollCount = currentRollCount;
+            }
+            
+            // Ensure non-negative
+            newMeters = Math.max(0, newMeters);
+            newYards = Math.max(0, newYards);
+            
+            // Get old record for audit
+            const [oldColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+            const oldColorRecord = oldColorRows[0];
+            
+            // Update color inventory directly
+            await db.query(
+              'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ? WHERE color_id = ?',
+              [newMeters, newYards, newRollCount, colorId]
+            );
+            
+            // Get updated record for audit
+            const [newColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+            const newColorRecord = newColorRows[0];
+            
+            // Log audit entry
+            await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Inventory adjusted due to transaction edit: ${deltaYards > 0 ? '+' : ''}${deltaYards.toFixed(2)}yd`);
+          }
+        }
+      }
+    }
     if (updates.weight !== undefined) updateData.weight = updates.weight;
     if (updates.notes !== undefined) updateData.notes = updates.notes;
     // Support lot and roll_nb attributes
