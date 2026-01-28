@@ -255,6 +255,20 @@ const logUpdate = async (table_name, record_id, user, oldRecord, newRecord, req 
 };
 
 /**
+ * Get fabric name and color name for a color_id (for audit notes).
+ * Pass connection when inside a transaction, otherwise uses db.
+ */
+const getColorFabricNames = async (colorId, connection = null) => {
+  const q = connection ? connection.query.bind(connection) : db.query.bind(db);
+  const [rows] = await q(
+    'SELECT c.color_name, f.fabric_name FROM colors c JOIN fabrics f ON c.fabric_id = f.fabric_id WHERE c.color_id = ?',
+    [colorId]
+  );
+  if (rows.length === 0) return { fabric_name: 'N/A', color_name: 'N/A' };
+  return { fabric_name: rows[0].fabric_name || 'N/A', color_name: rows[0].color_name || 'N/A' };
+};
+
+/**
  * Log a DELETE action
  */
 const logDelete = async (table_name, record_id, user, deletedRecord, req = null, notes = null) => {
@@ -1678,10 +1692,11 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
     const colorRecord = existing[0];
 
     // Cascade delete: color (rolls table removed, attributes are now on colors)
+    const delColorCtx = await getColorFabricNames(colorId, connection);
     await connection.query('DELETE FROM colors WHERE color_id = ?', [colorId]);
 
-    // Log audit entry
-    await logDelete('colors', colorId, req.user, colorRecord, req, `Deleted color: ${colorRecord.color_name}`);
+    // Log audit entry (include fabric/color for clarity)
+    await logDelete('colors', colorId, req.user, colorRecord, req, `Deleted color: ${colorRecord.color_name} | Fabric: ${delColorCtx.fabric_name}, Color: ${delColorCtx.color_name}`);
 
     await connection.commit();
     res.json({ success: true });
@@ -2156,8 +2171,9 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
 
-    // Log audit entry - especially important for length updates
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Updated color: ${newColorRecord.color_name || oldColorRecord.color_name}`);
+    // Log audit entry - especially important for length updates (include fabric/color for clarity)
+    const colorCtx = await getColorFabricNames(colorId, connection);
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Updated color: ${newColorRecord.color_name || oldColorRecord.color_name} | Fabric: ${colorCtx.fabric_name}, Color: ${colorCtx.color_name}`);
 
     await connection.commit();
 
@@ -2259,8 +2275,9 @@ async function addMetersToColorHandler(req, res) {
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
     
-    // Log audit entry for length addition
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m to color`);
+    // Log audit entry for length addition (include fabric/color for clarity)
+    const addMetersCtx = await getColorFabricNames(colorId, connection);
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m to color | Fabric: ${addMetersCtx.fabric_name}, Color: ${addMetersCtx.color_name}`);
 
     await connection.commit();
 
@@ -2521,9 +2538,10 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
       [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, userId, lotId]
     );
     
-    // Get updated record for audit
+    // Get updated record for audit (include fabric/color for clarity)
     const [newLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [lotId]);
-    await logUpdate('color_lots', lotId, req.user, oldLotRecord, newLotRows[0], req, `Updated lot: ${lot_number.trim()}`);
+    const lotCtx = await getColorFabricNames(colorId, connection);
+    await logUpdate('color_lots', lotId, req.user, oldLotRecord, newLotRows[0], req, `Updated lot: ${lot_number.trim()} | Fabric: ${lotCtx.fabric_name}, Color: ${lotCtx.color_name}`);
     
     await connection.commit();
     
@@ -2573,8 +2591,9 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
     // Delete lot
     await connection.query('DELETE FROM color_lots WHERE lot_id = ?', [lotId]);
     
-    // Log audit entry
-    await logDelete('color_lots', lotId, req.user, lotRecord, req, `Deleted lot: ${lotRecord.lot_number}`);
+    // Log audit entry (include fabric/color for clarity)
+    const delLotCtx = await getColorFabricNames(colorId, connection);
+    await logDelete('color_lots', lotId, req.user, lotRecord, req, `Deleted lot: ${lotRecord.lot_number} | Fabric: ${delLotCtx.fabric_name}, Color: ${delLotCtx.color_name}`);
     
     await connection.commit();
     
@@ -3368,7 +3387,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const currentMeters = parseFloat(color.length_meters) || 0;
     const sellMeters = currentMeters - newMeters;
     const sellYards = currentYards - newYards;
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color`);
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
     
     // Round to 2 decimals - yards is primary, meters is secondary
     const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
@@ -3526,8 +3545,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
     
-    // Log audit entry for return operation
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color`);
+    // Log audit entry for return operation (include fabric/color for clarity)
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
     
     // Create log entry for return (date-only, no time)
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
@@ -3921,9 +3940,11 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       // DO NOT call recalculatePermitNumbers - permit numbers are manually controlled
     }
     
-    // Get updated record for audit
+    // Get updated record for audit (include permit/customer for clarity)
     const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
-    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated transaction group type: ${oldType} → ${transaction_type}`);
+    const groupPermit = currentGroup.permit_number || 'N/A';
+    const groupCustomer = currentGroup.customer_name || 'N/A';
+    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated transaction group type: ${oldType} → ${transaction_type} | Permit: ${groupPermit}, Customer: ${groupCustomer}`);
     
     await connection.commit();
     
@@ -4035,9 +4056,10 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       [cleanedPermit, transactionGroupId]
     );
     
-    // Get updated record for audit
+    // Get updated record for audit (include permit/customer for clarity)
     const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
-    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated permit number: ${oldGroupRecord.permit_number || 'none'} → ${cleanedPermit}`);
+    const permitCustomer = currentGroup.customer_name || 'N/A';
+    await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated permit number: ${oldGroupRecord.permit_number || 'none'} → ${cleanedPermit} | Permit: ${cleanedPermit}, Customer: ${permitCustomer}`);
     
     await connection.commit();
     
@@ -4310,8 +4332,10 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
             const [newColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
             const newColorRecord = newColorRows[0];
             
-            // Log audit entry
-            await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Inventory adjusted due to transaction edit: ${deltaYards > 0 ? '+' : ''}${deltaYards.toFixed(2)}yd`);
+            // Log audit entry (include fabric/color for clarity)
+            const invFabric = oldLogRecord.fabric_name || 'N/A';
+            const invColor = oldLogRecord.color_name || 'N/A';
+            await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Inventory adjusted due to transaction edit: ${deltaYards > 0 ? '+' : ''}${deltaYards.toFixed(2)}yd | Fabric: ${invFabric}, Color: ${invColor}`);
           }
         }
       }
@@ -4407,9 +4431,16 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     `, [logId]);
     const log = updated[0];
     
-    // Get updated record for audit
+    // Get updated record for audit (include fabric/color and permit for clarity)
     const [newLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
-    await logUpdate('logs', logId, req.user, oldLogRecord, newLogRows[0], req, `Updated log entry`);
+    const logFabric = oldLogRecord.fabric_name || 'N/A';
+    const logColor = oldLogRecord.color_name || 'N/A';
+    let logNote = `Updated log entry | Fabric: ${logFabric}, Color: ${logColor}`;
+    if (oldLogRecord.transaction_group_id) {
+      const [tg] = await db.query('SELECT permit_number, customer_name FROM transaction_groups WHERE transaction_group_id = ?', [oldLogRecord.transaction_group_id]);
+      if (tg.length > 0) logNote += ` | Permit: ${tg[0].permit_number || 'N/A'}, Customer: ${tg[0].customer_name || 'N/A'}`;
+    }
+    await logUpdate('logs', logId, req.user, oldLogRecord, newLogRows[0], req, logNote);
     
     res.json({
       log_id: log.log_id,
@@ -4467,8 +4498,10 @@ app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, re
     
     const [result] = await db.query('DELETE FROM logs WHERE log_id = ?', [req.params.id]);
     if (result.affectedRows > 0) {
-      // Log audit entry
-      await logDelete('logs', parseInt(req.params.id), req.user, oldLogRecord, req, `Deleted log entry`);
+      // Log audit entry (include fabric/color for clarity)
+      const delLogFabric = oldLogRecord.fabric_name || 'N/A';
+      const delLogColor = oldLogRecord.color_name || 'N/A';
+      await logDelete('logs', parseInt(req.params.id), req.user, oldLogRecord, req, `Deleted log entry | Fabric: ${delLogFabric}, Color: ${delLogColor}`);
       res.json({ success: true });
     } else {
       res.status(404).json({ error: 'Log not found' });
@@ -4551,7 +4584,9 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
         // Log audit entry for transaction cancellation/restoration
         if (oldColorRecord) {
           const action = log.type === 'return' ? 'Reverted return' : `Restored from ${log.type}`;
-          await logUpdate('colors', log.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmountMeters.toFixed(2)}m`);
+          const logFabricName = log.fabric_name || 'N/A';
+          const logColorName = log.color_name || 'N/A';
+          await logUpdate('colors', log.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmountMeters.toFixed(2)}m | Fabric: ${logFabricName}, Color: ${logColorName}`);
         }
         
         // If log has lot number, try to restore/revert to that specific lot
@@ -4798,10 +4833,11 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
         const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [restore.color_id]);
         const newColorRecord = newColorRows[0];
         
-        // Log audit entry for transaction group cancellation
+        // Log audit entry for transaction group cancellation (include fabric/color for clarity)
         if (oldColorRecord) {
           const action = restore.hasReturns ? 'Cancelled transaction group (mixed)' : 'Cancelled transaction group';
-          await logUpdate('colors', restore.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmount.toFixed(2)}m`);
+          const cancelCtx = await getColorFabricNames(restore.color_id, connection);
+          await logUpdate('colors', restore.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmount.toFixed(2)}m | Fabric: ${cancelCtx.fabric_name}, Color: ${cancelCtx.color_name}`);
         }
         
         // Restore/revert to specific lots if applicable
