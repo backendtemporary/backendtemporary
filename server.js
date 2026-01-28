@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
@@ -9,17 +12,30 @@ import db from './db.js';
 
 import pool from "./db.js";
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
+// Validate required environment variables
+const requiredEnvVars = ['PORT', 'DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET'];
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.error('❌ ERROR: Missing required environment variables:');
+  missingVars.forEach(varName => {
+    console.error(`   - ${varName}`);
+  });
+  console.error('\nPlease ensure all required variables are set in your .env file.');
+  process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const PORT = process.env.PORT || 5000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT;
 
 console.log("=== SERVER STARTUP ===");
 console.log("SERVER.JS LOADED — REAL FILE");
-console.log("PORT:", PORT || "UNDEFINED");
+console.log("PORT:", PORT);
 console.log("NODE_ENV:", process.env.NODE_ENV || "development");
 console.log("=========================");
 
@@ -760,10 +776,59 @@ async function generatePermitNumber(connection, transactionType) {
   }
 }
 
+// Helper to ensure customer exists in database
+// Called within a database transaction, expects a connection
+async function ensureCustomerExists(connection, customerId, customerName, userId) {
+  // If customer_id is provided, verify it exists
+  if (customerId) {
+    const [existing] = await connection.query(
+      'SELECT customer_id FROM customers WHERE customer_id = ?',
+      [customerId]
+    );
+    if (existing.length > 0) {
+      return customerId; // Customer exists, return the ID
+    }
+    // Customer ID provided but doesn't exist - this is a data integrity issue
+    console.warn(`Customer ID ${customerId} provided but not found in database`);
+  }
+  
+  // If customer_name is provided but no valid customer_id, create the customer
+  if (customerName && customerName.trim()) {
+    // Check if customer with this name already exists
+    const [existingByName] = await connection.query(
+      'SELECT customer_id FROM customers WHERE customer_name = ?',
+      [customerName.trim()]
+    );
+    
+    if (existingByName.length > 0) {
+      return existingByName[0].customer_id; // Return existing customer ID
+    }
+    
+    // Create new customer
+    const [result] = await connection.query(
+      'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
+      [customerName.trim(), null, null, null, userId]
+    );
+    
+    // Log audit entry for customer creation
+    const [newCustomer] = await connection.query('SELECT * FROM customers WHERE customer_id = ?', [result.insertId]);
+    if (newCustomer.length > 0) {
+      // Note: We can't use req here since this is a helper function, so we'll skip audit logging
+      // The customer creation will be logged when the transaction is created
+      return result.insertId;
+    }
+  }
+  
+  return null; // No customer to create/return
+}
+
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
-async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null) {
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null) {
   if (!transactionGroupId) return;
+  
+  // Ensure customer exists in database before creating transaction group
+  const finalCustomerId = await ensureCustomerExists(connection, customerId, customerName, userId);
   
   const now = getLebanonTimestamp();
   const transactionEpoch = epoch || now.epoch;
@@ -813,7 +878,7 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
       try {
         await connection.query(
           'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)',
-          [transactionGroupId, permitNumber, transactionType, customerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
+          [transactionGroupId, permitNumber, transactionType, finalCustomerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
         );
         inserted = true; // Success, exit retry loop
       } catch (error) {
@@ -3401,6 +3466,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const transactionEpoch = req.body.epoch || null;
     
     if (transactionGroupId) {
+      const userId = req.user ? req.user.user_id : null;
       await createOrUpdateTransactionGroup(
         connection,
         transactionGroupId,
@@ -3411,7 +3477,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         transactionType,
         transactionEpoch,
         transactionDate,
-        finalAmountYards // Pass yards as primary unit
+        finalAmountYards, // Pass yards as primary unit
+        userId // Pass user ID for customer creation
       );
     }
     
@@ -3463,7 +3530,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       notes,
       reference_log_id,
       timestamp,
-      epoch
+      epoch,
+      transaction_group_id,
+      transaction_type = 'A'
     } = req.body;
     
     // Validation
@@ -3548,6 +3617,28 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     // Log audit entry for return operation (include fabric/color for clarity)
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
     
+    // Handle transaction group for returns - use yards as primary unit
+    const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const logReturnAmountYards = round2Ret(returnAmountYardsValue);
+    const returnAmountMeters = round2Ret(amountMeters);
+    
+    if (transaction_group_id) {
+      const userId = req.user ? req.user.user_id : null;
+      await createOrUpdateTransactionGroup(
+        connection,
+        transaction_group_id,
+        customer_id,
+        customer_name,
+        notes,
+        returnAmountMeters,
+        transaction_type,
+        epoch,
+        timestamp ? (typeof timestamp === 'string' && timestamp.includes('T') ? timestamp.split('T')[0] : timestamp) : null,
+        logReturnAmountYards, // Pass yards as primary unit
+        userId // Pass user ID for customer creation
+      );
+    }
+    
     // Create log entry for return (date-only, no time)
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
     const now = iso
@@ -3563,13 +3654,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
-    const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
-    const logReturnAmountYards = round2Ret(returnAmountYardsValue);
-    const returnAmountMeters = round2Ret(amountMeters);
-    
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId, transaction_group_id || null]
     );
     
     await connection.commit();
@@ -5575,9 +5662,37 @@ if (fs.existsSync(FRONTEND_DIST)) {
   console.warn('frontend/dist not found. Run the frontend build to serve the UI.');
 }
 
+// Test MySQL connection before starting server
+async function testDatabaseConnection() {
+  try {
+    console.log('🔌 Testing MySQL connection...');
+    const connection = await db.getConnection();
+    await connection.ping();
+    connection.release();
+    console.log('✅ MySQL connection successful');
+    return true;
+  } catch (error) {
+    console.error('❌ MySQL connection failed:');
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Host: ${process.env.DB_HOST}:${process.env.DB_PORT}`);
+    console.error(`   Database: ${process.env.DB_NAME}`);
+    console.error(`   User: ${process.env.DB_USER}`);
+    console.error('\nPlease check your database configuration in .env file.');
+    return false;
+  }
+}
+
 // Start server
-app.listen(PORT, '0.0.0.0', () => {
-  const env = process.env.NODE_ENV || 'development';
-  console.log(`Server listening on port ${PORT || 'undefined'} (env: ${env})`);
-  console.log('Elastic Beanstalk/ALB ready to proxy traffic.');
-});
+(async () => {
+  const dbConnected = await testDatabaseConnection();
+  if (!dbConnected) {
+    console.error('❌ Server startup aborted due to database connection failure.');
+    process.exit(1);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    const env = process.env.NODE_ENV || 'development';
+    console.log(`✅ Server listening on port ${PORT} (env: ${env})`);
+    console.log('Elastic Beanstalk/ALB ready to proxy traffic.');
+  });
+})();
