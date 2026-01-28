@@ -728,35 +728,40 @@ function normalizeTimestampToDate(ts) {
 }
 
 // Generate permit number automatically based on transaction type
-// Separate counters for Type A and Type B, auto-incrementing from last transaction
+// Separate counters for Type A, Type B, and Return, auto-incrementing from last transaction
 async function generatePermitNumber(connection, transactionType) {
   try {
-    // Validate transaction type
-    if (!['A', 'B'].includes(transactionType)) {
+    // Validate transaction type - support 'A', 'B', and 'return'
+    if (!['A', 'B', 'return'].includes(transactionType)) {
       transactionType = 'A'; // Default to A if invalid
     }
     
+    // Map transaction type to permit prefix
+    // 'return' -> 'R', 'A' -> 'A', 'B' -> 'B'
+    const prefix = transactionType === 'return' ? 'R' : transactionType;
+    
     // Get last permit number for this transaction type
-    // Extract numeric part from permit_number (e.g., "A-123" -> 123)
-    // Only consider permit numbers that match the pattern: A-{number} or B-{number}
+    // Extract numeric part from permit_number (e.g., "A-123" -> 123, "R-1" -> 1)
+    // Only consider permit numbers that match the pattern: {prefix}-{number}
     const [result] = await connection.query(
       `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as last_num 
        FROM transaction_groups 
        WHERE transaction_type = ? 
        AND permit_number IS NOT NULL 
        AND permit_number REGEXP ?`,
-      [transactionType, `^${transactionType}-[0-9]+$`]
+      [transactionType, `^${prefix}-[0-9]+$`]
     );
     
     const lastNum = result[0]?.last_num || 0;
     const nextNum = lastNum + 1;
     
-    return `${transactionType}-${nextNum}`;
+    return `${prefix}-${nextNum}`;
   } catch (error) {
     console.error('Error generating permit number:', error);
     // Fallback: use timestamp-based permit number if query fails
     const timestamp = Date.now();
-    return `${transactionType}-${timestamp}`;
+    const prefix = transactionType === 'return' ? 'R' : transactionType;
+    return `${prefix}-${timestamp}`;
   }
 }
 
@@ -3548,6 +3553,32 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     // Log audit entry for return operation (include fabric/color for clarity)
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
     
+    // Round to 2 decimals - yards is primary, meters is secondary
+    const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
+    const logReturnAmountYards = round2Ret(returnAmountYardsValue);
+    const returnAmountMeters = round2Ret(amountMeters);
+    
+    // Handle transaction group - returns are first-class transactions
+    // Use yards as primary unit
+    const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const transactionType = 'return'; // Returns are always type 'return'
+    const transactionDate = timestamp ? normalizeTimestampToDate(timestamp)?.split('T')[0] : null;
+    const transactionEpoch = epoch != null ? Number(epoch) : (timestamp ? new Date(normalizeTimestampToDate(timestamp)).getTime() : null);
+    
+    // Create or update transaction group for return
+    await createOrUpdateTransactionGroup(
+      connection,
+      transactionGroupId,
+      customer_id,
+      customer_name,
+      notes,
+      returnAmountMeters,
+      transactionType,
+      transactionEpoch,
+      transactionDate,
+      logReturnAmountYards // Pass yards as primary unit
+    );
+    
     // Create log entry for return (date-only, no time)
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
     const now = iso
@@ -3563,13 +3594,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       ? `${fabric.fabric_name} [${fabric.design}]` 
       : fabric.fabric_name;
     
-    const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
-    const logReturnAmountYards = round2Ret(returnAmountYardsValue);
-    const returnAmountMeters = round2Ret(amountMeters);
-    
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3890,9 +3917,9 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
     const transactionGroupId = req.params.transaction_group_id;
     const { transaction_type, epoch } = req.body;
     
-    if (!transaction_type || !['A', 'B'].includes(transaction_type)) {
+    if (!transaction_type || !['A', 'B', 'return'].includes(transaction_type)) {
       await connection.rollback();
-      return res.status(400).json({ error: 'Transaction type must be A or B' });
+      return res.status(400).json({ error: 'Transaction type must be A, B, or return' });
     }
     
     await connection.beginTransaction();
