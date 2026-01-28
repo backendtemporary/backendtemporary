@@ -280,8 +280,10 @@ const getColorFabricNames = async (colorId, connection = null) => {
     'SELECT c.color_name, f.fabric_name FROM colors c JOIN fabrics f ON c.fabric_id = f.fabric_id WHERE c.color_id = ?',
     [colorId]
   );
-  if (rows.length === 0) return { fabric_name: 'N/A', color_name: 'N/A' };
-  return { fabric_name: rows[0].fabric_name || 'N/A', color_name: rows[0].color_name || 'N/A' };
+  // Ensure rows is always an array (defensive check)
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (safeRows.length === 0) return { fabric_name: 'N/A', color_name: 'N/A' };
+  return { fabric_name: safeRows[0].fabric_name || 'N/A', color_name: safeRows[0].color_name || 'N/A' };
 };
 
 /**
@@ -452,6 +454,9 @@ const buildFabricColorAggregatedStructure = async () => {
       LEFT JOIN users u_updated ON f.updated_by_user_id = u_updated.user_id
       ORDER BY f.fabric_id
     `);
+    // Ensure fabrics is always an array (defensive check)
+    const safeFabrics = Array.isArray(fabrics) ? fabrics : [];
+    
     // Colors now have roll attributes directly (length_meters, length_yards, date, etc.)
     // Note: initial_length_meters and initial_length_yards may not exist in older schemas
     // Using SELECT * to handle missing columns gracefully (they'll be undefined if not present)
@@ -465,16 +470,20 @@ const buildFabricColorAggregatedStructure = async () => {
       WHERE (c.sold = FALSE OR c.sold IS NULL OR c.sold = 0)
       ORDER BY c.fabric_id, c.color_id
     `);
+    // Ensure colors is always an array (defensive check)
+    const safeColors = Array.isArray(colors) ? colors : [];
     
     // Fetch all lots for all colors
     const [lots] = await db.query(`
       SELECT * FROM color_lots 
       ORDER BY color_id, lot_id
     `);
+    // Ensure lots is always an array (defensive check)
+    const safeLots = Array.isArray(lots) ? lots : [];
     
     // Group lots by color_id
     const lotsByColor = {};
-    lots.forEach(lot => {
+    safeLots.forEach(lot => {
       if (!lotsByColor[lot.color_id]) {
         lotsByColor[lot.color_id] = [];
       }
@@ -496,13 +505,13 @@ const buildFabricColorAggregatedStructure = async () => {
     
     // Build colors with roll attributes directly
     const colorsByFabric = {};
-    colors.forEach(color => {
+    safeColors.forEach(color => {
       if (!colorsByFabric[color.fabric_id]) {
         colorsByFabric[color.fabric_id] = [];
       }
       
       // Extract fabric number from fabric_code (e.g., "FAB-001" -> "001")
-      const fabric = fabrics.find(f => f.fabric_id === color.fabric_id);
+      const fabric = safeFabrics.find(f => f.fabric_id === color.fabric_id);
       const fabricNum = (fabric?.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(color.fabric_id).padStart(3, '0');
       const colorIndex = colorsByFabric[color.fabric_id].length + 1;
       const colorNum = String(colorIndex).padStart(3, '0');
@@ -538,7 +547,7 @@ const buildFabricColorAggregatedStructure = async () => {
     });
     
     // Build final structure
-    return fabrics.map(fabric => ({
+    return safeFabrics.map(fabric => ({
       fabric_id: fabric.fabric_id,
       fabric_name: fabric.fabric_name,
       fabric_code: fabric.fabric_code,
@@ -768,7 +777,9 @@ async function generatePermitNumber(connection, transactionType) {
       [transactionType, `^${prefix}-[0-9]+$`]
     );
     
-    const lastNum = result[0]?.last_num || 0;
+    // Ensure result is always an array (defensive check)
+    const safeResult = Array.isArray(result) ? result : [];
+    const lastNum = safeResult[0]?.last_num || 0;
     const nextNum = lastNum + 1;
     
     return `${prefix}-${nextNum}`;
@@ -1428,7 +1439,9 @@ app.get('/api/customers', authMiddleware, async (req, res) => {
     }
     sql += ' ORDER BY customer_name ASC LIMIT 100';
     const [rows] = await db.query(sql, params);
-    res.json(rows.map(mapCustomer));
+    // Ensure rows is always an array (defensive check)
+    const safeRows = Array.isArray(rows) ? rows : [];
+    res.json(safeRows.map(mapCustomer));
   } catch (error) {
     console.error('Error fetching customers:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
