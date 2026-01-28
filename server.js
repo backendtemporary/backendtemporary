@@ -5330,8 +5330,104 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
       }
     });
 
+    // Best-effort enrichment for older audit rows:
+    // Add Fabric/Color/Permit context at read-time, even for historical logs.
+    // Note: if the referenced record was deleted, enrichment may be N/A.
+    const needsContext = (note) => {
+      const s = String(note || '');
+      return !s.includes('Fabric:') || !s.includes('Color:');
+    };
+
+    const colorIds = [];
+    const lotIds = [];
+    const logIds = [];
+    for (const l of formattedLogs) {
+      if (!needsContext(l.notes)) continue;
+      if (l.table_name === 'colors' && Number(l.record_id) > 0) colorIds.push(Number(l.record_id));
+      if (l.table_name === 'color_lots' && Number(l.record_id) > 0) lotIds.push(Number(l.record_id));
+      if (l.table_name === 'logs' && Number(l.record_id) > 0) logIds.push(Number(l.record_id));
+    }
+
+    const uniq = (arr) => Array.from(new Set(arr));
+    const colorMap = new Map(); // color_id -> { fabric_name, color_name }
+    const lotMap = new Map();   // lot_id -> { fabric_name, color_name, lot_number }
+    const logMap = new Map();   // log_id -> { fabric_name, color_name, permit_number, customer_name }
+
+    const [colorRows] = uniq(colorIds).length
+      ? await db.query(
+          'SELECT c.color_id, c.color_name, f.fabric_name FROM colors c JOIN fabrics f ON c.fabric_id = f.fabric_id WHERE c.color_id IN (?)',
+          [uniq(colorIds)]
+        )
+      : [[]];
+    for (const r of colorRows) {
+      colorMap.set(Number(r.color_id), { fabric_name: r.fabric_name || 'N/A', color_name: r.color_name || 'N/A' });
+    }
+
+    const [lotRows] = uniq(lotIds).length
+      ? await db.query(
+          `SELECT cl.lot_id, cl.lot_number, c.color_name, f.fabric_name
+           FROM color_lots cl
+           JOIN colors c ON cl.color_id = c.color_id
+           JOIN fabrics f ON c.fabric_id = f.fabric_id
+           WHERE cl.lot_id IN (?)`,
+          [uniq(lotIds)]
+        )
+      : [[]];
+    for (const r of lotRows) {
+      lotMap.set(Number(r.lot_id), {
+        fabric_name: r.fabric_name || 'N/A',
+        color_name: r.color_name || 'N/A',
+        lot_number: r.lot_number || 'N/A'
+      });
+    }
+
+    const [logRows] = uniq(logIds).length
+      ? await db.query(
+          `SELECT l.log_id, l.fabric_name, l.color_name, tg.permit_number, tg.customer_name
+           FROM logs l
+           LEFT JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id
+           WHERE l.log_id IN (?)`,
+          [uniq(logIds)]
+        )
+      : [[]];
+    for (const r of logRows) {
+      logMap.set(Number(r.log_id), {
+        fabric_name: r.fabric_name || 'N/A',
+        color_name: r.color_name || 'N/A',
+        permit_number: r.permit_number || null,
+        customer_name: r.customer_name || null
+      });
+    }
+
+    const enrichedLogs = formattedLogs.map((l) => {
+      if (!needsContext(l.notes)) return l;
+      const base = String(l.notes || '').trim();
+      const joinNote = (extra) => (base ? `${base} | ${extra}` : extra);
+
+      if (l.table_name === 'colors') {
+        const ctx = colorMap.get(Number(l.record_id));
+        if (!ctx) return { ...l, display_notes: joinNote('Fabric: N/A, Color: N/A') };
+        return { ...l, display_notes: joinNote(`Fabric: ${ctx.fabric_name}, Color: ${ctx.color_name}`) };
+      }
+      if (l.table_name === 'color_lots') {
+        const ctx = lotMap.get(Number(l.record_id));
+        if (!ctx) return { ...l, display_notes: joinNote('Fabric: N/A, Color: N/A') };
+        return { ...l, display_notes: joinNote(`Fabric: ${ctx.fabric_name}, Color: ${ctx.color_name}, Lot: ${ctx.lot_number}`) };
+      }
+      if (l.table_name === 'logs') {
+        const ctx = logMap.get(Number(l.record_id));
+        if (!ctx) return { ...l, display_notes: joinNote('Fabric: N/A, Color: N/A') };
+        let extra = `Fabric: ${ctx.fabric_name}, Color: ${ctx.color_name}`;
+        if (ctx.permit_number || ctx.customer_name) {
+          extra += `, Permit: ${ctx.permit_number || 'N/A'}, Customer: ${ctx.customer_name || 'N/A'}`;
+        }
+        return { ...l, display_notes: joinNote(extra) };
+      }
+      return l;
+    });
+
     res.json({
-      logs: formattedLogs,
+      logs: enrichedLogs,
       total,
       limit: parseInt(limit),
       offset: parseInt(offset)
