@@ -3622,22 +3622,18 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     // Log audit entry for return operation (include fabric/color for clarity)
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
     
-<<<<<<< HEAD
     // Round to 2 decimals - yards is primary, meters is secondary
-=======
-    // Handle transaction group for returns - use yards as primary unit
->>>>>>> 4cfbfff9e5cd844a6799be7b4892eccfc0936462
     const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
     const logReturnAmountYards = round2Ret(returnAmountYardsValue);
     const returnAmountMeters = round2Ret(amountMeters);
     
-<<<<<<< HEAD
     // Handle transaction group - returns are first-class transactions
     // Use yards as primary unit
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = 'return'; // Returns are always type 'return'
     const transactionDate = timestamp ? normalizeTimestampToDate(timestamp)?.split('T')[0] : null;
     const transactionEpoch = epoch != null ? Number(epoch) : (timestamp ? new Date(normalizeTimestampToDate(timestamp)).getTime() : null);
+    const userId = req.user ? req.user.user_id : null;
     
     // Create or update transaction group for return
     await createOrUpdateTransactionGroup(
@@ -3650,26 +3646,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       transactionType,
       transactionEpoch,
       transactionDate,
-      logReturnAmountYards // Pass yards as primary unit
+      logReturnAmountYards, // Pass yards as primary unit
+      userId // Pass user ID for customer creation
     );
-=======
-    if (transaction_group_id) {
-      const userId = req.user ? req.user.user_id : null;
-      await createOrUpdateTransactionGroup(
-        connection,
-        transaction_group_id,
-        customer_id,
-        customer_name,
-        notes,
-        returnAmountMeters,
-        transaction_type,
-        epoch,
-        timestamp ? (typeof timestamp === 'string' && timestamp.includes('T') ? timestamp.split('T')[0] : timestamp) : null,
-        logReturnAmountYards, // Pass yards as primary unit
-        userId // Pass user ID for customer creation
-      );
-    }
->>>>>>> 4cfbfff9e5cd844a6799be7b4892eccfc0936462
     
     // Create log entry for return (date-only, no time)
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
@@ -3687,13 +3666,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       : fabric.fabric_name;
     
     await connection.query(
-<<<<<<< HEAD
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
-=======
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, reference_log_id, salesperson_id, conducted_by_user_id, transaction_group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, reference_log_id || null, salespersonId, conductedByUserId, transaction_group_id || null]
->>>>>>> 4cfbfff9e5cd844a6799be7b4892eccfc0936462
     );
     
     await connection.commit();
