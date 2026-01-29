@@ -4443,9 +4443,9 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
             const [newColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
             const newColorRecord = newColorRows[0];
             
-            // Log audit entry (include fabric/color for clarity)
-            const invFabric = oldLogRecord.fabric_name || 'N/A';
-            const invColor = oldLogRecord.color_name || 'N/A';
+            // Log audit entry (include fabric/color for clarity) - use log (current row) not oldLogRecord (declared later)
+            const invFabric = log.fabric_name || 'N/A';
+            const invColor = log.color_name || 'N/A';
             await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Inventory adjusted due to transaction edit: ${deltaYards > 0 ? '+' : ''}${deltaYards.toFixed(2)}yd | Fabric: ${invFabric}, Color: ${invColor}`);
           }
         }
