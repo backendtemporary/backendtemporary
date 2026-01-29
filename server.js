@@ -4598,31 +4598,6 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
   }
 });
 
-app.delete('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) => {
-  try {
-    // Get record before deletion
-    const [oldLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [req.params.id]);
-    if (oldLogRows.length === 0) {
-      return res.status(404).json({ error: 'Log not found' });
-    }
-    const oldLogRecord = oldLogRows[0];
-    
-    const [result] = await db.query('DELETE FROM logs WHERE log_id = ?', [req.params.id]);
-    if (result.affectedRows > 0) {
-      // Log audit entry (include fabric/color for clarity)
-      const delLogFabric = oldLogRecord.fabric_name || 'N/A';
-      const delLogColor = oldLogRecord.color_name || 'N/A';
-      await logDelete('logs', parseInt(req.params.id), req.user, oldLogRecord, req, `Deleted log entry | Fabric: ${delLogFabric}, Color: ${delLogColor}`);
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: 'Log not found' });
-    }
-  } catch (error) {
-    console.error('Error deleting log:', error);
-    res.status(500).json({ error: 'Failed to delete log' });
-  }
-});
-
 // POST /api/logs/:log_id/cancel - Cancel a single log (restore roll, delete log, update transaction group)
 // If it's the last log in the transaction group, delete the group and decrease permit counter
 app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async (req, res) => {
