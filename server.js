@@ -3772,7 +3772,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
 
 app.get('/api/logs', authMiddleware, async (req, res) => {
   try {
-    const { type, fabricId, colorId, rollId, customerId, start, end, minLength, maxLength } = req.query;
+    const { type, fabricId, colorId, rollId, start, end, minLength, maxLength } = req.query;
     
     let query = `
       SELECT 
@@ -3806,10 +3806,6 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
     if (rollId) {
       query += ' AND l.roll_id LIKE ?';
       params.push(`%${rollId}%`);
-    }
-    if (customerId) {
-      query += ' AND l.customer_id = ?';
-      params.push(parseInt(customerId));
     }
     if (start) {
       query += ' AND l.epoch >= ?';
@@ -3968,46 +3964,6 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error fetching log:', error);
     res.status(500).json({ error: 'Failed to fetch log' });
-  }
-});
-
-// GET /api/transaction-groups - List transaction groups, optional customer_id filter
-app.get('/api/transaction-groups', authMiddleware, async (req, res) => {
-  try {
-    const { customer_id: customerId } = req.query;
-    let sql = `
-      SELECT transaction_group_id, permit_number, transaction_type, customer_id, customer_name,
-        transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes, created_at, updated_at
-      FROM transaction_groups
-      WHERE 1=1
-    `;
-    const params = [];
-    if (customerId) {
-      sql += ' AND customer_id = ?';
-      params.push(parseInt(customerId));
-    }
-    sql += ' ORDER BY epoch DESC, transaction_group_id DESC LIMIT 500';
-    const [rows] = await db.query(sql, params);
-    const list = (rows || []).map((r) => ({
-      transaction_group_id: r.transaction_group_id,
-      permit_number: r.permit_number || null,
-      transaction_type: r.transaction_type || 'A',
-      customer_id: r.customer_id || null,
-      customer_name: r.customer_name || null,
-      transaction_date: r.transaction_date || null,
-      epoch: r.epoch || null,
-      timezone: r.timezone || null,
-      total_items: r.total_items ?? 0,
-      total_meters: parseFloat(r.total_meters) || 0,
-      total_yards: parseFloat(r.total_yards) || 0,
-      notes: r.notes || null,
-      created_at: r.created_at,
-      updated_at: r.updated_at,
-    }));
-    res.json(list);
-  } catch (error) {
-    console.error('Error listing transaction groups:', error);
-    res.status(500).json({ error: 'Failed to list transaction groups' });
   }
 });
 
