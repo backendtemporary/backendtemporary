@@ -1,0 +1,2 @@
+# Optional: add .env here if you use EB environment variables instead.
+# Leaving .env out so you can deploy with your local .env when EB env vars can't be changed.
