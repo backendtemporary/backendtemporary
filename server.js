@@ -3385,6 +3385,20 @@ async function getColorForTransaction(connection, fabricId, colorId) {
   return colors[0] || null;
 }
 
+// Helper to get color with lock for return operations (allows sold colors so we can add inventory back)
+async function getColorForReturn(connection, fabricId, colorId) {
+  const [colors] = await connection.query(
+    `SELECT color_id, fabric_id, color_name, length_meters, length_yards,
+            initial_length_meters, initial_length_yards,
+            date, weight, lot, roll_nb, roll_count, status, sold
+     FROM colors
+     WHERE fabric_id = ? AND color_id = ?
+     FOR UPDATE`,
+    [fabricId, colorId]
+  );
+  return colors[0] || null;
+}
+
 // POST /api/fabrics/:fabric_id/colors/:color_id/sell - Sell by meters (subtract from color)
 app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
@@ -3765,6 +3779,187 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
   }
 });
 
+// POST /api/transactions/return/partial - Partial return: multiple items, each with partial amounts
+app.post('/api/transactions/return/partial', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { customer_id, customer_name, transaction_date, epoch, items } = req.body || {};
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items array is required and must not be empty' });
+    }
+    const customerId = customer_id != null ? parseInt(customer_id) : null;
+    const customerName = customer_name || null;
+    const transactionDate = transaction_date && typeof transaction_date === 'string' ? transaction_date.trim() : null;
+    const transactionEpoch = epoch != null && epoch !== '' ? Number(epoch) : null;
+    if (!transactionDate || !/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) {
+      return res.status(400).json({ error: 'Valid transaction_date (YYYY-MM-DD) is required' });
+    }
+    if (transactionEpoch == null || Number.isNaN(transactionEpoch)) {
+      return res.status(400).json({ error: 'epoch is required and must be a number' });
+    }
+    const userId = req.user ? req.user.user_id : null;
+    const transactionGroupId = `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const transactionTimezone = 'Asia/Beirut';
+    const now = { iso: transactionDate + ' 00:00:00', epoch: transactionEpoch, tz: transactionTimezone };
+
+    await connection.beginTransaction();
+
+    // Process items in deterministic order (by source_log_id) to avoid deadlocks
+    const sortedItems = [...items].sort((a, b) => (a.source_log_id || 0) - (b.source_log_id || 0));
+
+    for (const it of sortedItems) {
+      const sourceLogId = it.source_log_id != null ? parseInt(it.source_log_id) : null;
+      if (!sourceLogId || sourceLogId <= 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Each item must have a valid source_log_id' });
+      }
+      const [sourceRows] = await connection.query(
+        'SELECT log_id, type, fabric_id, color_id, fabric_name, color_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, salesperson_id FROM logs WHERE log_id = ?',
+        [sourceLogId]
+      );
+      if (sourceRows.length === 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Source log not found: ${sourceLogId}` });
+      }
+      const src = sourceRows[0];
+      if (src.type !== 'sell') {
+        await connection.rollback();
+        return res.status(400).json({ error: `Source log ${sourceLogId} is not a sell log; only sell logs can be partially returned` });
+      }
+      const fabricId = src.fabric_id;
+      const colorId = src.color_id;
+      if (!fabricId || !colorId) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Source log ${sourceLogId} has no fabric_id or color_id` });
+      }
+      const origRollCount = parseInt(src.roll_count) || 0;
+      const origYards = src.amount_yards != null && src.amount_yards !== '' ? parseFloat(src.amount_yards) : null;
+      const origMeters = src.amount_meters != null && src.amount_meters !== '' ? parseFloat(src.amount_meters) : null;
+      const yardsBased = origYards != null && !Number.isNaN(origYards) && origYards > 0;
+      const metersBased = !yardsBased && origMeters != null && !Number.isNaN(origMeters) && origMeters > 0;
+      if (!yardsBased && !metersBased) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Source log ${sourceLogId} has no valid amount_yards or amount_meters` });
+      }
+
+      let returnRollCount = it.return_roll_count != null ? parseInt(it.return_roll_count) : 0;
+      if (Number.isNaN(returnRollCount) || returnRollCount < 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'return_roll_count must be a non-negative integer' });
+      }
+      if (returnRollCount > origRollCount) {
+        await connection.rollback();
+        return res.status(400).json({ error: `return_roll_count cannot exceed original roll count (${origRollCount}) for source log ${sourceLogId}` });
+      }
+
+      let returnAmountYards = null;
+      let returnAmountMeters = null;
+      if (yardsBased) {
+        const raw = it.return_amount_yards;
+        if (raw === undefined || raw === null || raw === '') {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_yards is required for source log ${sourceLogId} (yards-based sale)` });
+        }
+        returnAmountYards = parseFloat(raw);
+        if (Number.isNaN(returnAmountYards) || returnAmountYards < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'return_amount_yards must be a non-negative number' });
+        }
+        if (returnAmountYards > origYards) {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_yards cannot exceed original amount (${origYards}) for source log ${sourceLogId}` });
+        }
+        returnAmountMeters = returnAmountYards / 1.0936;
+      } else {
+        const raw = it.return_amount_meters;
+        if (raw === undefined || raw === null || raw === '') {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_meters is required for source log ${sourceLogId} (meters-based sale)` });
+        }
+        returnAmountMeters = parseFloat(raw);
+        if (Number.isNaN(returnAmountMeters) || returnAmountMeters < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'return_amount_meters must be a non-negative number' });
+        }
+        if (returnAmountMeters > origMeters) {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_meters cannot exceed original amount (${origMeters}) for source log ${sourceLogId}` });
+        }
+        returnAmountYards = returnAmountMeters * 1.0936;
+      }
+      const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+      const finalYards = round2(returnAmountYards);
+      const finalMeters = round2(returnAmountMeters);
+      if (finalYards <= 0 && finalMeters <= 0 && returnRollCount === 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: `At least one of return amount or return_roll_count must be positive for source log ${sourceLogId}` });
+      }
+
+      const color = await getColorForReturn(connection, fabricId, colorId);
+      if (!color) {
+        await connection.rollback();
+        return res.status(404).json({ error: `Color not found: fabric_id=${fabricId}, color_id=${colorId}` });
+      }
+      const [fabrics] = await connection.query('SELECT fabric_name, fabric_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
+      if (fabrics.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ error: 'Fabric not found' });
+      }
+      const fabric = fabrics[0];
+      const fabricNameForLog = fabric.design && fabric.design !== 'none' ? `${fabric.fabric_name} [${fabric.design}]` : fabric.fabric_name;
+
+      const currentMeters = parseFloat(color.length_meters) || 0;
+      const currentYards = parseFloat(color.length_yards) || 0;
+      const currentRollCount = parseInt(color.roll_count) || 0;
+      const newMeters = currentMeters + finalMeters;
+      const newYards = currentYards + finalYards;
+      const newRollCount = currentRollCount + returnRollCount;
+
+      const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+      const oldColorRecord = oldColorRows[0];
+      await connection.query(
+        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+        [newMeters, newYards, newRollCount, colorId]
+      );
+      const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
+      const newColorRecord = newColorRows[0];
+      await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Partial return: +${finalYards.toFixed(2)}yd / +${returnRollCount} roll(s) | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
+
+      await createOrUpdateTransactionGroup(
+        connection,
+        transactionGroupId,
+        customerId,
+        customerName,
+        null,
+        finalMeters,
+        'return',
+        transactionEpoch,
+        transactionDate,
+        finalYards,
+        userId
+      );
+
+      const salespersonId = src.salesperson_id || null;
+      const conductedByUserId = req.user ? req.user.user_id : null;
+      const lotValue = color.lot || src.lot || null;
+      const rollNbValue = color.roll_nb || src.roll_nb || null;
+      await connection.query(
+        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, null, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
+      );
+    }
+
+    await connection.commit();
+    const updatedFabrics = await buildFabricColorAggregatedStructure();
+    res.json(updatedFabrics);
+  } catch (err) {
+    if (connection.rollback) await connection.rollback();
+    console.error('Error in partial return:', err);
+    res.status(500).json({ error: err.message || 'Partial return failed' });
+  } finally {
+    connection.release();
+  }
+});
 
 // ============================================
 // LOGS ENDPOINTS (Accept fabricIndex/colorIndex, store fabricId/colorId)
