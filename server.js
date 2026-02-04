@@ -1496,6 +1496,109 @@ app.get('/api/customers/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/customers/:id/logs - All logs for this customer (customer_id primary, customer_name fallback for old data)
+app.get('/api/customers/:id/logs', authMiddleware, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+    const [custRows] = await db.query('SELECT customer_id, customer_name FROM customers WHERE customer_id = ?', [customerId]);
+    if (!custRows.length) return res.status(404).json({ error: 'Customer not found' });
+    const customerName = custRows[0].customer_name || null;
+
+    const [logs] = await db.query(
+      `SELECT 
+        l.*,
+        s.name as salesperson_name,
+        u.username as conducted_by_username,
+        u.full_name as conducted_by_full_name,
+        tg.transaction_type,
+        tg.permit_number,
+        tg.notes as transaction_group_notes
+      FROM logs l
+      LEFT JOIN salespersons s ON l.salesperson_id = s.salesperson_id
+      LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
+      LEFT JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id
+      WHERE (l.customer_id = ? OR (l.customer_id IS NULL AND l.customer_name = ?))
+      ORDER BY l.epoch DESC, l.log_id DESC`,
+      [customerId, customerName]
+    );
+    const r2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+    const formattedLogs = logs.map(log => {
+      const am = log.amount_meters ? parseFloat(log.amount_meters) : 0;
+      const ay = log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0);
+      return {
+        log_id: log.log_id,
+        type: log.type,
+        fabric_id: log.fabric_id || null,
+        color_id: log.color_id || null,
+        customer_id: log.customer_id || null,
+        fabric_name: log.fabric_name,
+        color_name: log.color_name,
+        customer_name: log.customer_name,
+        amount_meters: r2(am),
+        amount_yards: r2(ay),
+        length_meters: log.type === 'sell' ? r2(am) : null,
+        length_yards: log.type === 'sell' ? r2(ay) : null,
+        roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
+        notes: log.transaction_group_notes || log.notes,
+        timestamp: log.timestamp,
+        epoch: log.epoch,
+        transaction_group_id: log.transaction_group_id || null,
+        salesperson_name: log.salesperson_name || null,
+        id: log.log_id,
+        fabricId: log.fabric_id || null,
+        colorId: log.color_id || null,
+        customerId: log.customer_id || null,
+        fabricName: log.fabric_name,
+        colorName: log.color_name,
+        customerName: log.customer_name,
+        transactionGroupId: log.transaction_group_id || null,
+        transactionType: log.transaction_type || null,
+        permitNumber: log.permit_number || null
+      };
+    });
+    res.json(formattedLogs);
+  } catch (error) {
+    console.error('Error fetching customer logs:', error);
+    res.status(500).json({ error: 'Failed to fetch customer logs' });
+  }
+});
+
+// GET /api/customers/:id/transaction-groups - All transaction groups (delivery permits) for this customer
+app.get('/api/customers/:id/transaction-groups', authMiddleware, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+    const [custRows] = await db.query('SELECT customer_id, customer_name FROM customers WHERE customer_id = ?', [customerId]);
+    if (!custRows.length) return res.status(404).json({ error: 'Customer not found' });
+    const customerName = custRows[0].customer_name || null;
+
+    const [groups] = await db.query(
+      `SELECT transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes
+       FROM transaction_groups
+       WHERE customer_id = ? OR (customer_id IS NULL AND customer_name = ?)
+       ORDER BY epoch DESC`,
+      [customerId, customerName]
+    );
+    const list = groups.map(g => ({
+      transaction_group_id: g.transaction_group_id,
+      permit_number: g.permit_number || null,
+      transaction_type: g.transaction_type || 'A',
+      customer_id: g.customer_id || null,
+      customer_name: g.customer_name || null,
+      transaction_date: g.transaction_date || null,
+      epoch: g.epoch || null,
+      timezone: g.timezone || null,
+      total_items: g.total_items != null ? parseInt(g.total_items) : 0,
+      total_meters: g.total_meters != null ? parseFloat(g.total_meters) : 0,
+      total_yards: g.total_yards != null ? parseFloat(g.total_yards) : 0,
+      notes: g.notes || null
+    }));
+    res.json(list);
+  } catch (error) {
+    console.error('Error fetching customer transaction groups:', error);
+    res.status(500).json({ error: 'Failed to fetch customer transaction groups' });
+  }
+});
+
 app.post('/api/customers', authMiddleware, async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
