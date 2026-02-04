@@ -923,7 +923,7 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
     // Create new transaction group - auto-generate permit number
     // Generate permit number based on transaction type (separate counters for A and B)
     let permitNumber = await generatePermitNumber(connection, transactionType);
-    
+
     // Retry logic in case of duplicate permit number (race condition)
     let retries = 3;
     let inserted = false;
@@ -3523,7 +3523,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
     const transactionDate = req.body.transaction_date || null;
-    const transactionEpoch = req.body.epoch || null;
+    let transactionEpoch = req.body.epoch ?? null;
     
     // When user sent a date without epoch, derive epoch in Asia/Beirut so we never silently use "today".
     if (transactionDate && (transactionEpoch == null || transactionEpoch === '')) {
