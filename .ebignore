@@ -1,2 +1,10 @@
 # Optional: add .env here if you use EB environment variables instead.
 # Leaving .env out so you can deploy with your local .env when EB env vars can't be changed.
+.env
+.env.*
+node_modules/
+.git/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
