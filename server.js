@@ -752,6 +752,42 @@ function normalizeTimestampToDate(ts) {
   return datePart + 'T00:00:00';
 }
 
+// Derive calendar date (YYYY-MM-DD) in Asia/Beirut from epoch (ms). Used for transaction_date from epoch.
+function epochToDateStringBeirut(epoch) {
+  const d = new Date(Number(epoch));
+  const fmt = new Intl.DateTimeFormat('sv', {
+    timeZone: 'Asia/Beirut',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(d);
+}
+
+// Derive epoch (ms) for midnight on the given calendar date (YYYY-MM-DD) in Asia/Beirut. Used when client sends date without epoch.
+function dateStringToEpochBeirut(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr.trim())) return NaN;
+  const cleaned = dateStr.trim();
+  const noonUtc = new Date(cleaned + 'T12:00:00.000Z').getTime();
+  const dateInBeirut = epochToDateStringBeirut(noonUtc);
+  if (dateInBeirut !== cleaned) {
+    return NaN;
+  }
+  const timeFmt = new Intl.DateTimeFormat('sv', {
+    timeZone: 'Asia/Beirut',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const parts = timeFmt.formatToParts(new Date(noonUtc));
+  const hour = parseInt(parts.find(p => p.type === 'hour').value, 10);
+  const minute = parseInt(parts.find(p => p.type === 'minute').value, 10);
+  const second = parseInt(parts.find(p => p.type === 'second').value, 10);
+  return noonUtc - (hour * 3600 + minute * 60 + second) * 1000;
+}
+
 // Generate permit number automatically based on transaction type
 // Separate counters for Type A, Type B, and Return, auto-incrementing from last transaction
 async function generatePermitNumber(connection, transactionType) {
@@ -779,7 +815,8 @@ async function generatePermitNumber(connection, transactionType) {
     
     // Ensure result is always an array (defensive check)
     const safeResult = Array.isArray(result) ? result : [];
-    const lastNum = safeResult[0]?.last_num || 0;
+    // Parse to integer so arithmetic is numeric (MySQL may return numeric columns as strings)
+    const lastNum = parseInt(safeResult[0]?.last_num, 10) || 0;
     const nextNum = lastNum + 1;
     
     return `${prefix}-${nextNum}`;
@@ -840,35 +877,35 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
 
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
+// Creation date rule: if client sends a user-selected date (transactionDate/timestamp), epoch must be provided or we derive it in Asia/Beirut; we never silently use "today".
 async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null) {
   if (!transactionGroupId) return;
   
   // Ensure customer exists in database before creating transaction group
   const finalCustomerId = await ensureCustomerExists(connection, customerId, customerName, userId);
   
-  const now = getLebanonTimestamp();
-  const transactionEpoch = epoch || now.epoch;
-  
-  // Use provided transaction_date if available, otherwise use current timestamp
-  // Convert now.iso from YYYY-MM-DDT00:00:00 to YYYY-MM-DD HH:MM:SS format for MySQL
-  let transactionDateValue = now.iso.replace('T', ' ');
-  let transactionTimezone = now.tz;
-  
-  if (transactionDate) {
-    // If transaction_date is provided, use it and convert to proper format
-    // transactionDate should be in YYYY-MM-DD format
-    if (typeof transactionDate === 'string' && transactionDate.trim()) {
-      // Ensure it's a valid date string
-      const dateStr = transactionDate.trim();
-      if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-        // Convert to datetime format (YYYY-MM-DD HH:MM:SS) using midnight
-        transactionDateValue = `${dateStr} 00:00:00`;
-        // Use the epoch if provided, otherwise calculate from the date
-        if (!epoch) {
-          transactionEpoch = new Date(dateStr + 'T00:00:00').getTime();
-        }
-      }
+  let transactionEpoch;
+  let transactionDateValue;
+  const transactionTimezone = 'Asia/Beirut';
+
+  if (epoch != null && epoch !== '') {
+    // Epoch is the single source of truth: derive transaction_date in Asia/Beirut (not UTC)
+    transactionEpoch = Number(epoch);
+    const datePart = epochToDateStringBeirut(transactionEpoch);
+    transactionDateValue = datePart + ' 00:00:00';
+  } else if (transactionDate && typeof transactionDate === 'string' && transactionDate.trim() && /^\d{4}-\d{2}-\d{2}$/.test(transactionDate.trim())) {
+    // User sent date without epoch: derive epoch from that date in Asia/Beirut (do not default to today)
+    const dateStr = transactionDate.trim();
+    transactionEpoch = dateStringToEpochBeirut(dateStr);
+    if (Number.isNaN(transactionEpoch)) {
+      throw new Error(`Invalid transaction_date: could not derive epoch for "${dateStr}" in Asia/Beirut. Please send epoch with the date.`);
     }
+    transactionDateValue = `${dateStr} 00:00:00`;
+  } else {
+    // No user-selected date: use today in Lebanon
+    const now = getLebanonTimestamp();
+    transactionEpoch = now.epoch;
+    transactionDateValue = now.iso.replace('T', ' ');
   }
   
   // Round to 2 decimals - yards is primary, meters is secondary
@@ -3298,9 +3335,14 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
       }
     }
 
-    // Create log entry only if skip_log is not true (used for cancellations)
+    // Create log entry only if skip_log is not true (used for cancellations). When user sends timestamp, use epoch if provided or derive in Asia/Beirut (never UTC, never "today").
     if (!skip_log) {
-      const now = timestamp ? { iso: timestamp, epoch: epoch || Date.parse(timestamp.replace('T', ' ')), tz: 'Asia/Beirut' } : getLebanonTimestamp();
+      const norm = timestamp ? normalizeTimestampToDate(timestamp) : null;
+      const datePart = norm ? norm.split('T')[0] : null;
+      const derivedEpoch = datePart ? dateStringToEpochBeirut(datePart) : NaN;
+      const now = timestamp
+        ? { iso: norm || timestamp, epoch: (epoch != null && epoch !== '') ? Number(epoch) : (Number.isNaN(derivedEpoch) ? getLebanonTimestamp().epoch : derivedEpoch), tz: 'Asia/Beirut' }
+        : getLebanonTimestamp();
       const salesperson_id = req.body.salesperson_id || null;
       const conducted_by_user_id = req.user ? req.user.user_id : null;
       await connection.query(
@@ -3483,6 +3525,15 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const transactionDate = req.body.transaction_date || null;
     const transactionEpoch = req.body.epoch || null;
     
+    // When user sent a date without epoch, derive epoch in Asia/Beirut so we never silently use "today".
+    if (transactionDate && (transactionEpoch == null || transactionEpoch === '')) {
+      const dateStr = typeof transactionDate === 'string' ? transactionDate.trim() : '';
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        const derived = dateStringToEpochBeirut(dateStr);
+        if (!Number.isNaN(derived)) transactionEpoch = derived;
+      }
+    }
+
     if (transactionGroupId) {
       const userId = req.user ? req.user.user_id : null;
       await createOrUpdateTransactionGroup(
@@ -3500,8 +3551,11 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       );
     }
     
-    // Create log entry (no roll_id, include lot and roll_nb as metadata)
-    const now = getLebanonTimestamp();
+    // Create log entry: use same date/epoch as transaction group when user provided date/epoch (do not use "today")
+    const hasUserDate = transactionDate || (transactionEpoch != null && transactionEpoch !== '');
+    const now = hasUserDate && transactionEpoch != null && transactionEpoch !== ''
+      ? { iso: epochToDateStringBeirut(Number(transactionEpoch)) + 'T00:00:00', epoch: Number(transactionEpoch), tz: 'Asia/Beirut' }
+      : getLebanonTimestamp();
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     // Use lot number from selected lot if lot_id provided, otherwise use provided lot or color.lot
@@ -3641,11 +3695,15 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const returnAmountMeters = round2Ret(amountMeters);
     
     // Handle transaction group - returns are first-class transactions
-    // Use yards as primary unit
+    // Use yards as primary unit. When user sends timestamp/date, epoch must be provided or we derive in Asia/Beirut (never UTC, never "today").
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = 'return'; // Returns are always type 'return'
     const transactionDate = timestamp ? normalizeTimestampToDate(timestamp)?.split('T')[0] : null;
-    const transactionEpoch = epoch != null ? Number(epoch) : (timestamp ? new Date(normalizeTimestampToDate(timestamp)).getTime() : null);
+    let transactionEpoch = epoch != null && epoch !== '' ? Number(epoch) : null;
+    if (transactionDate && (transactionEpoch == null || Number.isNaN(transactionEpoch))) {
+      const derived = dateStringToEpochBeirut(transactionDate);
+      if (!Number.isNaN(derived)) transactionEpoch = derived;
+    }
     const userId = req.user ? req.user.user_id : null;
     
     // Create or update transaction group for return
@@ -3663,11 +3721,20 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       userId // Pass user ID for customer creation
     );
     
-    // Create log entry for return (date-only, no time)
+    // Create log entry for return: use same date/epoch as transaction group (Asia/Beirut); never UTC or "today" when user sent date
     const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
-    const now = iso
-      ? { iso, epoch: epoch != null ? Number(epoch) : new Date(iso).getTime(), tz: 'Asia/Beirut' }
-      : getLebanonTimestamp();
+    const now = (iso && transactionEpoch != null && !Number.isNaN(transactionEpoch))
+      ? { iso, epoch: transactionEpoch, tz: 'Asia/Beirut' }
+      : (iso ? { iso, epoch: dateStringToEpochBeirut(iso.split('T')[0]), tz: 'Asia/Beirut' } : getLebanonTimestamp());
+    if (iso && (now.epoch == null || Number.isNaN(now.epoch))) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Invalid date', message: 'Could not derive epoch for the provided timestamp in Asia/Beirut. Please send epoch with the date.' });
+    }
+    if (now.epoch == null || Number.isNaN(now.epoch)) {
+      const today = getLebanonTimestamp();
+      now.epoch = today.epoch;
+      now.iso = now.iso || today.iso;
+    }
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     const lotValue = color.lot || null;
@@ -4036,9 +4103,16 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       // Note: Permit number prefix should be updated by user if needed
     } else if (epoch && epoch !== currentGroup.epoch) {
       // Only epoch changed - DO NOT recalculate permit numbers (user wants manual control)
-      // Store date-only (no time). MySQL DATETIME expects "YYYY-MM-DD HH:MM:SS", not "YYYY-MM-DDT00:00:00"
+      // Store date-only (no time) in Asia/Beirut. MySQL DATETIME expects "YYYY-MM-DD HH:MM:SS", not "YYYY-MM-DDT00:00:00"
       const d = new Date(Number(epoch));
-      const datePart = d.toISOString().split('T')[0];
+      const fmt = new Intl.DateTimeFormat('sv', {
+        timeZone: 'Asia/Beirut',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      });
+      const datePart = fmt.format(d);
       const mysqlDatetime = datePart + ' 00:00:00';
       await connection.query(
         'UPDATE transaction_groups SET epoch = ?, transaction_date = ? WHERE transaction_group_id = ?',
@@ -4137,7 +4211,8 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
     // Extract transaction type from permit number (A or B)
     const permitType = cleanedPermit.charAt(0).toUpperCase();
     
-    // Check if permit number already exists (excluding current transaction)
+    // Check if permit number already exists (excluding current transaction).
+    // String equality: permit_number column is VARCHAR; ? is bound as string (cleanedPermit).
     const [existing] = await connection.query(
       'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_group_id != ?',
       [cleanedPermit, transactionGroupId]
@@ -4152,7 +4227,7 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
       });
     }
     
-    // Validate that permit number prefix matches transaction type
+    // Validate that permit number prefix matches transaction type (strict string comparison)
     if (permitType !== currentGroup.transaction_type) {
       await connection.rollback();
       return res.status(400).json({ 
@@ -4232,6 +4307,25 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       }
     }
 
+    // When user sends timestamp/date, use epoch if provided or derive in Asia/Beirut; never silently use "today"
+    let timestampValue = entry.timestamp || now.iso;
+    let epochValue = (entry.epoch != null && entry.epoch !== '') ? Number(entry.epoch) : null;
+    if (entry.timestamp && (epochValue == null || Number.isNaN(epochValue))) {
+      const norm = normalizeTimestampToDate(entry.timestamp);
+      const datePart = norm ? norm.split('T')[0] : null;
+      if (datePart) {
+        const derived = dateStringToEpochBeirut(datePart);
+        if (!Number.isNaN(derived)) {
+          epochValue = derived;
+          timestampValue = norm ? norm.replace('T', ' ') : entry.timestamp;
+        }
+      }
+    }
+    if (epochValue == null || Number.isNaN(epochValue)) {
+      epochValue = now.epoch;
+      timestampValue = timestampValue || now.iso;
+    }
+
     const logData = {
       type: entry.type,
       roll_id: rollId,
@@ -4246,8 +4340,8 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       is_trimmable: entry.isTrimmable || false,
       weight: entry.weight || 'N/A',
       notes: entry.notes || null,
-      timestamp: entry.timestamp || now.iso,
-      epoch: entry.epoch || now.epoch,
+      timestamp: timestampValue,
+      epoch: epochValue,
       timezone: 'Asia/Beirut',
       salesperson_id: entry.salesperson_id || null,
       conducted_by_user_id: req.user ? req.user.user_id : null
@@ -4470,7 +4564,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       if (normalized) {
         // MySQL DATETIME expects "YYYY-MM-DD HH:MM:SS", not "YYYY-MM-DDT00:00:00"
         updateData.timestamp = normalized.replace('T', ' ');
-        if (updates.epoch === undefined) updateData.epoch = new Date(normalized).getTime();
+        // Epoch is never recalculated from timestamp; it changes only when explicitly provided by the client.
       } else {
         updateData.timestamp = updates.timestamp;
       }
@@ -4766,7 +4860,8 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
 
     // Step 5: Decrease permit number counter if we deleted the last transaction group
     if (shouldDeleteGroup && permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
-      const permitNum = parseInt(permitNumber.substring(2));
+      // Parse numeric part as integer for SQL comparison (no string/integer mixing)
+      const permitNum = parseInt(permitNumber.substring(2), 10);
       
       // Find the highest permit number for this transaction type that is less than the canceled one
       const [result] = await connection.query(
@@ -4778,8 +4873,8 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
          AND CAST(SUBSTRING(permit_number, 3) AS UNSIGNED) < ?`,
         [transactionType, `^${transactionType}-[0-9]+$`, permitNum]
       );
-      
-      const maxNum = result[0]?.max_num || 0;
+      // Parse to integer (MySQL may return numeric as string)
+      const maxNum = parseInt(result[0]?.max_num, 10) || 0;
       console.log(`Canceled log ${logId} from transaction group ${transactionGroupId} with permit ${permitNumber}. Next permit will be ${transactionType}-${maxNum + 1}`);
     }
 
@@ -4967,7 +5062,8 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
 
     // Step 6: Decrease permit number counter if permit number matches pattern
     if (permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
-      const permitNum = parseInt(permitNumber.substring(2));
+      // Parse numeric part as integer for SQL comparison (no string/integer mixing)
+      const permitNum = parseInt(permitNumber.substring(2), 10);
       
       // Find the highest permit number for this transaction type that is less than the canceled one
       const [result] = await connection.query(
@@ -4979,8 +5075,8 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
          AND CAST(SUBSTRING(permit_number, 3) AS UNSIGNED) < ?`,
         [transactionType, `^${transactionType}-[0-9]+$`, permitNum]
       );
-      
-      const maxNum = result[0]?.max_num || 0;
+      // Parse to integer (MySQL may return numeric as string)
+      const maxNum = parseInt(result[0]?.max_num, 10) || 0;
       
       // If there are no permit numbers below this one, we don't need to do anything
       // The counter will naturally continue from the next highest number
