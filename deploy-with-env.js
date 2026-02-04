@@ -38,9 +38,8 @@ async function main() {
 
   try {
     await copyRecursive(backendDir, tempDir);
-    console.log('Running npm install --production...');
-    execSync('npm install --production', { cwd: tempDir, stdio: 'inherit', shell: true });
-    console.log('Running eb deploy...');
+    // Do not run npm install here — EB runs it on the instance so native deps (e.g. no bcrypt) match Linux.
+    console.log('Running eb deploy (EB will run npm install on the instance)...');
     execSync('eb deploy', { cwd: tempDir, stdio: 'inherit', shell: true });
   } finally {
     await rm(tempDir, { recursive: true, force: true });

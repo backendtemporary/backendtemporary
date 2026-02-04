@@ -1,7 +1,7 @@
 // Script to create a default admin account
 // Run with: node create-default-admin.js
 
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';
 import db from './db.js';
 
 const DEFAULT_ADMIN = {
