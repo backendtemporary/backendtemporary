@@ -879,7 +879,8 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
 // Helper to create or update transaction group
 // Called within a database transaction, expects a connection
 // Creation date rule: if client sends a user-selected date (transactionDate/timestamp), epoch must be provided or we derive it in Asia/Beirut; we never silently use "today".
-async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null) {
+// For returns: pass permitNumberOverride (string) to use user-provided permit number instead of auto-generation.
+async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null, permitNumberOverride = null) {
   if (!transactionGroupId) return;
   
   // Ensure customer exists in database before creating transaction group
@@ -921,32 +922,37 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
   );
   
   if (existing.length === 0) {
-    // Create new transaction group - auto-generate permit number
-    // Generate permit number based on transaction type (separate counters for A and B)
-    let permitNumber = await generatePermitNumber(connection, transactionType);
+    // Create new transaction group - use user-provided permit number for returns, otherwise auto-generate
+    const useOverride = permitNumberOverride && typeof permitNumberOverride === 'string' && permitNumberOverride.trim();
+    let permitNumber = useOverride ? permitNumberOverride.trim() : await generatePermitNumber(connection, transactionType);
 
-    // Retry logic in case of duplicate permit number (race condition)
-    let retries = 3;
     let inserted = false;
-    while (retries > 0 && !inserted) {
-      try {
-        await connection.query(
-          'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)',
-          [transactionGroupId, permitNumber, transactionType, finalCustomerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
-        );
-        inserted = true; // Success, exit retry loop
-      } catch (error) {
-        // If duplicate permit number error, regenerate and retry
-        if (error.code === 'ER_DUP_ENTRY' || error.message.includes('Duplicate entry')) {
-          retries--;
-          if (retries > 0) {
-            // Regenerate permit number and retry
-            permitNumber = await generatePermitNumber(connection, transactionType);
-            continue;
+    if (useOverride) {
+      await connection.query(
+        'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)',
+        [transactionGroupId, permitNumber, transactionType, finalCustomerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
+      );
+      inserted = true;
+    } else {
+      // Retry logic in case of duplicate permit number (race condition)
+      let retries = 3;
+      while (retries > 0 && !inserted) {
+        try {
+          await connection.query(
+            'INSERT INTO transaction_groups (transaction_group_id, permit_number, transaction_type, customer_id, customer_name, transaction_date, epoch, timezone, total_items, total_meters, total_yards, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)',
+            [transactionGroupId, permitNumber, transactionType, finalCustomerId || null, customerName || null, transactionDateValue, transactionEpoch, transactionTimezone, finalAmountMeters, finalAmountYards, notes || null]
+          );
+          inserted = true;
+        } catch (error) {
+          if (error.code === 'ER_DUP_ENTRY' || error.message.includes('Duplicate entry')) {
+            retries--;
+            if (retries > 0) {
+              permitNumber = await generatePermitNumber(connection, transactionType);
+              continue;
+            }
           }
+          throw error;
         }
-        // Re-throw if not a duplicate error or out of retries
-        throw error;
       }
     }
   } else {
@@ -3722,7 +3728,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       timestamp,
       epoch,
       transaction_group_id,
-      transaction_type = 'A'
+      transaction_type: txnTypeParam = null,
+      permit_number: permitNumberParam = null
     } = req.body;
     
     // Validation
@@ -3812,16 +3819,46 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const logReturnAmountYards = round2Ret(returnAmountYardsValue);
     const returnAmountMeters = round2Ret(amountMeters);
     
-    // Handle transaction group - returns are first-class transactions
-    // Use yards as primary unit. When user sends timestamp/date, epoch must be provided or we derive in Asia/Beirut (never UTC, never "today").
-    const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const transactionType = 'return'; // Returns are always type 'return'
+    // Permit number is required for returns (user-provided)
+    const permitNumber = permitNumberParam && typeof permitNumberParam === 'string' ? permitNumberParam.trim() : null;
+    if (!permitNumber) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'permit_number is required for returns' });
+    }
+
+    // Transaction type (A or B): from request, or from reference log's group
+    let transactionType = (txnTypeParam && typeof txnTypeParam === 'string' && ['A', 'B'].includes(txnTypeParam.trim().toUpperCase())) ? txnTypeParam.trim().toUpperCase() : null;
+    if (!transactionType && reference_log_id) {
+      const [srcGroupRows] = await connection.query(
+        'SELECT tg.transaction_type FROM logs l JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id WHERE l.log_id = ?',
+        [reference_log_id]
+      );
+      if (srcGroupRows.length > 0 && srcGroupRows[0].transaction_type) {
+        const t = String(srcGroupRows[0].transaction_type).trim().toUpperCase();
+        transactionType = (t === 'A' || t === 'B') ? t : 'A';
+      }
+    }
+    if (!transactionType) transactionType = 'A';
+
+    const returnNotes = 'Return';
+
+    // For returns, date is required (manual entry)
     const transactionDate = timestamp ? normalizeTimestampToDate(timestamp)?.split('T')[0] : null;
+    if (!transactionDate || !/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Valid transaction date (YYYY-MM-DD) is required for returns. Send timestamp or transaction_date.' });
+    }
     let transactionEpoch = epoch != null && epoch !== '' ? Number(epoch) : null;
-    if (transactionDate && (transactionEpoch == null || Number.isNaN(transactionEpoch))) {
+    if (transactionEpoch == null || Number.isNaN(transactionEpoch)) {
       const derived = dateStringToEpochBeirut(transactionDate);
       if (!Number.isNaN(derived)) transactionEpoch = derived;
     }
+    if (transactionEpoch == null || Number.isNaN(transactionEpoch)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'epoch is required for returns. Send epoch or a valid transaction_date.' });
+    }
+
+    const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const userId = req.user ? req.user.user_id : null;
     
     // Create or update transaction group for return
@@ -3830,29 +3867,18 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       transactionGroupId,
       customer_id,
       customer_name,
-      notes,
+      returnNotes,
       returnAmountMeters,
       transactionType,
       transactionEpoch,
       transactionDate,
-      logReturnAmountYards, // Pass yards as primary unit
-      userId // Pass user ID for customer creation
+      logReturnAmountYards,
+      userId,
+      permitNumber
     );
     
-    // Create log entry for return: use same date/epoch as transaction group (Asia/Beirut); never UTC or "today" when user sent date
-    const iso = timestamp ? normalizeTimestampToDate(timestamp) : null;
-    const now = (iso && transactionEpoch != null && !Number.isNaN(transactionEpoch))
-      ? { iso, epoch: transactionEpoch, tz: 'Asia/Beirut' }
-      : (iso ? { iso, epoch: dateStringToEpochBeirut(iso.split('T')[0]), tz: 'Asia/Beirut' } : getLebanonTimestamp());
-    if (iso && (now.epoch == null || Number.isNaN(now.epoch))) {
-      await connection.rollback();
-      return res.status(400).json({ error: 'Invalid date', message: 'Could not derive epoch for the provided timestamp in Asia/Beirut. Please send epoch with the date.' });
-    }
-    if (now.epoch == null || Number.isNaN(now.epoch)) {
-      const today = getLebanonTimestamp();
-      now.epoch = today.epoch;
-      now.iso = now.iso || today.iso;
-    }
+    // Create log entry for return: use validated transactionDate and transactionEpoch
+    const now = { iso: transactionDate + ' 00:00:00', epoch: transactionEpoch, tz: 'Asia/Beirut' };
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     const lotValue = color.lot || null;
@@ -3865,7 +3891,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
+      ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
     );
     
     await connection.commit();
@@ -3887,9 +3913,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
 app.post('/api/transactions/return/partial', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
-    const { customer_id, customer_name, transaction_date, epoch, items } = req.body || {};
+    const { customer_id, customer_name, transaction_date, epoch, permit_number, transaction_type, items } = req.body || {};
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'items array is required and must not be empty' });
+    }
+    const permitNumber = permit_number && typeof permit_number === 'string' ? permit_number.trim() : null;
+    if (!permitNumber) {
+      return res.status(400).json({ error: 'permit_number is required for returns' });
     }
     const customerId = customer_id != null ? parseInt(customer_id) : null;
     const customerName = customer_name || null;
@@ -3907,6 +3937,25 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
     const now = { iso: transactionDate + ' 00:00:00', epoch: transactionEpoch, tz: transactionTimezone };
 
     await connection.beginTransaction();
+
+    // Get transaction_type (A or B) from request or from first source log's group
+    let txnType = (transaction_type && typeof transaction_type === 'string' && ['A', 'B'].includes(transaction_type.trim().toUpperCase())) ? transaction_type.trim().toUpperCase() : null;
+    if (!txnType) {
+      const firstSourceLogId = items[0]?.source_log_id != null ? parseInt(items[0].source_log_id) : null;
+      if (firstSourceLogId) {
+        const [srcGroupRows] = await connection.query(
+          'SELECT tg.transaction_type FROM logs l JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id WHERE l.log_id = ?',
+          [firstSourceLogId]
+        );
+        if (srcGroupRows.length > 0 && srcGroupRows[0].transaction_type) {
+          const t = String(srcGroupRows[0].transaction_type).trim().toUpperCase();
+          txnType = (t === 'A' || t === 'B') ? t : 'A';
+        }
+      }
+    }
+    if (!txnType) txnType = 'A';
+
+    const returnNotes = 'Return';
 
     // Process items in deterministic order (by source_log_id) to avoid deadlocks
     const sortedItems = [...items].sort((a, b) => (a.source_log_id || 0) - (b.source_log_id || 0));
@@ -4034,13 +4083,14 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
         transactionGroupId,
         customerId,
         customerName,
-        null,
+        returnNotes,
         finalMeters,
-        'return',
+        txnType,
         transactionEpoch,
         transactionDate,
         finalYards,
-        userId
+        userId,
+        permitNumber
       );
 
       const salespersonId = src.salesperson_id || null;
@@ -4049,7 +4099,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
       const rollNbValue = color.roll_nb || src.roll_nb || null;
       await connection.query(
         'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, null, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
+        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
       );
     }
 
