@@ -461,6 +461,7 @@ const buildFabricColorAggregatedStructure = async () => {
     // Colors now have roll attributes directly (length_meters, length_yards, date, etc.)
     // Note: initial_length_meters and initial_length_yards may not exist in older schemas
     // Using SELECT * to handle missing columns gracefully (they'll be undefined if not present)
+    // IMPORTANT: do NOT filter by sold here - frontend needs both available and sold-out colors.
     const [colors] = await db.query(`
       SELECT c.*,
         u_created.username as created_by_username, u_created.full_name as created_by_full_name,
@@ -468,7 +469,6 @@ const buildFabricColorAggregatedStructure = async () => {
       FROM colors c
       LEFT JOIN users u_created ON c.created_by_user_id = u_created.user_id
       LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id
-      WHERE (c.sold = FALSE OR c.sold IS NULL OR c.sold = 0)
       ORDER BY c.fabric_id, c.color_id
     `);
     // Ensure colors is always an array (defensive check)
