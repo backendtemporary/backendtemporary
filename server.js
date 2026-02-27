@@ -107,7 +107,7 @@ const authMiddleware = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, JWT_SECRET);
-    
+
     // Verify user still exists and get current role
     const [users] = await db.query('SELECT user_id, username, email, role, full_name FROM users WHERE user_id = ?', [decoded.userId]);
     if (users.length === 0) {
@@ -228,26 +228,26 @@ const logUpdate = async (table_name, record_id, user, oldRecord, newRecord, req 
     'created_by_user_id',  // We track this separately
     'updated_by_user_id'   // We track this separately
   ]);
-  
+
   // Compare old and new records to find changes
   const changes = {};
   const allKeys = new Set([...Object.keys(oldRecord || {}), ...Object.keys(newRecord || {})]);
-  
+
   for (const key of allKeys) {
     // Skip excluded fields
     if (excludedFields.has(key)) {
       continue;
     }
-    
+
     const oldVal = oldRecord?.[key];
     const newVal = newRecord?.[key];
-    
+
     // Only log if value actually changed (and both aren't null/undefined)
     if (oldVal !== newVal) {
       // Convert dates to strings for consistent comparison
       const oldValStr = oldVal instanceof Date ? oldVal.toISOString() : oldVal;
       const newValStr = newVal instanceof Date ? newVal.toISOString() : newVal;
-      
+
       // Only log if they're actually different after string conversion
       if (String(oldValStr) !== String(newValStr)) {
         changes[key] = {
@@ -340,19 +340,19 @@ const buildFabricStructure = async () => {
     const rollsByColor = {};
     rolls.forEach(roll => {
       if (!rollsByColor[roll.color_id]) rollsByColor[roll.color_id] = [];
-      
+
       // Get the fabric for this roll
       const color = colors.find(c => c.color_id === roll.color_id);
       if (!color) return;
-      
+
       const fabric = fabrics.find(f => f.fabric_id === color.fabric_id);
       if (!fabric) return;
-      
+
       // Extract fabric number from fabric_code (e.g., "FAB-001" -> "001")
       const fabricNum = (fabric.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(fabric.fabric_id).padStart(3, '0');
       const colorNum = String(colorIndexMap[roll.color_id]).padStart(3, '0');
       const rollNum = String(rollsByColor[roll.color_id].length + 1).padStart(3, '0');
-      
+
       // Format date to YYYY-MM-DD (remove time component if present)
       let formattedDate = null;
       if (roll.date) {
@@ -383,7 +383,7 @@ const buildFabricStructure = async () => {
         console.warn('buildFabricStructure: Date missing for roll_id:', roll.roll_id, 'using today as fallback')
         formattedDate = new Date().toISOString().split('T')[0];
       }
-      
+
       // FIX DISPLAY ISSUE: Include lot and roll_nb in the roll object
       rollsByColor[roll.color_id].push({
         roll_id: roll.roll_id,
@@ -409,7 +409,7 @@ const buildFabricStructure = async () => {
     Object.keys(colorsByFabric).forEach(fabricId => {
       const fabric = fabrics.find(f => f.fabric_id === parseInt(fabricId));
       const fabricNum = (fabric.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(fabricId).padStart(3, '0');
-      
+
       finalColorsByFabric[fabricId] = colorsByFabric[fabricId].map((color, idx) => {
         const colorNum = String(idx + 1).padStart(3, '0');
         return {
@@ -457,7 +457,7 @@ const buildFabricColorAggregatedStructure = async () => {
     `);
     // Ensure fabrics is always an array (defensive check)
     const safeFabrics = Array.isArray(fabrics) ? fabrics : [];
-    
+
     // Colors now have roll attributes directly (length_meters, length_yards, date, etc.)
     // Note: initial_length_meters and initial_length_yards may not exist in older schemas
     // Using SELECT * to handle missing columns gracefully (they'll be undefined if not present)
@@ -473,7 +473,7 @@ const buildFabricColorAggregatedStructure = async () => {
     `);
     // Ensure colors is always an array (defensive check)
     const safeColors = Array.isArray(colors) ? colors : [];
-    
+
     // Fetch all lots for all colors
     const [lots] = await db.query(`
       SELECT * FROM color_lots 
@@ -481,7 +481,7 @@ const buildFabricColorAggregatedStructure = async () => {
     `);
     // Ensure lots is always an array (defensive check)
     const safeLots = Array.isArray(lots) ? lots : [];
-    
+
     // Group lots by color_id
     const lotsByColor = {};
     safeLots.forEach(lot => {
@@ -503,20 +503,20 @@ const buildFabricColorAggregatedStructure = async () => {
         updated_at: lot.updated_at
       });
     });
-    
+
     // Build colors with roll attributes directly
     const colorsByFabric = {};
     safeColors.forEach(color => {
       if (!colorsByFabric[color.fabric_id]) {
         colorsByFabric[color.fabric_id] = [];
       }
-      
+
       // Extract fabric number from fabric_code (e.g., "FAB-001" -> "001")
       const fabric = safeFabrics.find(f => f.fabric_id === color.fabric_id);
       const fabricNum = (fabric?.fabric_code || '').match(/FAB-(\d+)/)?.[1] || String(color.fabric_id).padStart(3, '0');
       const colorIndex = colorsByFabric[color.fabric_id].length + 1;
       const colorNum = String(colorIndex).padStart(3, '0');
-      
+
       colorsByFabric[color.fabric_id].push({
         color_id: color.color_id,
         fabric_id: color.fabric_id,
@@ -546,7 +546,7 @@ const buildFabricColorAggregatedStructure = async () => {
         lots: lotsByColor[color.color_id] || []
       });
     });
-    
+
     // Build final structure
     return safeFabrics.map(fabric => ({
       fabric_id: fabric.fabric_id,
@@ -797,11 +797,11 @@ async function generatePermitNumber(connection, transactionType) {
     if (!['A', 'B', 'return'].includes(transactionType)) {
       transactionType = 'A'; // Default to A if invalid
     }
-    
+
     // Map transaction type to permit prefix
     // 'return' -> 'R', 'A' -> 'A', 'B' -> 'B'
     const prefix = transactionType === 'return' ? 'R' : transactionType;
-    
+
     // Get last permit number for this transaction type
     // Extract numeric part from permit_number (e.g., "A-123" -> 123, "R-1" -> 1)
     // Only consider permit numbers that match the pattern: {prefix}-{number}
@@ -813,13 +813,13 @@ async function generatePermitNumber(connection, transactionType) {
        AND permit_number REGEXP ?`,
       [transactionType, `^${prefix}-[0-9]+$`]
     );
-    
+
     // Ensure result is always an array (defensive check)
     const safeResult = Array.isArray(result) ? result : [];
     // Parse to integer so arithmetic is numeric (MySQL may return numeric columns as strings)
     const lastNum = parseInt(safeResult[0]?.last_num, 10) || 0;
     const nextNum = lastNum + 1;
-    
+
     return `${prefix}-${nextNum}`;
   } catch (error) {
     console.error('Error generating permit number:', error);
@@ -845,7 +845,7 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
     // Customer ID provided but doesn't exist - this is a data integrity issue
     console.warn(`Customer ID ${customerId} provided but not found in database`);
   }
-  
+
   // If customer_name is provided but no valid customer_id, create the customer
   if (customerName && customerName.trim()) {
     // Check if customer with this name already exists
@@ -853,17 +853,17 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
       'SELECT customer_id FROM customers WHERE customer_name = ?',
       [customerName.trim()]
     );
-    
+
     if (existingByName.length > 0) {
       return existingByName[0].customer_id; // Return existing customer ID
     }
-    
+
     // Create new customer
     const [result] = await connection.query(
       'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
       [customerName.trim(), null, null, null, userId]
     );
-    
+
     // Log audit entry for customer creation
     const [newCustomer] = await connection.query('SELECT * FROM customers WHERE customer_id = ?', [result.insertId]);
     if (newCustomer.length > 0) {
@@ -872,7 +872,7 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
       return result.insertId;
     }
   }
-  
+
   return null; // No customer to create/return
 }
 
@@ -882,10 +882,10 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
 // For returns: pass permitNumberOverride (string) to use user-provided permit number instead of auto-generation.
 async function createOrUpdateTransactionGroup(connection, transactionGroupId, customerId, customerName, notes, amountMeters, transactionType = 'A', epoch = null, transactionDate = null, amountYards = null, userId = null, permitNumberOverride = null) {
   if (!transactionGroupId) return;
-  
+
   // Ensure customer exists in database before creating transaction group
   const finalCustomerId = await ensureCustomerExists(connection, customerId, customerName, userId);
-  
+
   let transactionEpoch;
   let transactionDateValue;
   const transactionTimezone = 'Asia/Beirut';
@@ -909,18 +909,18 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
     transactionEpoch = now.epoch;
     transactionDateValue = now.iso.replace('T', ' ');
   }
-  
+
   // Round to 2 decimals - yards is primary, meters is secondary
   const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
   const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
   const finalAmountMeters = round2(amountMeters);
-  
+
   // Check if transaction group already exists
   const [existing] = await connection.query(
     'SELECT transaction_group_id, total_items, total_meters, total_yards, notes, permit_number, transaction_type, epoch FROM transaction_groups WHERE transaction_group_id = ?',
     [transactionGroupId]
   );
-  
+
   if (existing.length === 0) {
     // Create new transaction group - use user-provided permit number for returns, otherwise auto-generate
     const useOverride = permitNumberOverride && typeof permitNumberOverride === 'string' && permitNumberOverride.trim();
@@ -962,7 +962,7 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
     const currentTotalYards = parseFloat(current.total_yards) || (parseFloat(current.total_meters) * 1.0936);
     const newTotalYards = round2(currentTotalYards + finalAmountYards);
     const newTotalMeters = round2(parseFloat(current.total_meters) + finalAmountMeters);
-    
+
     // Preserve existing notes if new notes are null/empty, otherwise use new notes
     const finalNotes = (notes && notes.trim()) ? notes : (current.notes || null);
     await connection.query(
@@ -991,11 +991,11 @@ const mapCustomer = (row) => ({
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, email, password } = req.body;
-    
+
     if (!password) {
       return res.status(400).json({ error: 'Password is required' });
     }
-    
+
     const identifier = username || email;
     if (!identifier) {
       return res.status(400).json({ error: 'Username or email is required' });
@@ -1039,23 +1039,23 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Error during login:', error);
-    
+
     // Check for database connection errors
     if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT') {
-      return res.status(503).json({ 
+      return res.status(503).json({
         error: 'Database connection failed',
         message: 'Unable to connect to database. Please check database configuration.'
       });
     }
-    
+
     // Check for authentication errors (wrong password, etc.)
     if (error.message && error.message.includes('password')) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    
+
     // Generic error - include message in development for debugging
     const isDevelopment = process.env.NODE_ENV !== 'production';
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to login',
       ...(isDevelopment && { detail: error.message, stack: error.stack })
     });
@@ -1262,10 +1262,10 @@ app.delete('/api/users/:id', authMiddleware, requireRole('admin'), async (req, r
     const oldUserRecord = oldUserRows[0];
 
     await db.query('DELETE FROM users WHERE user_id = ?', [userId]);
-    
+
     // Log audit entry
     await logDelete('users', userId, req.user, oldUserRecord, req, `Deleted user: ${oldUserRecord.username}`);
-    
+
     res.json({ success: true, message: 'User deleted' });
   } catch (error) {
     console.error('Error deleting user:', error);
@@ -1317,11 +1317,11 @@ app.get('/api/deletion-requests', authMiddleware, async (req, res) => {
         AND TABLE_NAME = 'deletion_requests'
         AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id')
       `);
-      
+
       if (columns.length > 0) {
         // Determine which column name to use (prefer reviewed_by_user_id, fallback to approved_by_user_id)
-        reviewerColumn = columns.find(c => c.COLUMN_NAME === 'reviewed_by_user_id') 
-          ? 'reviewed_by_user_id' 
+        reviewerColumn = columns.find(c => c.COLUMN_NAME === 'reviewed_by_user_id')
+          ? 'reviewed_by_user_id'
           : 'approved_by_user_id';
       }
     } catch (schemaError) {
@@ -1386,7 +1386,7 @@ app.put('/api/deletion-requests/:id/approve', authMiddleware, requireRole('admin
       AND TABLE_NAME = 'deletion_requests'
       AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id', 'reviewed_at', 'approved_at')
     `);
-    
+
     const hasReviewedBy = columns.some(c => c.COLUMN_NAME === 'reviewed_by_user_id');
     const hasReviewedAt = columns.some(c => c.COLUMN_NAME === 'reviewed_at');
     const hasApprovedBy = columns.some(c => c.COLUMN_NAME === 'approved_by_user_id');
@@ -1431,7 +1431,7 @@ app.put('/api/deletion-requests/:id/reject', authMiddleware, requireRole('admin'
       AND TABLE_NAME = 'deletion_requests'
       AND COLUMN_NAME IN ('reviewed_by_user_id', 'approved_by_user_id', 'reviewed_at', 'approved_at')
     `);
-    
+
     const hasReviewedBy = columns.some(c => c.COLUMN_NAME === 'reviewed_by_user_id');
     const hasReviewedAt = columns.some(c => c.COLUMN_NAME === 'reviewed_at');
     const hasApprovedBy = columns.some(c => c.COLUMN_NAME === 'approved_by_user_id');
@@ -1626,10 +1626,10 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON c.updated_by_user_id = u_updated.user_id
       WHERE c.customer_id = ?
     `, [result.insertId]);
-    
+
     // Log audit entry
     await logInsert('customers', result.insertId, req.user, rows[0], req, `Created customer: ${name.trim()}`);
-    
+
     res.status(201).json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error creating customer:', error.message, error.code);
@@ -1663,10 +1663,10 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
 
     const [rows] = await db.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Customer not found' });
-    
+
     // Log audit entry
     await logUpdate('customers', parseInt(req.params.id), req.user, oldCustomerRecord, rows[0], req, `Updated customer: ${rows[0].customer_name || oldCustomerRecord.customer_name}`);
-    
+
     res.json(mapCustomer(rows[0]));
   } catch (error) {
     console.error('Error updating customer:', error.message, error.code);
@@ -1689,7 +1689,7 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
-    
+
     // Check if customer has associated logs/transaction groups
     // Get customer record before deletion
     const [customerRows] = await connection.query('SELECT * FROM customers WHERE customer_id = ?', [req.params.id]);
@@ -1702,18 +1702,18 @@ app.delete('/api/customers/:id', authMiddleware, async (req, res) => {
     const [logs] = await connection.query('SELECT COUNT(*) as count FROM logs WHERE customer_id = ?', [req.params.id]);
     const [groups] = await connection.query('SELECT COUNT(*) as count FROM transaction_groups WHERE customer_id = ?', [req.params.id]);
     const transactionCount = (logs[0]?.count || 0) + (groups[0]?.count || 0);
-    
+
     // Delete customer - this will set customer_id to NULL in logs due to ON DELETE SET NULL constraint
     const [result] = await connection.query('DELETE FROM customers WHERE customer_id = ?', [req.params.id]);
-    
+
     // Log audit entry
     await logDelete('customers', parseInt(req.params.id), req.user, customerRecord, req, `Deleted customer: ${customerRecord.customer_name} (had ${transactionCount} transactions)`);
 
     await connection.commit();
-    
-    res.json({ 
+
+    res.json({
       success: true,
-      message: transactionCount > 0 
+      message: transactionCount > 0
         ? `Customer deleted. ${transactionCount} transaction(s) have been updated to remove customer association.`
         : 'Customer deleted successfully.'
     });
@@ -1747,7 +1747,7 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const [rows] = await db.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
-    
+
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Fabric not found' });
     }
@@ -1755,7 +1755,7 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
     // Build aggregated structure for this fabric
     const fabrics = await buildFabricColorAggregatedStructure();
     const fabric = fabrics.find(f => f.fabric_id === fabricId);
-    
+
     res.json(fabric);
   } catch (error) {
     console.error('Error fetching fabric:', error);
@@ -1767,7 +1767,7 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
 app.post('/api/fabrics', authMiddleware, async (req, res) => {
   try {
     const { fabric_name, fabric_code, main_code, source, design } = req.body;
-    
+
     // Validation
     if (!fabric_name || !fabric_name.trim()) {
       return res.status(400).json({ error: 'Fabric name is required' });
@@ -1796,7 +1796,7 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
     // Return aggregated structure for created fabric
     const fabrics = await buildFabricColorAggregatedStructure();
     const created = fabrics.find(f => f.fabric_id === result.insertId);
-    
+
     res.status(201).json(created);
   } catch (error) {
     console.error('Error creating fabric:', error);
@@ -1848,7 +1848,7 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
     updates.updated_by_user_id = userId;
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updates), fabricId];
-    
+
     await db.query(`UPDATE fabrics SET ${fields} WHERE fabric_id = ?`, values);
 
     // Get updated record for audit
@@ -1858,7 +1858,7 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
     // Return aggregated structure after update
     const fabrics = await buildFabricColorAggregatedStructure();
     const updated = fabrics.find(f => f.fabric_id === fabricId);
-    
+
     res.json(updated);
   } catch (error) {
     console.error('Error updating fabric:', error);
@@ -1871,7 +1871,7 @@ app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), asyn
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
-    
+
     await connection.beginTransaction();
 
     // Check if fabric exists
@@ -1884,7 +1884,7 @@ app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), asyn
     // Get fabric record before deletion
     const [fabricRows] = await connection.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
     const fabricRecord = fabricRows[0];
-    
+
     // IMPORTANT: Do NOT delete logs - they are append-only audit records
     // Logs will have fabric_id set to NULL via ON DELETE SET NULL constraint
     // Cascade delete: colors -> fabric (logs preserved, rolls table removed)
@@ -1910,7 +1910,7 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    
+
     await connection.beginTransaction();
 
     // Check if color exists and get record before deletion
@@ -1980,7 +1980,7 @@ app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async 
 app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     console.warn('PUT /api/fabrics: Bulk save endpoint is deprecated. Use granular endpoints instead.');
-    
+
     let fabricsArray = req.body;
 
     // Accept single-object payloads by wrapping into an array
@@ -2002,7 +2002,7 @@ app.put('/api/fabrics', authMiddleware, requireRole('admin'), async (req, res) =
     }
 
     await saveFabricStructure(fabricsArray);
-    
+
     // Return aggregated structure
     const updated = await buildFabricColorAggregatedStructure();
     res.json(updated);
@@ -2022,13 +2022,13 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const fabricId = parseInt(req.params.fabric_id);
-    const { 
-      color_name, 
-      length_meters, 
-      length_yards, 
-      date, 
-      weight, 
-      lot, 
+    const {
+      color_name,
+      length_meters,
+      length_yards,
+      date,
+      weight,
+      lot,
       roll_nb,
       roll_count,
       lots  // Array of lots: [{ lot_number, length_meters, length_yards, date, weight, roll_nb }]
@@ -2051,7 +2051,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     const lenM = parseFloat(length_meters) || 0;
     const lenY = parseFloat(length_yards) || 0;
     const rollDate = date ? String(date).trim() : new Date().toISOString().split('T')[0];
-    
+
     // Check for duplicate color name with same date (enforced by unique constraint)
     // Note: NULL dates are treated as distinct by MySQL, so multiple NULL dates are allowed
     const [existing] = await connection.query(
@@ -2071,13 +2071,13 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       let sumMeters = 0;
       let sumYards = 0;
       const lotNumbers = new Set();
-      
+
       for (const lotItem of lots) {
         if (!lotItem.lot_number || !lotItem.lot_number.trim()) {
           await connection.rollback();
           return res.status(400).json({ error: 'Each lot must have a lot_number' });
         }
-        
+
         // Check for duplicate lot numbers
         const lotNum = lotItem.lot_number.trim();
         if (lotNumbers.has(lotNum)) {
@@ -2085,25 +2085,25 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
           return res.status(400).json({ error: `Duplicate lot number: ${lotNum}` });
         }
         lotNumbers.add(lotNum);
-        
+
         const lotM = parseFloat(lotItem.length_meters) || 0;
         const lotY = parseFloat(lotItem.length_yards) || 0;
-        
+
         if (lotM < 0 || lotY < 0) {
           await connection.rollback();
           return res.status(400).json({ error: 'Lot lengths must be non-negative' });
         }
-        
+
         sumMeters += lotM;
         sumYards += lotY;
       }
-      
+
       // Validate that sum equals total (allow small floating point differences)
       const tolerance = 0.01;
       if (Math.abs(sumMeters - lenM) > tolerance || Math.abs(sumYards - lenY) > tolerance) {
         await connection.rollback();
-        return res.status(400).json({ 
-          error: `Sum of lot lengths (${sumMeters}m, ${sumYards}yd) must equal total length (${lenM}m, ${lenY}yd)` 
+        return res.status(400).json({
+          error: `Sum of lot lengths (${sumMeters}m, ${sumYards}yd) must equal total length (${lenM}m, ${lenY}yd)`
         });
       }
     }
@@ -2117,15 +2117,15 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     const [result] = await connection.query(
       'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, status, sold, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
-        fabricId, 
-        color_name.trim(), 
-        lenM, 
+        fabricId,
+        color_name.trim(),
+        lenM,
         lenY,
         initialLenM,
         initialLenY,
-        rollDate, 
-        weight || 'N/A', 
-        lotValue, 
+        rollDate,
+        weight || 'N/A',
+        lotValue,
         rollNbValue,
         rollCountValue,
         'available',
@@ -2146,15 +2146,15 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         const lotM = parseFloat(lotItem.length_meters) || 0;
         const lotY = parseFloat(lotItem.length_yards) || 0;
         const lotDate = lotItem.date ? String(lotItem.date).trim() : rollDate;
-        const lotWeight = (lotItem.weight && typeof lotItem.weight === 'string' && lotItem.weight.trim() !== '') 
+        const lotWeight = (lotItem.weight && typeof lotItem.weight === 'string' && lotItem.weight.trim() !== '')
           ? lotItem.weight.trim() : null;
-        const lotRollNb = (lotItem.roll_nb && typeof lotItem.roll_nb === 'string' && lotItem.roll_nb.trim() !== '') 
+        const lotRollNb = (lotItem.roll_nb && typeof lotItem.roll_nb === 'string' && lotItem.roll_nb.trim() !== '')
           ? lotItem.roll_nb.trim() : null;
-        
+
         // Set initial length when creating lot (first non-zero length)
         const initialLotM = (lotM > 0) ? lotM : null;
         const initialLotY = (lotY > 0) ? lotY : null;
-        
+
         const userId = req.user ? req.user.user_id : null;
         await connection.query(
           'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -2187,7 +2187,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    const { 
+    const {
       color_name,
       length_meters,
       length_yards,
@@ -2234,7 +2234,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         [colorId]
       );
       const currentDate = currentColor[0]?.date || null;
-      
+
       // Check for duplicate color name with same date (excluding current color)
       // If date is being updated, check against new date; otherwise check against current date
       const checkDate = date !== undefined ? (date ? String(date).trim() : null) : currentDate;
@@ -2504,7 +2504,7 @@ async function addMetersToColorHandler(req, res) {
     // Get updated record for audit
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
-    
+
     // Log audit entry for length addition (include fabric/color for clarity)
     const addMetersCtx = await getColorFabricNames(colorId, connection);
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m to color | Fabric: ${addMetersCtx.fabric_name}, Color: ${addMetersCtx.color_name}`);
@@ -2541,18 +2541,18 @@ app.post('/api/colors/:color_id/rolls', authMiddleware, addMetersToColorHandler)
 app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
   try {
     const colorId = parseInt(req.params.color_id);
-    
+
     // Verify color exists
     const [colors] = await db.query('SELECT color_id FROM colors WHERE color_id = ?', [colorId]);
     if (colors.length === 0) {
       return res.status(404).json({ error: 'Color not found' });
     }
-    
+
     const [lots] = await db.query(
       'SELECT * FROM color_lots WHERE color_id = ? ORDER BY lot_id',
       [colorId]
     );
-    
+
     const formattedLots = lots.map(lot => ({
       lot_id: lot.lot_id,
       color_id: lot.color_id,
@@ -2567,7 +2567,7 @@ app.get('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
       created_at: lot.created_at,
       updated_at: lot.updated_at
     }));
-    
+
     res.json(formattedLots);
   } catch (error) {
     console.error('Error fetching lots:', error);
@@ -2581,20 +2581,20 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
   try {
     const colorId = parseInt(req.params.color_id);
     const { lot_number, length_meters, length_yards, date, weight, roll_nb } = req.body;
-    
+
     if (!lot_number || !lot_number.trim()) {
       return res.status(400).json({ error: 'Lot number is required' });
     }
-    
+
     const lotM = parseFloat(length_meters) || 0;
     const lotY = parseFloat(length_yards) || 0;
-    
+
     if (lotM < 0 || lotY < 0) {
       return res.status(400).json({ error: 'Lot lengths must be non-negative' });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // Verify color exists and get total length
     const [colors] = await connection.query(
       'SELECT color_id, fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? FOR UPDATE',
@@ -2604,11 +2604,11 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ error: 'Color not found' });
     }
-    
+
     const fabricId = colors[0].fabric_id;
     const totalMeters = parseFloat(colors[0].length_meters) || 0;
     const totalYards = parseFloat(colors[0].length_yards) || 0;
-    
+
     // Check for duplicate lot number
     const [existing] = await connection.query(
       'SELECT lot_id FROM color_lots WHERE color_id = ? AND lot_number = ?',
@@ -2618,7 +2618,7 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
       await connection.rollback();
       return res.status(409).json({ error: 'Lot number already exists for this color' });
     }
-    
+
     // Get current sum of lot lengths
     const [currentLots] = await connection.query(
       'SELECT SUM(length_meters) as sum_meters, SUM(length_yards) as sum_yards FROM color_lots WHERE color_id = ?',
@@ -2626,47 +2626,47 @@ app.post('/api/colors/:color_id/lots', authMiddleware, async (req, res) => {
     );
     const currentSumM = parseFloat(currentLots[0]?.sum_meters) || 0;
     const currentSumY = parseFloat(currentLots[0]?.sum_yards) || 0;
-    
+
     // Validate that adding this lot doesn't exceed total
     const newSumM = currentSumM + lotM;
     const newSumY = currentSumY + lotY;
     const tolerance = 0.01;
-    
+
     if (newSumM > totalMeters + tolerance || newSumY > totalYards + tolerance) {
       await connection.rollback();
-      return res.status(400).json({ 
-        error: `Adding this lot would exceed total length. Current sum: ${currentSumM}m/${currentSumY}yd, Adding: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd` 
+      return res.status(400).json({
+        error: `Adding this lot would exceed total length. Current sum: ${currentSumM}m/${currentSumY}yd, Adding: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd`
       });
     }
-    
+
     // Insert lot
     const lotDate = date ? String(date).trim() : new Date().toISOString().split('T')[0];
     const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
     const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
-    
+
     // Set initial length when creating lot (first non-zero length)
     const initialLotM = (lotM > 0) ? lotM : null;
     const initialLotY = (lotY > 0) ? lotY : null;
-    
+
     const userId = req.user ? req.user.user_id : null;
     const [result] = await connection.query(
       'INSERT INTO color_lots (color_id, lot_number, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, roll_nb, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [colorId, lot_number.trim(), lotM, lotY, initialLotM, initialLotY, lotDate, lotWeight, lotRollNb, userId]
     );
-    
+
     // Get created lot for audit
     const [newLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [result.insertId]);
     await logInsert('color_lots', result.insertId, req.user, newLotRows[0], req, `Created lot: ${lot_number.trim()} (${lotY}yd/${lotM}m)`);
-    
+
     await connection.commit();
-    
+
     // Return updated fabric structure
     const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after adding lot' });
     }
-    
+
     res.status(201).json(updatedFabric);
   } catch (error) {
     await connection.rollback();
@@ -2684,20 +2684,20 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
     const colorId = parseInt(req.params.color_id);
     const lotId = parseInt(req.params.lot_id);
     const { lot_number, length_meters, length_yards, date, weight, roll_nb } = req.body;
-    
+
     if (!lot_number || !lot_number.trim()) {
       return res.status(400).json({ error: 'Lot number is required' });
     }
-    
+
     const lotM = parseFloat(length_meters) || 0;
     const lotY = parseFloat(length_yards) || 0;
-    
+
     if (lotM < 0 || lotY < 0) {
       return res.status(400).json({ error: 'Lot lengths must be non-negative' });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // Verify lot exists and belongs to color
     const [lots] = await connection.query(
       'SELECT lot_id, color_id FROM color_lots WHERE lot_id = ? AND color_id = ?',
@@ -2707,7 +2707,7 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
       await connection.rollback();
       return res.status(404).json({ error: 'Lot not found' });
     }
-    
+
     // Get color total length
     const [colors] = await connection.query(
       'SELECT fabric_id, length_meters, length_yards FROM colors WHERE color_id = ? FOR UPDATE',
@@ -2716,7 +2716,7 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
     const fabricId = colors[0].fabric_id;
     const totalMeters = parseFloat(colors[0].length_meters) || 0;
     const totalYards = parseFloat(colors[0].length_yards) || 0;
-    
+
     // Check for duplicate lot number (excluding current lot)
     const [existing] = await connection.query(
       'SELECT lot_id FROM color_lots WHERE color_id = ? AND lot_number = ? AND lot_id != ?',
@@ -2726,7 +2726,7 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
       await connection.rollback();
       return res.status(409).json({ error: 'Lot number already exists for this color' });
     }
-    
+
     // Get old record for audit
     const [oldLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [lotId]);
     if (oldLotRows.length === 0) {
@@ -2736,7 +2736,7 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
     const oldLotRecord = oldLotRows[0];
     const oldLotM = parseFloat(oldLotRecord.length_meters) || 0;
     const oldLotY = parseFloat(oldLotRecord.length_yards) || 0;
-    
+
     // Get current sum of all other lots (excluding this one)
     const [otherLots] = await connection.query(
       'SELECT SUM(length_meters) as sum_meters, SUM(length_yards) as sum_yards FROM color_lots WHERE color_id = ? AND lot_id != ?',
@@ -2744,44 +2744,44 @@ app.put('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res) =
     );
     const otherSumM = parseFloat(otherLots[0]?.sum_meters) || 0;
     const otherSumY = parseFloat(otherLots[0]?.sum_yards) || 0;
-    
+
     // Validate that new sum doesn't exceed total
     const newSumM = otherSumM + lotM;
     const newSumY = otherSumY + lotY;
     const tolerance = 0.01;
-    
+
     if (newSumM > totalMeters + tolerance || newSumY > totalYards + tolerance) {
       await connection.rollback();
-      return res.status(400).json({ 
-        error: `Updating this lot would exceed total length. Other lots sum: ${otherSumM}m/${otherSumY}yd, New lot: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd` 
+      return res.status(400).json({
+        error: `Updating this lot would exceed total length. Other lots sum: ${otherSumM}m/${otherSumY}yd, New lot: ${lotM}m/${lotY}yd, Total: ${totalMeters}m/${totalYards}yd`
       });
     }
-    
+
     // Update lot
     const lotDate = date ? String(date).trim() : null;
     const lotWeight = (weight && typeof weight === 'string' && weight.trim() !== '') ? weight.trim() : null;
     const lotRollNb = (roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : null;
-    
+
     const userId = req.user ? req.user.user_id : null;
     await connection.query(
       'UPDATE color_lots SET lot_number = ?, length_meters = ?, length_yards = ?, date = ?, weight = ?, roll_nb = ?, updated_by_user_id = ? WHERE lot_id = ?',
       [lot_number.trim(), lotM, lotY, lotDate, lotWeight, lotRollNb, userId, lotId]
     );
-    
+
     // Get updated record for audit (include fabric/color for clarity)
     const [newLotRows] = await connection.query('SELECT * FROM color_lots WHERE lot_id = ?', [lotId]);
     const lotCtx = await getColorFabricNames(colorId, connection);
     await logUpdate('color_lots', lotId, req.user, oldLotRecord, newLotRows[0], req, `Updated lot: ${lot_number.trim()} | Fabric: ${lotCtx.fabric_name}, Color: ${lotCtx.color_name}`);
-    
+
     await connection.commit();
-    
+
     // Return updated fabric structure
     const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after updating lot' });
     }
-    
+
     res.json(updatedFabric);
   } catch (error) {
     await connection.rollback();
@@ -2798,9 +2798,9 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
   try {
     const colorId = parseInt(req.params.color_id);
     const lotId = parseInt(req.params.lot_id);
-    
+
     await connection.beginTransaction();
-    
+
     // Verify lot exists and get record before deletion
     const [lots] = await connection.query(
       'SELECT * FROM color_lots WHERE lot_id = ? AND color_id = ?',
@@ -2811,29 +2811,29 @@ app.delete('/api/colors/:color_id/lots/:lot_id', authMiddleware, async (req, res
       return res.status(404).json({ error: 'Lot not found' });
     }
     const lotRecord = lots[0];
-    
+
     const [colors] = await connection.query(
       'SELECT fabric_id FROM colors WHERE color_id = ?',
       [colorId]
     );
     const fabricId = colors[0].fabric_id;
-    
+
     // Delete lot
     await connection.query('DELETE FROM color_lots WHERE lot_id = ?', [lotId]);
-    
+
     // Log audit entry (include fabric/color for clarity)
     const delLotCtx = await getColorFabricNames(colorId, connection);
     await logDelete('color_lots', lotId, req.user, lotRecord, req, `Deleted lot: ${lotRecord.lot_number} | Fabric: ${delLotCtx.fabric_name}, Color: ${delLotCtx.color_name}`);
-    
+
     await connection.commit();
-    
+
     // Return updated fabric structure
     const fabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = fabrics.find(f => f.fabric_id === fabricId);
     if (!updatedFabric) {
       return res.status(404).json({ error: 'Fabric not found after deleting lot' });
     }
-    
+
     res.json(updatedFabric);
   } catch (error) {
     await connection.rollback();
@@ -3516,16 +3516,16 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const fabricId = parseInt(req.params.fabric_id);
     const colorId = parseInt(req.params.color_id);
     const { amount_meters, amount_yards, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes, lot_id } = req.body;
-    
+
     // Validation
     if (!fabricId || !colorId) {
       return res.status(400).json({ error: 'Invalid fabric_id or color_id' });
     }
-    
+
     // Calculate amount - prioritize yards as primary unit
     let amountMeters = 0;
     let amountYards = 0;
-    
+
     if (amount_yards !== undefined && amount_yards !== null && amount_yards > 0) {
       // Yards is primary - use it directly and convert to meters for storage
       amountYards = parseFloat(amount_yards);
@@ -3537,21 +3537,21 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     } else {
       return res.status(400).json({ error: 'Either amount_meters or amount_yards must be provided' });
     }
-    
+
     if (isNaN(amountMeters) || amountMeters <= 0 || isNaN(amountYards) || amountYards <= 0) {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // Get color with roll attributes (with lock for transaction)
     const color = await getColorForTransaction(connection, fabricId, colorId);
-    
+
     if (!color) {
       await connection.rollback();
       return res.status(404).json({ error: 'Color not found or already sold' });
     }
-    
+
     // Get fabric info (including design for log formatting)
     const [fabrics] = await connection.query('SELECT fabric_name, fabric_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabrics.length === 0) {
@@ -3559,7 +3559,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(404).json({ error: 'Fabric not found' });
     }
     const fabric = fabrics[0];
-    
+
     // Handle lot_id if provided
     let selectedLot = null;
     let lotNumber = null;
@@ -3574,16 +3574,16 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       }
       selectedLot = lots[0];
       lotNumber = selectedLot.lot_number;
-      
+
       // Check if lot has enough length - use yards as primary
       const lotYards = parseFloat(selectedLot.length_yards) || 0;
       if (lotYards < amountYards) {
         await connection.rollback();
-        return res.status(400).json({ 
-          error: `Insufficient lot inventory. Available: ${lotYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd` 
+        return res.status(400).json({
+          error: `Insufficient lot inventory. Available: ${lotYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd`
         });
       }
-      
+
       // Update lot length - subtract yards directly
       const newLotYards = lotYards - amountYards;
       const newLotMeters = newLotYards / 1.0936; // Convert to meters for storage
@@ -3592,36 +3592,42 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         [newLotMeters, newLotYards, lot_id]
       );
     }
-    
+
     // Check if we have enough length in color total - use yards as primary
     const currentYards = parseFloat(color.length_yards) || 0;
     if (currentYards < amountYards) {
       await connection.rollback();
-      return res.status(400).json({ 
-        error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd` 
+      return res.status(400).json({
+        error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd`
       });
     }
-    
+
     // Calculate new length - use yards as primary for calculation
     const newYards = currentYards - amountYards; // Subtract yards directly
     const newMeters = newYards / 1.0936; // Convert back to meters for storage
-    
+
     // Calculate new roll_count (decrease by roll_count from request, or default to 0 if not provided)
     // Ensure we're reading the current roll_count from the database, not from the color object which might be stale
     const [currentColorData] = await connection.query(
       'SELECT roll_count FROM colors WHERE color_id = ?',
       [colorId]
     );
-    const currentRollCount = currentColorData && currentColorData.length > 0 
-      ? (parseInt(currentColorData[0].roll_count) || 0) 
+    const currentRollCount = currentColorData && currentColorData.length > 0
+      ? (parseInt(currentColorData[0].roll_count) || 0)
       : (parseInt(color.roll_count) || 0);
     const sellRollCount = parseInt(roll_count) || 0;
+    if (sellRollCount > 0 && sellRollCount > currentRollCount) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: `Insufficient rolls. Available: ${currentRollCount}, Requested: ${sellRollCount}`
+      });
+    }
     const newRollCount = Math.max(0, currentRollCount - sellRollCount);
-    
+
     // Get old record for audit
     const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const oldColorRecord = oldColorRows[0];
-    
+
     // Update color (subtract yards directly, convert to meters for storage)
     await connection.query(
       'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
@@ -3631,24 +3637,24 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     // Get updated record for audit
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
-    
+
     // Log audit entry for sell operation
     const currentMeters = parseFloat(color.length_meters) || 0;
     const sellMeters = currentMeters - newMeters;
     const sellYards = currentYards - newYards;
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
-    
+
     // Round to 2 decimals - yards is primary, meters is secondary
     const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
     const finalAmountYards = round2(amountYards ?? (amountMeters * 1.0936));
     const finalAmountMeters = round2(amountMeters);
-    
+
     // Handle transaction group - use yards as primary unit
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const transactionType = req.body.transaction_type || 'A';
     const transactionDate = req.body.transaction_date || null;
     let transactionEpoch = req.body.epoch ?? null;
-    
+
     // When user sent a date without epoch, derive epoch in Asia/Beirut so we never silently use "today".
     if (transactionDate && (transactionEpoch == null || transactionEpoch === '')) {
       const dateStr = typeof transactionDate === 'string' ? transactionDate.trim() : '';
@@ -3674,7 +3680,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         userId // Pass user ID for customer creation
       );
     }
-    
+
     // Create log entry: use same date/epoch as transaction group when user provided date/epoch (do not use "today")
     const hasUserDate = transactionDate || (transactionEpoch != null && transactionEpoch !== '');
     const now = hasUserDate && transactionEpoch != null && transactionEpoch !== ''
@@ -3685,19 +3691,19 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     // Use lot number from selected lot if lot_id provided, otherwise use provided lot or color.lot
     const lotValue = lotNumber || ((lot && typeof lot === 'string' && lot.trim() !== '') ? lot.trim() : color.lot);
     const rollNbValue = selectedLot?.roll_nb || ((roll_nb && typeof roll_nb === 'string' && roll_nb.trim() !== '') ? roll_nb.trim() : color.roll_nb);
-    
+
     // Format fabric name with design code for logs
-    const fabricNameForLog = fabric.design && fabric.design !== 'none' 
-      ? `${fabric.fabric_name} [${fabric.design}]` 
+    const fabricNameForLog = fabric.design && fabric.design !== 'none'
+      ? `${fabric.fabric_name} [${fabric.design}]`
       : fabric.fabric_name;
-    
+
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, finalAmountMeters, finalAmountYards, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
-    
+
     await connection.commit();
-    
+
     // Return updated aggregated structure
     const updatedFabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = updatedFabrics.find(f => f.fabric_id === fabricId);
@@ -3717,12 +3723,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const colorId = parseInt(req.params.color_id);
-    const { 
-      amount_meters, 
-      amount_yards, 
+    const {
+      amount_meters,
+      amount_yards,
       roll_count = 0,
-      customer_id, 
-      customer_name, 
+      customer_id,
+      customer_name,
       notes,
       reference_log_id,
       timestamp,
@@ -3731,12 +3737,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       transaction_type: txnTypeParam = null,
       permit_number: permitNumberParam = null
     } = req.body;
-    
+
     // Validation
     if (!fabricId || !colorId) {
       return res.status(400).json({ error: 'Invalid fabric_id or color_id' });
     }
-    
+
     // Calculate amount in meters
     let amountMeters = 0;
     if (amount_yards !== undefined && amount_yards !== null) {
@@ -3746,13 +3752,13 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     } else {
       return res.status(400).json({ error: 'Either amount_meters or amount_yards must be provided' });
     }
-    
+
     if (isNaN(amountMeters) || amountMeters <= 0) {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // If reference_log_id is provided and roll_count is not explicitly set, get roll_count from the reference log
     let finalRollCount = parseInt(roll_count) || 0;
     if (reference_log_id && (roll_count === undefined || roll_count === null || roll_count === 0)) {
@@ -3764,14 +3770,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
         finalRollCount = parseInt(refLogs[0].roll_count) || 0;
       }
     }
-    
+
     // Get color with lock
-    const color = await getColorForTransaction(connection, fabricId, colorId);
+    const color = await getColorForReturn(connection, fabricId, colorId);
     if (!color) {
       await connection.rollback();
       return res.status(404).json({ error: 'Color not found' });
     }
-    
+
     // Get fabric info (including design for log formatting)
     const [fabrics] = await connection.query('SELECT fabric_name, fabric_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabrics.length === 0) {
@@ -3779,7 +3785,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       return res.status(404).json({ error: 'Fabric not found' });
     }
     const fabric = fabrics[0];
-    
+
     // Get old record for audit
     const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const oldColorRecord = oldColorRows[0];
@@ -3810,15 +3816,15 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     // Get updated record for audit
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const newColorRecord = newColorRows[0];
-    
+
     // Log audit entry for return operation (include fabric/color for clarity)
     await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Returned ${returnAmountYardsValue.toFixed(2)}yd/${amountMeters.toFixed(2)}m to color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
-    
+
     // Round to 2 decimals - yards is primary, meters is secondary
     const round2Ret = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
     const logReturnAmountYards = round2Ret(returnAmountYardsValue);
     const returnAmountMeters = round2Ret(amountMeters);
-    
+
     // Permit number is required for returns (user-provided)
     const permitNumber = permitNumberParam && typeof permitNumberParam === 'string' ? permitNumberParam.trim() : null;
     if (!permitNumber) {
@@ -3860,7 +3866,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
 
     const transactionGroupId = req.body.transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const userId = req.user ? req.user.user_id : null;
-    
+
     // Create or update transaction group for return
     await createOrUpdateTransactionGroup(
       connection,
@@ -3876,26 +3882,26 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       userId,
       permitNumber
     );
-    
+
     // Create log entry for return: use validated transactionDate and transactionEpoch
     const now = { iso: transactionDate + ' 00:00:00', epoch: transactionEpoch, tz: 'Asia/Beirut' };
     const salespersonId = req.body.salesperson_id || null;
     const conductedByUserId = req.user ? req.user.user_id : null;
     const lotValue = color.lot || null;
     const rollNbValue = color.roll_nb || null;
-    
+
     // Format fabric name with design code for logs
-    const fabricNameForLog = fabric.design && fabric.design !== 'none' 
-      ? `${fabric.fabric_name} [${fabric.design}]` 
+    const fabricNameForLog = fabric.design && fabric.design !== 'none'
+      ? `${fabric.fabric_name} [${fabric.design}]`
       : fabric.fabric_name;
-    
+
     await connection.query(
       'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
     );
-    
+
     await connection.commit();
-    
+
     // Return updated aggregated structure
     const updatedFabrics = await buildFabricColorAggregatedStructure();
     const updatedFabric = updatedFabrics.find(f => f.fabric_id === fabricId);
@@ -4122,7 +4128,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
 app.get('/api/logs', authMiddleware, async (req, res) => {
   try {
     const { type, fabricId, colorId, rollId, start, end, minLength, maxLength } = req.query;
-    
+
     let query = `
       SELECT 
         l.*,
@@ -4174,68 +4180,68 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
     }
 
     query += ' ORDER BY l.epoch DESC, l.log_id DESC';
-    
+
     const [logs] = await db.query(query, params);
-    
+
     const r2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
     const formattedLogs = logs.map(log => {
       const am = log.amount_meters ? parseFloat(log.amount_meters) : 0;
       const ay = log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0);
       return {
-      log_id: log.log_id,
-      type: log.type,
-      roll_id: log.roll_id,
-      fabric_id: log.fabric_id || null,
-      color_id: log.color_id || null,
-      customer_id: log.customer_id || null,
-      fabric_name: log.fabric_name,
-      color_name: log.color_name,
-      customer_name: log.customer_name,
-      amount_meters: r2(am),
-      amount_yards: r2(ay),
-      length_meters: log.type === 'sell' ? r2(am) : null,
-      length_yards: log.type === 'sell' ? r2(ay) : null,
-      roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
-      lot: log.lot || null,
-      roll_nb: log.roll_nb || null,
-      is_trimmable: Boolean(log.is_trimmable),
-      weight: log.weight,
-      notes: log.transaction_group_notes || log.notes,
-      timestamp: log.timestamp,
-      epoch: log.epoch,
-      timezone: log.timezone,
-      reference_log_id: log.reference_log_id || null,
-      transaction_group_id: log.transaction_group_id || null,
-      salesperson_id: log.salesperson_id || null,
-      salesperson_name: log.salesperson_name || null,
-      conducted_by_user_id: log.conducted_by_user_id || null,
-      conducted_by_username: log.conducted_by_username || null,
-      conducted_by_full_name: log.conducted_by_full_name || null,
-      created_at: log.created_at,
-      updated_at: log.updated_at,
-      id: log.log_id,
-      rollId: log.roll_id,
-      fabricId: log.fabric_id || null,
-      colorId: log.color_id || null,
-      customerId: log.customer_id || null,
-      fabricName: log.fabric_name,
-      colorName: log.color_name,
-      customerName: log.customer_name,
-      length_meters: log.type === 'sell' ? r2(am) : null,
-      length_yards: log.type === 'sell' ? r2(ay) : null,
-      amount_yards: r2(ay),
-      rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
-      rollNb: log.roll_nb || null,
-      tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable),
-      referenceLogId: log.reference_log_id || null,
-      transactionGroupId: log.transaction_group_id || null,
-      transactionType: log.transaction_type || null,
-      permitNumber: log.permit_number || null,
-      salespersonId: log.salesperson_id || null,
-      salespersonName: log.salesperson_name || null,
-      conductedByUserId: log.conducted_by_user_id || null,
-      conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
+        log_id: log.log_id,
+        type: log.type,
+        roll_id: log.roll_id,
+        fabric_id: log.fabric_id || null,
+        color_id: log.color_id || null,
+        customer_id: log.customer_id || null,
+        fabric_name: log.fabric_name,
+        color_name: log.color_name,
+        customer_name: log.customer_name,
+        amount_meters: r2(am),
+        amount_yards: r2(ay),
+        length_meters: log.type === 'sell' ? r2(am) : null,
+        length_yards: log.type === 'sell' ? r2(ay) : null,
+        roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
+        lot: log.lot || null,
+        roll_nb: log.roll_nb || null,
+        is_trimmable: Boolean(log.is_trimmable),
+        weight: log.weight,
+        notes: log.transaction_group_notes || log.notes,
+        timestamp: log.timestamp,
+        epoch: log.epoch,
+        timezone: log.timezone,
+        reference_log_id: log.reference_log_id || null,
+        transaction_group_id: log.transaction_group_id || null,
+        salesperson_id: log.salesperson_id || null,
+        salesperson_name: log.salesperson_name || null,
+        conducted_by_user_id: log.conducted_by_user_id || null,
+        conducted_by_username: log.conducted_by_username || null,
+        conducted_by_full_name: log.conducted_by_full_name || null,
+        created_at: log.created_at,
+        updated_at: log.updated_at,
+        id: log.log_id,
+        rollId: log.roll_id,
+        fabricId: log.fabric_id || null,
+        colorId: log.color_id || null,
+        customerId: log.customer_id || null,
+        fabricName: log.fabric_name,
+        colorName: log.color_name,
+        customerName: log.customer_name,
+        length_meters: log.type === 'sell' ? r2(am) : null,
+        length_yards: log.type === 'sell' ? r2(ay) : null,
+        amount_yards: r2(ay),
+        rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
+        rollNb: log.roll_nb || null,
+        tz: log.timezone,
+        isTrimmable: Boolean(log.is_trimmable),
+        referenceLogId: log.reference_log_id || null,
+        transactionGroupId: log.transaction_group_id || null,
+        transactionType: log.transaction_type || null,
+        permitNumber: log.permit_number || null,
+        salespersonId: log.salesperson_id || null,
+        salespersonName: log.salesperson_name || null,
+        conductedByUserId: log.conducted_by_user_id || null,
+        conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
       };
     });
 
@@ -4320,19 +4326,19 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
 app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (req, res) => {
   try {
     const transactionGroupId = req.params.transaction_group_id;
-    
+
     // Get transaction group info
     const [groups] = await db.query(
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     if (groups.length === 0) {
       return res.status(404).json({ error: 'Transaction group not found' });
     }
-    
+
     const group = groups[0];
-    
+
     // Get all related logs with fabric main_code
     const [logs] = await db.query(
       `SELECT 
@@ -4344,7 +4350,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       ORDER BY l.epoch ASC, l.log_id ASC`,
       [transactionGroupId]
     );
-    
+
     // Format logs
     const formattedLogs = logs.map(log => ({
       log_id: log.log_id,
@@ -4385,7 +4391,7 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
       isTrimmable: Boolean(log.is_trimmable),
       transactionGroupId: log.transaction_group_id || null
     }));
-    
+
     // Return transaction group with items
     res.json({
       transaction_group_id: group.transaction_group_id,
@@ -4416,32 +4422,32 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
   try {
     const transactionGroupId = req.params.transaction_group_id;
     const { transaction_type, epoch } = req.body;
-    
+
     if (!transaction_type || !['A', 'B', 'return'].includes(transaction_type)) {
       await connection.rollback();
       return res.status(400).json({ error: 'Transaction type must be A, B, or return' });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // Get current transaction group
     const [groups] = await connection.query(
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     if (groups.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Transaction group not found' });
     }
-    
+
     const currentGroup = groups[0];
     const oldType = currentGroup.transaction_type;
     const newEpoch = epoch || currentGroup.epoch;
-    
+
     // Get old record for audit
     const oldGroupRecord = { ...currentGroup };
-    
+
     // If type changed, just update the type - permit numbers are manual
     if (oldType !== transaction_type) {
       // Update transaction group with new type and epoch
@@ -4473,21 +4479,21 @@ app.put('/api/transaction-groups/:transaction_group_id/type', authMiddleware, re
       );
       // DO NOT call recalculatePermitNumbers - permit numbers are manually controlled
     }
-    
+
     // Get updated record for audit (include permit/customer for clarity)
     const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
     const groupPermit = currentGroup.permit_number || 'N/A';
     const groupCustomer = currentGroup.customer_name || 'N/A';
     await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated transaction group type: ${oldType} → ${transaction_type} | Permit: ${groupPermit}, Customer: ${groupCustomer}`);
-    
+
     await connection.commit();
-    
+
     // Return updated transaction group
     const [updated] = await connection.query(
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     const group = updated[0];
     res.json({
       transaction_group_id: group.transaction_group_id,
@@ -4522,88 +4528,88 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
   try {
     const transactionGroupId = req.params.transaction_group_id;
     const { permit_number } = req.body;
-    
+
     if (!permit_number || typeof permit_number !== 'string') {
       return res.status(400).json({ error: 'Permit number is required and must be a string' });
     }
-    
+
     // Clean and validate format: should be "A-1" or "B-1" format
     // Remove any curly braces and convert to uppercase
     const cleanedPermit = permit_number.replace(/[{}]/g, '').trim().toUpperCase();
-    
+
     const permitPattern = /^[AB]-\d+$/;
     if (!permitPattern.test(cleanedPermit)) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Permit number must be in format "A-{number}" or "B-{number}" (e.g., "A-5" or "B-10")',
         received: permit_number
       });
     }
-    
+
     await connection.beginTransaction();
-    
+
     // Get current transaction group
     const [groups] = await connection.query(
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     if (groups.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Transaction group not found' });
     }
-    
+
     const currentGroup = groups[0];
-    
+
     // Get old record for audit
     const oldGroupRecord = { ...currentGroup };
-    
+
     // Extract transaction type from permit number (A or B)
     const permitType = cleanedPermit.charAt(0).toUpperCase();
-    
+
     // Check if permit number already exists (excluding current transaction).
     // String equality: permit_number column is VARCHAR; ? is bound as string (cleanedPermit).
     const [existing] = await connection.query(
       'SELECT transaction_group_id, permit_number FROM transaction_groups WHERE permit_number = ? AND transaction_group_id != ?',
       [cleanedPermit, transactionGroupId]
     );
-    
+
     if (existing.length > 0) {
       await connection.rollback();
-      return res.status(409).json({ 
+      return res.status(409).json({
         error: 'Duplicate permit number',
         message: `Another transaction already has permit number ${cleanedPermit}`,
         conflictingTransaction: existing[0].transaction_group_id
       });
     }
-    
+
     // Validate that permit number prefix matches transaction type (strict string comparison)
     if (permitType !== currentGroup.transaction_type) {
       await connection.rollback();
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Permit number prefix must match transaction type',
         message: `Permit number starts with "${permitType}" but transaction type is "${currentGroup.transaction_type}". Please change the transaction type first.`
       });
     }
-    
+
     // Update permit number only (transaction type is managed separately)
     await connection.query(
       'UPDATE transaction_groups SET permit_number = ? WHERE transaction_group_id = ?',
       [cleanedPermit, transactionGroupId]
     );
-    
+
     // Get updated record for audit (include permit/customer for clarity)
     const [newGroupRows] = await connection.query('SELECT * FROM transaction_groups WHERE transaction_group_id = ?', [transactionGroupId]);
     const permitCustomer = currentGroup.customer_name || 'N/A';
     await logUpdate('transaction_groups', transactionGroupId, req.user, oldGroupRecord, newGroupRows[0], req, `Updated permit number: ${oldGroupRecord.permit_number || 'none'} → ${cleanedPermit} | Permit: ${cleanedPermit}, Customer: ${permitCustomer}`);
-    
+
     await connection.commit();
-    
+
     // Return updated transaction group
     const [updated] = await connection.query(
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     const group = updated[0];
     res.json({
       transaction_group_id: group.transaction_group_id,
@@ -4632,7 +4638,7 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
   try {
     const entry = req.body || {};
     const now = getLebanonTimestamp();
-    
+
     // Validation
     if (!entry.type) {
       return res.status(400).json({ error: 'Log type is required' });
@@ -4699,13 +4705,13 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
     // Build INSERT query with optional amount_yards field
     const insertFields = ['type', 'roll_id', 'fabric_id', 'color_id', 'fabric_name', 'color_name', 'customer_id', 'customer_name', 'amount_meters', 'is_trimmable', 'weight', 'notes', 'timestamp', 'epoch', 'timezone', 'salesperson_id', 'conducted_by_user_id'];
     const insertValues = [logData.type, logData.roll_id, logData.fabric_id, logData.color_id, logData.fabric_name, logData.color_name, logData.customer_id, logData.customer_name, logData.amount_meters, logData.is_trimmable, logData.weight, logData.notes, logData.timestamp, logData.epoch, logData.timezone, logData.salesperson_id, logData.conducted_by_user_id];
-    
+
     // Add amount_yards if provided
     if (logData.amount_yards !== undefined && logData.amount_yards !== null) {
       insertFields.push('amount_yards');
       insertValues.push(logData.amount_yards);
     }
-    
+
     const placeholders = insertFields.map(() => '?').join(', ');
     const [result] = await db.query(
       `INSERT INTO logs (${insertFields.join(', ')}) VALUES (${placeholders})`,
@@ -4715,7 +4721,7 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
     // Return DB reality
     const [created] = await db.query('SELECT * FROM logs WHERE log_id = ?', [result.insertId]);
     const log = created[0];
-    
+
     res.status(201).json({
       log_id: log.log_id,
       type: log.type,
@@ -4751,7 +4757,7 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error creating log:', error);
     // Provide more helpful error message
-    const errorMessage = error.code === 'ER_NO_REFERENCED_ROW_2' 
+    const errorMessage = error.code === 'ER_NO_REFERENCED_ROW_2'
       ? 'Invalid roll ID or fabric ID - record does not exist'
       : error.message || 'Failed to create log';
     res.status(500).json({ error: errorMessage });
@@ -4784,7 +4790,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
     if (updates.length_meters !== undefined) updateData.amount_meters = round2(updates.length_meters); // length_meters -> amount_meters for sell logs
     if (updates.length_yards !== undefined) updateData.amount_yards = round2(updates.length_yards); // length_yards -> amount_yards for sell logs
     if (updates.isTrimmable !== undefined) updateData.is_trimmable = updates.is_trimmable;
-    
+
     // Handle direct inventory adjustment when editing transactions (no new log entries)
     if (updates.adjustInventory !== undefined && updates.adjustInventory === true) {
       const logId = parseInt(req.params.id);
@@ -4793,27 +4799,27 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
         const log = logRows[0];
         const fabricId = log.fabric_id;
         const colorId = log.color_id;
-        
+
         if (fabricId && colorId) {
           // Get old amounts - use stored yards if available, otherwise convert from meters
           const oldAmountMeters = parseFloat(log.amount_meters || log.length_meters || 0);
           const oldAmountYards = parseFloat(log.amount_yards || log.length_yards || (oldAmountMeters * 1.0936));
-          
+
           // Get new amounts from updateData (already rounded and properly mapped)
           // For sell logs: length_meters/length_yards map to amount_meters/amount_yards in updateData
           // For return logs: amount_meters/amount_yards are used directly
           // Fallback to updates if updateData doesn't have values (shouldn't happen, but safe)
-          const newAmountMeters = updateData.amount_meters !== undefined 
-            ? parseFloat(updateData.amount_meters) 
+          const newAmountMeters = updateData.amount_meters !== undefined
+            ? parseFloat(updateData.amount_meters)
             : parseFloat(updates.amount_meters || updates.length_meters || 0);
-          const newAmountYards = updateData.amount_yards !== undefined 
-            ? parseFloat(updateData.amount_yards) 
+          const newAmountYards = updateData.amount_yards !== undefined
+            ? parseFloat(updateData.amount_yards)
             : parseFloat(updates.amount_yards || updates.length_yards || (newAmountMeters * 1.0936));
-          
+
           // Calculate delta - use yards as primary unit for inventory calculation
           const deltaYards = newAmountYards - oldAmountYards;
           const deltaMeters = newAmountMeters - oldAmountMeters;
-          
+
           // Get current color inventory
           const [colors] = await db.query('SELECT length_meters, length_yards, roll_count FROM colors WHERE color_id = ?', [colorId]);
           if (colors.length > 0) {
@@ -4821,13 +4827,13 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
             const currentMeters = parseFloat(color.length_meters) || 0;
             const currentYards = parseFloat(color.length_yards) || 0;
             const currentRollCount = parseInt(color.roll_count) || 0;
-            
+
             // Calculate new inventory based on transaction type
             let newMeters, newYards, newRollCount;
             const oldRollCount = parseInt(log.roll_count) || 0;
             const newRollCountFromLog = parseInt(updates.roll_count) || oldRollCount;
             const rollCountDelta = newRollCountFromLog - oldRollCount;
-            
+
             // Calculate inventory adjustment based on transaction type
             // For sell: subtracting from inventory, so if we increase the transaction amount, we decrease inventory more
             // For return: adding to inventory, so if we increase the transaction amount, we increase inventory more
@@ -4850,7 +4856,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
               newYards = currentYards;
               newRollCount = currentRollCount;
             }
-            
+
             // When increasing sell amount, ensure we have enough inventory
             if (log.type === 'sell' && deltaYards > 0) {
               if (currentYards < deltaYards) {
@@ -4867,25 +4873,25 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
                 message: `Cannot decrease return amount: would leave negative inventory. Available: ${currentYards.toFixed(2)} yd.`
               });
             }
-            
+
             // Ensure non-negative
             newMeters = Math.max(0, newMeters);
             newYards = Math.max(0, newYards);
-            
+
             // Get old record for audit
             const [oldColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
             const oldColorRecord = oldColorRows[0];
-            
+
             // Update color inventory directly
             await db.query(
               'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ? WHERE color_id = ?',
               [newMeters, newYards, newRollCount, colorId]
             );
-            
+
             // Get updated record for audit
             const [newColorRows] = await db.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
             const newColorRecord = newColorRows[0];
-            
+
             // Log audit entry (include fabric/color for clarity) - use log (current row) not oldLogRecord (declared later)
             const invFabric = log.fabric_name || 'N/A';
             const invColor = log.color_name || 'N/A';
@@ -4932,7 +4938,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
 
     const fields = Object.keys(updateData).map(k => `${k} = ?`).join(', ');
     const values = [...Object.values(updateData), logId];
-    
+
     await db.query(`UPDATE logs SET ${fields} WHERE log_id = ?`, values);
 
     // Update transaction group totals if amount changed
@@ -4948,24 +4954,24 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
         const oldAmountYards = parseFloat(oldLogRecord.amount_yards || (oldAmountMeters * 1.0936));
         const newAmountMeters = parseFloat(updatedLog.amount_meters || 0);
         const newAmountYards = parseFloat(updatedLog.amount_yards || (newAmountMeters * 1.0936));
-        
+
         const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
         const amountDeltaMeters = newAmountMeters - oldAmountMeters;
         const amountDeltaYards = newAmountYards - oldAmountYards;
-        
+
         // Update transaction group totals
         const [groups] = await db.query(
           'SELECT total_items, total_meters, total_yards FROM transaction_groups WHERE transaction_group_id = ?',
           [transactionGroupId]
         );
-        
+
         if (groups.length > 0) {
           const group = groups[0];
           const currentTotalMeters = parseFloat(group.total_meters) || 0;
           const currentTotalYards = parseFloat(group.total_yards) || (currentTotalMeters * 1.0936);
           const newTotalMeters = round2(Math.max(0, currentTotalMeters + amountDeltaMeters));
           const newTotalYards = round2(Math.max(0, currentTotalYards + amountDeltaYards));
-          
+
           await db.query(
             'UPDATE transaction_groups SET total_meters = ?, total_yards = ? WHERE transaction_group_id = ?',
             [newTotalMeters, newTotalYards, transactionGroupId]
@@ -4984,7 +4990,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       WHERE l.log_id = ?
     `, [logId]);
     const log = updated[0];
-    
+
     // Get updated record for audit (include fabric/color and permit for clarity)
     const [newLogRows] = await db.query('SELECT * FROM logs WHERE log_id = ?', [logId]);
     const logFabric = oldLogRecord.fabric_name || 'N/A';
@@ -4995,7 +5001,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       if (tg.length > 0) logNote += ` | Permit: ${tg[0].permit_number || 'N/A'}, Customer: ${tg[0].customer_name || 'N/A'}`;
     }
     await logUpdate('logs', logId, req.user, oldLogRecord, newLogRows[0], req, logNote);
-    
+
     res.json({
       log_id: log.log_id,
       type: log.type,
@@ -5047,7 +5053,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
   const connection = await db.getConnection();
   try {
     const logId = parseInt(req.params.log_id);
-    
+
     await connection.beginTransaction();
 
     // Step 1: Get the log
@@ -5056,7 +5062,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
       await connection.rollback();
       return res.status(404).json({ error: 'Log not found' });
     }
-    
+
     const log = logs[0];
     const transactionGroupId = log.transaction_group_id;
     const returnAmount = parseFloat(log.amount_meters) || 0;
@@ -5069,22 +5075,22 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
         'SELECT color_id, fabric_id, length_meters, length_yards, roll_count FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
         [log.color_id, log.fabric_id]
       );
-      
+
       if (colors.length > 0) {
         const color = colors[0];
         const currentMeters = parseFloat(color.length_meters) || 0;
         const currentYards = parseFloat(color.length_yards) || 0;
         const currentRollCount = parseInt(color.roll_count) || 0;
-        
+
         // Get roll_count from log
         const logRollCount = parseInt(log.roll_count) || 0;
-        
+
         let newMeters, newYards, newRollCount;
-        
+
         const returnAmountMeters = parseFloat(log.amount_meters) || 0;
         const returnAmountYards = parseFloat(log.amount_yards) || (returnAmountMeters * 1.0936);
         const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
-        
+
         if (log.type === 'return') {
           // For return deletions: subtract length and roll_count (revert the return)
           newMeters = round2(Math.max(0, currentMeters - returnAmountMeters));
@@ -5096,7 +5102,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           newYards = round2(currentYards + returnAmountYards);
           newRollCount = currentRollCount + logRollCount;
         }
-        
+
         // Get old record for audit
         const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [log.color_id]);
         const oldColorRecord = oldColorRows.length > 0 ? oldColorRows[0] : null;
@@ -5109,7 +5115,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
         // Get updated record for audit
         const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [log.color_id]);
         const newColorRecord = newColorRows[0];
-        
+
         // Log audit entry for transaction cancellation/restoration
         if (oldColorRecord) {
           const action = log.type === 'return' ? 'Reverted return' : `Restored from ${log.type}`;
@@ -5117,19 +5123,19 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           const logColorName = log.color_name || 'N/A';
           await logUpdate('colors', log.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmountMeters.toFixed(2)}m | Fabric: ${logFabricName}, Color: ${logColorName}`);
         }
-        
+
         // If log has lot number, try to restore/revert to that specific lot
         if (log.lot && log.lot.trim()) {
           const [lots] = await connection.query(
             'SELECT lot_id, length_meters, length_yards FROM color_lots WHERE color_id = ? AND lot_number = ? FOR UPDATE',
             [log.color_id, log.lot.trim()]
           );
-          
+
           if (lots.length > 0) {
             const lot = lots[0];
             const currentLotM = parseFloat(lot.length_meters) || 0;
             const currentLotY = parseFloat(lot.length_yards) || 0;
-            
+
             let newLotM, newLotY;
             if (log.type === 'return') {
               // For return deletions: subtract from lot
@@ -5140,7 +5146,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
               newLotM = round2(currentLotM + returnAmountMeters);
               newLotY = round2(currentLotY + returnAmountYards);
             }
-            
+
             await connection.query(
               'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
               [newLotM, newLotY, lot.lot_id]
@@ -5157,25 +5163,25 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
     let shouldDeleteGroup = false;
     let permitNumber = null;
     let transactionType = 'A';
-    
+
     if (transactionGroupId) {
       const [remainingLogs] = await connection.query(
         'SELECT COUNT(*) as count FROM logs WHERE transaction_group_id = ?',
         [transactionGroupId]
       );
-      
+
       if (remainingLogs[0].count === 0) {
         // Last log deleted, get transaction group info before deleting
         const [groups] = await connection.query(
           'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
           [transactionGroupId]
         );
-        
+
         if (groups.length > 0) {
           shouldDeleteGroup = true;
           permitNumber = groups[0].permit_number;
           transactionType = groups[0].transaction_type || 'A';
-          
+
           // Delete the transaction group
           await connection.query(
             'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
@@ -5188,7 +5194,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           'SELECT total_items, total_meters, total_yards FROM transaction_groups WHERE transaction_group_id = ?',
           [transactionGroupId]
         );
-        
+
         if (groups.length > 0) {
           const group = groups[0];
           const returnAmountMeters = parseFloat(log.amount_meters) || 0;
@@ -5198,7 +5204,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
           const currentTotalYards = parseFloat(group.total_yards) || (parseFloat(group.total_meters) * 1.0936);
           const newTotalMeters = round2(Math.max(0, parseFloat(group.total_meters) - returnAmountMeters));
           const newTotalYards = round2(Math.max(0, currentTotalYards - returnAmountYards));
-          
+
           await connection.query(
             'UPDATE transaction_groups SET total_items = ?, total_meters = ?, total_yards = ? WHERE transaction_group_id = ?',
             [newTotalItems, newTotalMeters, newTotalYards, transactionGroupId]
@@ -5211,7 +5217,7 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
     if (shouldDeleteGroup && permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
       // Parse numeric part as integer for SQL comparison (no string/integer mixing)
       const permitNum = parseInt(permitNumber.substring(2), 10);
-      
+
       // Find the highest permit number for this transaction type that is less than the canceled one
       const [result] = await connection.query(
         `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as max_num 
@@ -5228,10 +5234,10 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
     }
 
     await connection.commit();
-    
-    res.json({ 
-      success: true, 
-      message: `Log canceled. Roll restored.${shouldDeleteGroup ? ' Transaction group deleted.' : ''}` 
+
+    res.json({
+      success: true,
+      message: `Log canceled. Roll restored.${shouldDeleteGroup ? ' Transaction group deleted.' : ''}`
     });
   } catch (error) {
     await connection.rollback();
@@ -5248,7 +5254,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
-    
+
     await connection.beginTransaction();
 
     // Step 1: Get transaction group info
@@ -5256,12 +5262,12 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
       'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
     );
-    
+
     if (groups.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Transaction group not found' });
     }
-    
+
     const group = groups[0];
     const transactionType = group.transaction_type || 'A';
     const permitNumber = group.permit_number;
@@ -5275,12 +5281,12 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
     // Step 3: Restore/revert length to colors (and lots if applicable) - SAVE FIRST before deleting logs
     // Group by color_id to avoid multiple locks on same color
     const colorRestoreMap = {};
-    
+
     for (const log of logs) {
       if ((log.type === 'sell' || log.type === 'return') && log.fabric_id && log.color_id) {
         const returnAmount = parseFloat(log.amount_meters) || 0;
         const logRollCount = parseInt(log.roll_count) || 0;
-        
+
         if (returnAmount > 0) {
           const key = `${log.fabric_id}_${log.color_id}`;
           if (!colorRestoreMap[key]) {
@@ -5293,13 +5299,13 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
               hasReturns: false // Track if any returns are in this group
             };
           }
-          
+
           if (log.type === 'return') {
             // For returns: subtract (revert the return)
             colorRestoreMap[key].totalAmount -= returnAmount;
             colorRestoreMap[key].totalRollCount -= logRollCount;
             colorRestoreMap[key].hasReturns = true;
-            
+
             // Track lot-specific amounts if lot number exists
             if (log.lot && log.lot.trim()) {
               const lotNum = log.lot.trim();
@@ -5312,7 +5318,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
             // For sell: add back
             colorRestoreMap[key].totalAmount += returnAmount;
             colorRestoreMap[key].totalRollCount += logRollCount;
-            
+
             // Track lot-specific amounts if lot number exists
             if (log.lot && log.lot.trim()) {
               const lotNum = log.lot.trim();
@@ -5325,31 +5331,31 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
         }
       }
     }
-    
+
     // Restore/revert to each color
     for (const key in colorRestoreMap) {
       const restore = colorRestoreMap[key];
       const returnAmount = restore.totalAmount;
       const returnAmountYards = returnAmount * 1.0936;
       const returnRollCount = restore.totalRollCount;
-      
+
       // Get color with lock
       const [colors] = await connection.query(
         'SELECT color_id, fabric_id, length_meters, length_yards, roll_count FROM colors WHERE color_id = ? AND fabric_id = ? FOR UPDATE',
         [restore.color_id, restore.fabric_id]
       );
-      
+
       if (colors.length > 0) {
         const color = colors[0];
         const currentMeters = parseFloat(color.length_meters) || 0;
         const currentYards = parseFloat(color.length_yards) || 0;
         const currentRollCount = parseInt(color.roll_count) || 0;
-        
+
         // Apply net change (could be positive for sell deletions, negative for return deletions)
         const newMeters = Math.max(0, currentMeters + returnAmount);
         const newYards = Math.max(0, currentYards + returnAmountYards);
         const newRollCount = Math.max(0, currentRollCount + returnRollCount);
-        
+
         // Get old record for audit
         const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [restore.color_id]);
         const oldColorRecord = oldColorRows.length > 0 ? oldColorRows[0] : null;
@@ -5362,24 +5368,24 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
         // Get updated record for audit
         const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [restore.color_id]);
         const newColorRecord = newColorRows[0];
-        
+
         // Log audit entry for transaction group cancellation (include fabric/color for clarity)
         if (oldColorRecord) {
           const action = restore.hasReturns ? 'Cancelled transaction group (mixed)' : 'Cancelled transaction group';
           const cancelCtx = await getColorFabricNames(restore.color_id, connection);
           await logUpdate('colors', restore.color_id, req.user, oldColorRecord, newColorRecord, req, `${action} - restored ${returnAmountYards.toFixed(2)}yd/${returnAmount.toFixed(2)}m | Fabric: ${cancelCtx.fabric_name}, Color: ${cancelCtx.color_name}`);
         }
-        
+
         // Restore/revert to specific lots if applicable
         for (const lotNum in restore.lots) {
           const lotAmount = restore.lots[lotNum];
           const lotAmountYards = lotAmount * 1.0936;
-          
+
           const [lots] = await connection.query(
             'SELECT lot_id, length_meters, length_yards FROM color_lots WHERE color_id = ? AND lot_number = ? FOR UPDATE',
             [restore.color_id, lotNum]
           );
-          
+
           if (lots.length > 0) {
             const lot = lots[0];
             const currentLotM = parseFloat(lot.length_meters) || 0;
@@ -5387,7 +5393,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
             // Apply net change (could be positive or negative)
             const newLotM = Math.max(0, currentLotM + lotAmount);
             const newLotY = Math.max(0, currentLotY + lotAmountYards);
-            
+
             await connection.query(
               'UPDATE color_lots SET length_meters = ?, length_yards = ? WHERE lot_id = ?',
               [newLotM, newLotY, lot.lot_id]
@@ -5413,7 +5419,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
     if (permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
       // Parse numeric part as integer for SQL comparison (no string/integer mixing)
       const permitNum = parseInt(permitNumber.substring(2), 10);
-      
+
       // Find the highest permit number for this transaction type that is less than the canceled one
       const [result] = await connection.query(
         `SELECT MAX(CAST(SUBSTRING(permit_number, 3) AS UNSIGNED)) as max_num 
@@ -5426,7 +5432,7 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
       );
       // Parse to integer (MySQL may return numeric as string)
       const maxNum = parseInt(result[0]?.max_num, 10) || 0;
-      
+
       // If there are no permit numbers below this one, we don't need to do anything
       // The counter will naturally continue from the next highest number
       // But if we want to "reuse" the canceled permit number, we could update the highest one
@@ -5435,10 +5441,10 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
     }
 
     await connection.commit();
-    
-    res.json({ 
-      success: true, 
-      message: `Transaction ${transactionGroupId} canceled. ${logs.length} logs deleted, rolls restored.` 
+
+    res.json({
+      success: true,
+      message: `Transaction ${transactionGroupId} canceled. ${logs.length} logs deleted, rolls restored.`
     });
   } catch (error) {
     await connection.rollback();
@@ -5464,14 +5470,14 @@ app.get('/api/salespersons', authMiddleware, async (req, res) => {
       LEFT JOIN users u_created ON s.created_by_user_id = u_created.user_id
       LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id`;
     const params = [];
-    
+
     if (active !== undefined) {
       query += ' WHERE active = ?';
       params.push(active === 'true' || active === '1');
     }
-    
+
     query += ' ORDER BY name ASC';
-    
+
     const [salespersons] = await db.query(query, params);
     res.json(salespersons);
   } catch (error) {
@@ -5484,11 +5490,11 @@ app.get('/api/salespersons', authMiddleware, async (req, res) => {
 app.post('/api/salespersons', authMiddleware, async (req, res) => {
   try {
     const { name, code, email, phone, active = true } = req.body;
-    
+
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Salesperson name is required' });
     }
-    
+
     // Check if code already exists (if provided)
     if (code) {
       const [existing] = await db.query('SELECT salesperson_id FROM salespersons WHERE code = ?', [code]);
@@ -5496,13 +5502,13 @@ app.post('/api/salespersons', authMiddleware, async (req, res) => {
         return res.status(409).json({ error: 'Salesperson code already exists' });
       }
     }
-    
+
     const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
       'INSERT INTO salespersons (name, code, email, phone, active, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
       [name.trim(), code || null, email || null, phone || null, Boolean(active), userId]
     );
-    
+
     const [newSalesperson] = await db.query(`
       SELECT s.*,
         u_created.username as created_by_username, u_created.full_name as created_by_full_name,
@@ -5512,11 +5518,11 @@ app.post('/api/salespersons', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
       WHERE s.salesperson_id = ?
     `, [result.insertId]);
-    
+
     // Log audit entry
     const [salespersonRow] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [result.insertId]);
     await logInsert('salespersons', result.insertId, req.user, salespersonRow[0], req, `Created salesperson: ${name.trim()}`);
-    
+
     res.status(201).json(newSalesperson[0]);
   } catch (error) {
     console.error('Error creating salesperson:', error);
@@ -5529,10 +5535,10 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
   try {
     const salespersonId = parseInt(req.params.id);
     const { name, code, email, phone, active } = req.body;
-    
+
     const updates = {};
     const values = [];
-    
+
     if (name !== undefined) {
       updates.name = name.trim();
       values.push(name.trim());
@@ -5558,11 +5564,11 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
       updates.active = Boolean(active);
       values.push(Boolean(active));
     }
-    
+
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
     }
-    
+
     // Get old record before update
     const [oldSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
     if (oldSalespersonRows.length === 0) return res.status(404).json({ error: 'Salesperson not found' });
@@ -5573,7 +5579,7 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
     values.push(salespersonId);
     const fields = Object.keys(updates).map(k => `${k} = ?`).join(', ');
     await db.query(`UPDATE salespersons SET ${fields} WHERE salesperson_id = ?`, values);
-    
+
     const [updated] = await db.query(`
       SELECT s.*,
         u_created.username as created_by_username, u_created.full_name as created_by_full_name,
@@ -5583,11 +5589,11 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
       LEFT JOIN users u_updated ON s.updated_by_user_id = u_updated.user_id
       WHERE s.salesperson_id = ?
     `, [salespersonId]);
-    
+
     // Get updated record for audit
     const [newSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
     await logUpdate('salespersons', salespersonId, req.user, oldSalespersonRecord, newSalespersonRows[0], req, `Updated salesperson: ${newSalespersonRows[0].name}`);
-    
+
     res.json(updated[0]);
   } catch (error) {
     console.error('Error updating salesperson:', error);
@@ -5599,25 +5605,25 @@ app.put('/api/salespersons/:id', authMiddleware, async (req, res) => {
 app.delete('/api/salespersons/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const salespersonId = parseInt(req.params.id);
-    
+
     // Check if salesperson has transactions
     const [hasTransactions] = await db.query('SELECT COUNT(*) as count FROM logs WHERE salesperson_id = ?', [salespersonId]);
-    
+
     // Get old record before update/delete
     const [oldSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
     if (oldSalespersonRows.length === 0) {
       return res.status(404).json({ error: 'Salesperson not found' });
     }
     const oldSalespersonRecord = oldSalespersonRows[0];
-    
+
     if (hasTransactions[0].count > 0) {
       // Soft delete - set active to false
       await db.query('UPDATE salespersons SET active = FALSE WHERE salesperson_id = ?', [salespersonId]);
-      
+
       // Get updated record for audit
       const [newSalespersonRows] = await db.query('SELECT * FROM salespersons WHERE salesperson_id = ?', [salespersonId]);
       await logUpdate('salespersons', salespersonId, req.user, oldSalespersonRecord, newSalespersonRows[0], req, `Deactivated salesperson: ${oldSalespersonRecord.name}`);
-      
+
       res.json({ success: true, message: 'Salesperson deactivated (has transactions)' });
     } else {
       // Hard delete - no transactions exist
@@ -5639,10 +5645,10 @@ app.delete('/api/salespersons/:id', authMiddleware, requireRole('admin'), async 
 app.get('/api/salespersons/stats', authMiddleware, async (req, res) => {
   try {
     const { limit = 10, start_date, end_date } = req.query;
-    
+
     let dateFilter = '';
     const params = [];
-    
+
     if (start_date) {
       dateFilter += ' AND l.epoch >= ?';
       params.push(parseInt(start_date));
@@ -5651,7 +5657,7 @@ app.get('/api/salespersons/stats', authMiddleware, async (req, res) => {
       dateFilter += ' AND l.epoch <= ?';
       params.push(parseInt(end_date));
     }
-    
+
     // Get top sellers by transaction count and total meters
     const query = `
       SELECT 
@@ -5669,9 +5675,9 @@ app.get('/api/salespersons/stats', authMiddleware, async (req, res) => {
       ORDER BY transaction_count DESC, total_meters_sold DESC
       LIMIT ?
     `;
-    
+
     params.push(parseInt(limit));
-    
+
     const [stats] = await db.query(query, params);
     res.json(stats.map(row => ({
       salesperson_id: row.salesperson_id,
@@ -5697,7 +5703,7 @@ app.get('/api/health', (req, res) => {
 app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
   try {
     const { year, month } = req.query;
-    
+
     let query = `
       SELECT 
         DATE_FORMAT(FROM_UNIXTIME(l.epoch / 1000), '%Y-%m') as month,
@@ -5710,7 +5716,7 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
       WHERE l.type IN ('sell', 'return')
     `;
     const params = [];
-    
+
     if (year) {
       query += ' AND YEAR(FROM_UNIXTIME(l.epoch / 1000)) = ?';
       params.push(parseInt(year));
@@ -5719,11 +5725,11 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
       query += ' AND MONTH(FROM_UNIXTIME(l.epoch / 1000)) = ?';
       params.push(parseInt(month));
     }
-    
+
     query += ' GROUP BY month, l.type ORDER BY month DESC, l.type';
-    
+
     const [results] = await db.query(query, params);
-    
+
     // Group by month
     const monthlyData = {};
     results.forEach(row => {
@@ -5745,7 +5751,7 @@ app.get('/api/reports/monthly-sales', authMiddleware, async (req, res) => {
         };
       }
     });
-    
+
     res.json(Object.values(monthlyData));
   } catch (error) {
     console.error('Error fetching monthly sales report:', error);
@@ -5765,7 +5771,7 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
       await db.query('SELECT 1 FROM audit_logs LIMIT 1');
     } catch (tableError) {
       if (tableError.code === 'ER_NO_SUCH_TABLE' || tableError.message?.includes("doesn't exist")) {
-        return res.status(503).json({ 
+        return res.status(503).json({
           error: 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql',
           migration_required: true
         });
@@ -5886,9 +5892,9 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
 
     const [colorRows] = uniq(colorIds).length
       ? await db.query(
-          'SELECT c.color_id, c.color_name, f.fabric_name FROM colors c JOIN fabrics f ON c.fabric_id = f.fabric_id WHERE c.color_id IN (?)',
-          [uniq(colorIds)]
-        )
+        'SELECT c.color_id, c.color_name, f.fabric_name FROM colors c JOIN fabrics f ON c.fabric_id = f.fabric_id WHERE c.color_id IN (?)',
+        [uniq(colorIds)]
+      )
       : [[]];
     for (const r of colorRows) {
       colorMap.set(Number(r.color_id), { fabric_name: r.fabric_name || 'N/A', color_name: r.color_name || 'N/A' });
@@ -5896,13 +5902,13 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
 
     const [lotRows] = uniq(lotIds).length
       ? await db.query(
-          `SELECT cl.lot_id, cl.lot_number, c.color_name, f.fabric_name
+        `SELECT cl.lot_id, cl.lot_number, c.color_name, f.fabric_name
            FROM color_lots cl
            JOIN colors c ON cl.color_id = c.color_id
            JOIN fabrics f ON c.fabric_id = f.fabric_id
            WHERE cl.lot_id IN (?)`,
-          [uniq(lotIds)]
-        )
+        [uniq(lotIds)]
+      )
       : [[]];
     for (const r of lotRows) {
       lotMap.set(Number(r.lot_id), {
@@ -5914,12 +5920,12 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
 
     const [logRows] = uniq(logIds).length
       ? await db.query(
-          `SELECT l.log_id, l.fabric_name, l.color_name, tg.permit_number, tg.customer_name
+        `SELECT l.log_id, l.fabric_name, l.color_name, tg.permit_number, tg.customer_name
            FROM logs l
            LEFT JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id
            WHERE l.log_id IN (?)`,
-          [uniq(logIds)]
-        )
+        [uniq(logIds)]
+      )
       : [[]];
     for (const r of logRows) {
       logMap.set(Number(r.log_id), {
@@ -5969,7 +5975,7 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     console.error('Error code:', error.code);
     // Provide more detailed error information
     let errorMessage = error.message || 'Failed to fetch audit logs';
-    
+
     if (error.code === 'ER_NO_SUCH_TABLE' || error.message?.includes("doesn't exist")) {
       errorMessage = 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql';
     } else if (error.code === 'ER_BAD_FIELD_ERROR') {
@@ -5977,8 +5983,8 @@ app.get('/api/audit-logs', authMiddleware, requireRole('admin'), async (req, res
     } else if (error.code === 'ER_PARSE_ERROR') {
       errorMessage = `SQL syntax error: ${error.message}`;
     }
-    
-    res.status(500).json({ 
+
+    res.status(500).json({
       error: errorMessage,
       code: error.code,
       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
@@ -5994,7 +6000,7 @@ app.get('/api/audit-logs/statistics', authMiddleware, requireRole('admin'), asyn
       await db.query('SELECT 1 FROM audit_logs LIMIT 1');
     } catch (tableError) {
       if (tableError.code === 'ER_NO_SUCH_TABLE' || tableError.message?.includes("doesn't exist")) {
-        return res.status(503).json({ 
+        return res.status(503).json({
           error: 'Audit logs table does not exist. Please run the migration: backend/migrate-audit-logs.sql',
           migration_required: true
         });
