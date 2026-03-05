@@ -6123,11 +6123,17 @@ async function testDatabaseConnection() {
     return true;
   } catch (error) {
     console.error('❌ MySQL connection failed:');
-    console.error(`   Error: ${error.message}`);
+    console.error(`   Error: ${error.message || '(empty)'}`);
+    console.error(`   Code: ${error.code || 'N/A'}`);
+    console.error(`   Errno: ${error.errno || 'N/A'}`);
+    console.error(`   SQLState: ${error.sqlState || 'N/A'}`);
     console.error(`   Host: ${process.env.DB_HOST}:${process.env.DB_PORT}`);
     console.error(`   Database: ${process.env.DB_NAME}`);
     console.error(`   User: ${process.env.DB_USER}`);
-    console.error('\nPlease check your database configuration in .env file.');
+    console.error(`   MYSQL_PRIVATE_URL available: ${!!process.env.MYSQL_PRIVATE_URL}`);
+    console.error(`   MYSQL_URL available: ${!!process.env.MYSQL_URL}`);
+    console.error(`   DATABASE_URL available: ${!!process.env.DATABASE_URL}`);
+    console.error('\nPlease check your database configuration.');
     return false;
   }
 }

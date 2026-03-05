@@ -4,12 +4,16 @@ let pool;
 
 function getPool() {
   if (!pool) {
-    // Railway auto-provides MYSQL_URL / DATABASE_URL with host, port, user, pass, db all included.
-    // Use that if available; fall back to individual env vars.
-    const connectionUri = process.env.MYSQL_URL || process.env.DATABASE_URL;
+    // Railway provides MySQL connection strings under various names.
+    // Try them all. MYSQL_PRIVATE_URL is for internal networking (preferred in Railway).
+    const connectionUri =
+      process.env.MYSQL_PRIVATE_URL ||
+      process.env.MYSQL_URL ||
+      process.env.DATABASE_PRIVATE_URL ||
+      process.env.DATABASE_URL;
 
     if (connectionUri) {
-      console.log('🔧 MySQL pool: using connection string (MYSQL_URL / DATABASE_URL)');
+      console.log('🔧 MySQL pool: using connection string');
       pool = mysql.createPool({
         uri: connectionUri,
         waitForConnections: true,
@@ -21,6 +25,7 @@ function getPool() {
       });
     } else {
       console.log('🔧 MySQL pool: using individual DB_* env vars');
+      console.log(`   DB_HOST=${process.env.DB_HOST}, DB_PORT=${process.env.DB_PORT}, DB_NAME=${process.env.DB_NAME}, DB_USER=${process.env.DB_USER}`);
       pool = mysql.createPool({
         host: process.env.DB_HOST,
         port: parseInt(process.env.DB_PORT, 10) || 3306,
