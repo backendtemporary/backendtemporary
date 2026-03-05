@@ -6267,7 +6267,8 @@ app.get('/api/chat-stream', (req, res) => {
   });
 });
 
-// ── POST message: save to DB, forward to n8n, push response via SSE ──
+// ── POST message: save to DB, fire-and-forget to n8n ──
+// All assistant responses come through POST /api/chat-callback (like Telegram's sendMessage)
 app.post('/api/chat-message', async (req, res) => {
   const { session_id, message_text, timestamp } = req.body;
 
@@ -6286,56 +6287,26 @@ app.post('/api/chat-message', async (req, res) => {
     console.error('[Chat DB] Error persisting user message:', err.message);
   }
 
-  // Forward to n8n
-  try {
-    console.log(`[Chat] Forwarding message to n8n for session: ${session_id}`);
-    const n8nResponse = await fetch(N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id,
-        original_source: 'webapp',
-        message_text,
-        timestamp,
-      }),
-      signal: AbortSignal.timeout(120000), // 2 minute timeout
-    });
-    console.log(`[Chat] n8n responded with status: ${n8nResponse.status}`);
-
-    if (!n8nResponse.ok) {
-      const errText = await n8nResponse.text().catch(() => 'Unknown error');
-      console.error(`[Chat] n8n responded with ${n8nResponse.status}: ${errText}`);
-      const errMsg = `Assistant error (${n8nResponse.status}): ${errText}`;
-      await saveMessage(session_id, 'error', errMsg, new Date().toISOString());
-      pushToSSE(session_id, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
-      return;
-    }
-
-    const contentType = n8nResponse.headers.get('content-type') || '';
-    let responseText;
-
-    if (contentType.includes('application/json')) {
-      const json = await n8nResponse.json();
-      responseText =
-        typeof json === 'string'
-          ? json
-          : json.output || json.message || json.text || json.response || JSON.stringify(json, null, 2);
-    } else {
-      responseText = await n8nResponse.text();
-    }
-
-    // Save assistant response + push via SSE
-    const responseTimestamp = new Date().toISOString();
-    await saveMessage(session_id, 'assistant', responseText, responseTimestamp);
-    pushToSSE(session_id, { type: 'assistant', text: responseText, timestamp: responseTimestamp });
-
-    console.log(`[Chat] Response saved & pushed for session: ${session_id}`);
-  } catch (err) {
+  // Fire-and-forget: forward to n8n, don't process the response
+  // n8n will deliver messages via POST /api/chat-callback (like Telegram's sendMessage)
+  fetch(N8N_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id,
+      original_source: 'webapp',
+      message_text,
+      timestamp,
+    }),
+    signal: AbortSignal.timeout(120000),
+  }).then(resp => {
+    console.log(`[Chat] n8n acknowledged with status: ${resp.status}`);
+  }).catch(err => {
     console.error(`[Chat] Error forwarding to n8n:`, err.message);
     const errMsg = `Failed to reach the assistant: ${err.message}`;
-    await saveMessage(session_id, 'error', errMsg, new Date().toISOString());
+    saveMessage(session_id, 'error', errMsg, new Date().toISOString());
     pushToSSE(session_id, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
-  }
+  });
 });
 
 // ── n8n async callback ──
