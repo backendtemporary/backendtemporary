@@ -6132,6 +6132,255 @@ async function testDatabaseConnection() {
   }
 }
 
+// ============================================
+// SSE CHAT STREAMING + CHAT HISTORY
+// ============================================
+
+const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
+
+// Active SSE connections keyed by session_id
+const sseClients = new Map();
+
+// ── Helper: ensure a conversation row exists, return it ──
+async function ensureConversation(sessionId, firstMessageText = null) {
+  const [existing] = await db.query(
+    'SELECT * FROM chat_conversations WHERE conversation_id = ?', [sessionId]
+  );
+  if (existing.length > 0) return existing[0];
+
+  // Auto-title from first user message (max 60 chars)
+  const title = firstMessageText
+    ? firstMessageText.substring(0, 60) + (firstMessageText.length > 60 ? '…' : '')
+    : 'New Conversation';
+
+  await db.query(
+    'INSERT INTO chat_conversations (conversation_id, title) VALUES (?, ?)',
+    [sessionId, title]
+  );
+  const [created] = await db.query(
+    'SELECT * FROM chat_conversations WHERE conversation_id = ?', [sessionId]
+  );
+  return created[0];
+}
+
+// ── Helper: save a message to DB ──
+async function saveMessage(conversationId, role, text, timestamp) {
+  try {
+    await db.query(
+      'INSERT INTO chat_messages (conversation_id, role, text, timestamp) VALUES (?, ?, ?, ?)',
+      [conversationId, role, text, timestamp || new Date()]
+    );
+    await db.query(
+      'UPDATE chat_conversations SET message_count = message_count + 1, last_message_at = NOW() WHERE conversation_id = ?',
+      [conversationId]
+    );
+  } catch (err) {
+    console.error('[Chat DB] Error saving message:', err.message);
+  }
+}
+
+// Helper: push a message to an SSE client
+function pushToSSE(sessionId, data) {
+  const client = sseClients.get(sessionId);
+  if (client) {
+    client.write(`data: ${JSON.stringify(data)}\n\n`);
+    return true;
+  }
+  console.warn(`[SSE] No client found for session: ${sessionId}`);
+  return false;
+}
+
+// ── SSE: persistent connection ──
+app.get('/api/chat-stream', (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'session_id query parameter required' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  res.write(`data: ${JSON.stringify({ type: 'connected', session_id: sessionId })}\n\n`);
+
+  sseClients.set(sessionId, res);
+  console.log(`[SSE] Client connected: ${sessionId} (total: ${sseClients.size})`);
+
+  const keepalive = setInterval(() => {
+    res.write(': keepalive\n\n');
+  }, 30000);
+
+  req.on('close', () => {
+    clearInterval(keepalive);
+    sseClients.delete(sessionId);
+    console.log(`[SSE] Client disconnected: ${sessionId} (total: ${sseClients.size})`);
+  });
+});
+
+// ── POST message: save to DB, forward to n8n, push response via SSE ──
+app.post('/api/chat-message', async (req, res) => {
+  const { session_id, message_text, timestamp } = req.body;
+
+  if (!session_id || !message_text) {
+    return res.status(400).json({ error: 'session_id and message_text are required' });
+  }
+
+  // Acknowledge receipt immediately
+  res.json({ status: 'sent' });
+
+  // Ensure conversation exists + save user message
+  try {
+    await ensureConversation(session_id, message_text);
+    await saveMessage(session_id, 'user', message_text, timestamp);
+  } catch (err) {
+    console.error('[Chat DB] Error persisting user message:', err.message);
+  }
+
+  // Forward to n8n
+  try {
+    console.log(`[Chat] Forwarding message to n8n for session: ${session_id}`);
+    const n8nResponse = await fetch(N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id,
+        original_source: 'webapp',
+        message_text,
+        timestamp,
+      }),
+    });
+
+    if (!n8nResponse.ok) {
+      const errText = await n8nResponse.text().catch(() => 'Unknown error');
+      console.error(`[Chat] n8n responded with ${n8nResponse.status}: ${errText}`);
+      const errMsg = `Assistant error (${n8nResponse.status}): ${errText}`;
+      await saveMessage(session_id, 'error', errMsg, new Date().toISOString());
+      pushToSSE(session_id, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
+      return;
+    }
+
+    const contentType = n8nResponse.headers.get('content-type') || '';
+    let responseText;
+
+    if (contentType.includes('application/json')) {
+      const json = await n8nResponse.json();
+      responseText =
+        typeof json === 'string'
+          ? json
+          : json.output || json.message || json.text || json.response || JSON.stringify(json, null, 2);
+    } else {
+      responseText = await n8nResponse.text();
+    }
+
+    // Save assistant response + push via SSE
+    const responseTimestamp = new Date().toISOString();
+    await saveMessage(session_id, 'assistant', responseText, responseTimestamp);
+    pushToSSE(session_id, { type: 'assistant', text: responseText, timestamp: responseTimestamp });
+
+    console.log(`[Chat] Response saved & pushed for session: ${session_id}`);
+  } catch (err) {
+    console.error(`[Chat] Error forwarding to n8n:`, err.message);
+    const errMsg = `Failed to reach the assistant: ${err.message}`;
+    await saveMessage(session_id, 'error', errMsg, new Date().toISOString());
+    pushToSSE(session_id, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
+  }
+});
+
+// ── n8n async callback ──
+app.post('/api/chat-callback', async (req, res) => {
+  const { session_id, output, message } = req.body;
+  if (!session_id) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  const text = output || message || '';
+  const ts = new Date().toISOString();
+  await saveMessage(session_id, 'assistant', text, ts);
+  const pushed = pushToSSE(session_id, { type: 'assistant', text, timestamp: ts });
+  res.json({ delivered: pushed });
+});
+
+// ============================================
+// CHAT HISTORY CRUD ENDPOINTS
+// ============================================
+
+// GET /api/chat/conversations — list all, newest first
+app.get('/api/chat/conversations', async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      'SELECT conversation_id, title, created_at, last_message_at, message_count FROM chat_conversations ORDER BY last_message_at DESC'
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[Chat API] Error listing conversations:', err.message);
+    res.status(500).json({ error: 'Failed to list conversations' });
+  }
+});
+
+// GET /api/chat/conversations/:id/messages — get all messages for a conversation
+app.get('/api/chat/conversations/:id/messages', async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      'SELECT message_id, role, text, timestamp FROM chat_messages WHERE conversation_id = ? ORDER BY timestamp ASC',
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[Chat API] Error fetching messages:', err.message);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// DELETE /api/chat/conversations/:id — delete conversation + cascade messages
+app.delete('/api/chat/conversations/:id', async (req, res) => {
+  try {
+    await db.query('DELETE FROM chat_conversations WHERE conversation_id = ?', [req.params.id]);
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('[Chat API] Error deleting conversation:', err.message);
+    res.status(500).json({ error: 'Failed to delete conversation' });
+  }
+});
+
+// PUT /api/chat/conversations/:id — rename conversation
+app.put('/api/chat/conversations/:id', async (req, res) => {
+  try {
+    const { title } = req.body;
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    await db.query('UPDATE chat_conversations SET title = ? WHERE conversation_id = ?', [title, req.params.id]);
+    res.json({ updated: true });
+  } catch (err) {
+    console.error('[Chat API] Error renaming conversation:', err.message);
+    res.status(500).json({ error: 'Failed to rename conversation' });
+  }
+});
+
+// GET /api/chat/search?q=xxx — full-text search across all messages
+app.get('/api/chat/search', async (req, res) => {
+  try {
+    const q = req.query.q;
+    if (!q || q.trim().length < 2) return res.json([]);
+
+    const [rows] = await db.query(
+      `SELECT m.message_id, m.conversation_id, m.role, m.text, m.timestamp,
+              c.title as conversation_title
+       FROM chat_messages m
+       JOIN chat_conversations c ON m.conversation_id = c.conversation_id
+       WHERE MATCH(m.text) AGAINST(? IN NATURAL LANGUAGE MODE)
+       ORDER BY m.timestamp DESC
+       LIMIT 50`,
+      [q.trim()]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[Chat API] Error searching messages:', err.message);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
 // Start server
 (async () => {
   const dbConnected = await testDatabaseConnection();
