@@ -6198,17 +6198,27 @@ async function ensureConversation(sessionId, firstMessageText = null) {
   return created[0];
 }
 
+// ── Helper: convert ISO timestamp to MySQL format ──
+function toMySQLTimestamp(ts) {
+  if (!ts) return new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return new Date().toISOString().slice(0, 19).replace('T', ' ');
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 // ── Helper: save a message to DB ──
 async function saveMessage(conversationId, role, text, timestamp) {
   try {
+    const mysqlTs = toMySQLTimestamp(timestamp);
     await db.query(
       'INSERT INTO chat_messages (conversation_id, role, text, timestamp) VALUES (?, ?, ?, ?)',
-      [conversationId, role, text, timestamp || new Date()]
+      [conversationId, role, text, mysqlTs]
     );
     await db.query(
       'UPDATE chat_conversations SET message_count = message_count + 1, last_message_at = NOW() WHERE conversation_id = ?',
       [conversationId]
     );
+    console.log(`[Chat DB] ✅ Saved ${role} message for ${conversationId}`);
   } catch (err) {
     console.error('[Chat DB] Error saving message:', err.message);
   }
