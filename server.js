@@ -6147,6 +6147,35 @@ const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.rail
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
 
+// Auto-create chat tables if they don't exist
+(async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        conversation_id VARCHAR(100) PRIMARY KEY,
+        title VARCHAR(255) DEFAULT 'New Conversation',
+        message_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        message_id INT AUTO_INCREMENT PRIMARY KEY,
+        conversation_id VARCHAR(100) NOT NULL,
+        role ENUM('user','assistant','error') NOT NULL,
+        text TEXT NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_conv (conversation_id),
+        FOREIGN KEY (conversation_id) REFERENCES chat_conversations(conversation_id) ON DELETE CASCADE
+      )
+    `);
+    console.log('✅ Chat tables verified/created');
+  } catch (err) {
+    console.error('⚠️ Chat table creation error (may already exist with different schema):', err.message);
+  }
+})();
+
 // ── Helper: ensure a conversation row exists, return it ──
 async function ensureConversation(sessionId, firstMessageText = null) {
   const [existing] = await db.query(
@@ -6187,12 +6216,14 @@ async function saveMessage(conversationId, role, text, timestamp) {
 
 // Helper: push a message to an SSE client
 function pushToSSE(sessionId, data) {
+  console.log(`[SSE] Pushing to session ${sessionId}, active clients: ${sseClients.size}, keys: [${[...sseClients.keys()].join(', ')}]`);
   const client = sseClients.get(sessionId);
   if (client) {
     client.write(`data: ${JSON.stringify(data)}\n\n`);
+    console.log(`[SSE] ✅ Pushed ${data.type} message to ${sessionId}`);
     return true;
   }
-  console.warn(`[SSE] No client found for session: ${sessionId}`);
+  console.warn(`[SSE] ❌ No client found for session: ${sessionId}`);
   return false;
 }
 
@@ -6257,7 +6288,9 @@ app.post('/api/chat-message', async (req, res) => {
         message_text,
         timestamp,
       }),
+      signal: AbortSignal.timeout(120000), // 2 minute timeout
     });
+    console.log(`[Chat] n8n responded with status: ${n8nResponse.status}`);
 
     if (!n8nResponse.ok) {
       const errText = await n8nResponse.text().catch(() => 'Unknown error');
