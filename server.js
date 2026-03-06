@@ -6142,7 +6142,7 @@ async function testDatabaseConnection() {
 // SSE CHAT STREAMING + CHAT HISTORY
 // ============================================
 
-const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
+const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook-test/operations-assistant';
 
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
