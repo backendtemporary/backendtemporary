@@ -6142,7 +6142,7 @@ async function testDatabaseConnection() {
 // SSE CHAT STREAMING + CHAT HISTORY
 // ============================================
 
-const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
+const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook-test/operations-assistant';
 
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
@@ -6311,15 +6311,25 @@ app.post('/api/chat-message', async (req, res) => {
 
 // ── n8n async callback ──
 app.post('/api/chat-callback', async (req, res) => {
-  const { session_id, output, message } = req.body;
+  console.log('[Callback] Received body:', JSON.stringify(req.body, null, 2));
+
+  const { session_id, output, message, text: bodyText, response, content } = req.body;
   if (!session_id) {
     return res.status(400).json({ error: 'session_id is required' });
   }
 
-  const text = output || message || '';
+  // Try every possible field name n8n agents might use
+  const text = output || message || bodyText || response || content || '';
+  console.log(`[Callback] session=${session_id}, text="${text.substring(0, 100)}..."`);
+
+  if (!text) {
+    console.warn('[Callback] ⚠️ All text fields are empty! Check n8n HTTP Request body mapping.');
+    console.warn('[Callback] Available keys:', Object.keys(req.body));
+  }
+
   const ts = new Date().toISOString();
-  await saveMessage(session_id, 'assistant', text, ts);
-  const pushed = pushToSSE(session_id, { type: 'assistant', text, timestamp: ts });
+  await saveMessage(session_id, 'assistant', text || '(empty response)', ts);
+  const pushed = pushToSSE(session_id, { type: 'assistant', text: text || '(empty response)', timestamp: ts });
   res.json({ delivered: pushed });
 });
 
