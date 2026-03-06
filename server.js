@@ -6310,6 +6310,8 @@ app.post('/api/chat-message', async (req, res) => {
 });
 
 // ── n8n async callback ──
+// n8n can send { done: false } for intermediate messages and { done: true } (or omit it) for the final message.
+// The frontend uses this flag to keep showing the typing dots until the last message arrives.
 app.post('/api/chat-callback', async (req, res) => {
   console.log('[Callback] Received body:', JSON.stringify(req.body, null, 2));
 
@@ -6327,9 +6329,13 @@ app.post('/api/chat-callback', async (req, res) => {
     console.warn('[Callback] Available keys:', Object.keys(req.body));
   }
 
+  // done flag: defaults to true (backward compatible). n8n sends done:false for intermediate messages.
+  const done = req.body.done !== false;
+  console.log(`[Callback] done=${done}`);
+
   const ts = new Date().toISOString();
   await saveMessage(session_id, 'assistant', text || '(empty response)', ts);
-  const pushed = pushToSSE(session_id, { type: 'assistant', text: text || '(empty response)', timestamp: ts });
+  const pushed = pushToSSE(session_id, { type: 'assistant', text: text || '(empty response)', timestamp: ts, done });
   res.json({ delivered: pushed });
 });
 
