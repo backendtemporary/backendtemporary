@@ -50,6 +50,7 @@ app.get("/api/__prove", (req, res) => {
 // CORS: restrict to the production frontend domain, but allow specific tools like n8n
 const allowedOrigins = [
   'https://depotmanagersystemrisetexcofrontend.pages.dev',
+  'https://operations.risetexco.com',
   'http://localhost:5173'
 ];
 
