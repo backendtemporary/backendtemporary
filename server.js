@@ -47,9 +47,21 @@ app.get("/api/__prove", (req, res) => {
 
 
 // Middleware
-// CORS: permissive config to avoid preflight timeouts in production
+// CORS: restrict to the production frontend domain, but allow specific tools like n8n
+const allowedOrigins = [
+  'https://depotmanagersystemrisetexcofrontend.pages.dev',
+  'http://localhost:5173'
+];
+
 app.use(cors({
-  origin: true,
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests/n8n)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('n8n')) {
+      return callback(null, true);
+    }
+    return callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'), false);
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
