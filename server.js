@@ -3617,7 +3617,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
 
     // Check if we have enough length in color total - use yards as primary
     const currentYards = parseFloat(color.length_yards) || 0;
-    if (currentYards < amountYards) {
+    if (!kgOnly && currentYards < amountYards) {
       await connection.rollback();
       return res.status(400).json({
         error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd`
