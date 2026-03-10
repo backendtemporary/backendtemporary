@@ -3528,16 +3528,22 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
   try {
     const fabricId = parseInt(req.params.fabric_id);
     const colorId = parseInt(req.params.color_id);
-    const { amount_meters, amount_yards, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes, lot_id } = req.body;
+    const { amount_meters, amount_yards, amount_kilograms, roll_count = 0, lot, roll_nb, customer_id, customer_name, notes, lot_id } = req.body;
 
     // Validation
     if (!fabricId || !colorId) {
       return res.status(400).json({ error: 'Invalid fabric_id or color_id' });
     }
 
+    // Parse kilograms (independent unit, no conversion)
+    const amountKilograms = (amount_kilograms !== undefined && amount_kilograms !== null && amount_kilograms !== '' && parseFloat(amount_kilograms) > 0)
+      ? parseFloat(amount_kilograms)
+      : null;
+
     // Calculate amount - prioritize yards as primary unit
     let amountMeters = 0;
     let amountYards = 0;
+    let kgOnly = false;
 
     if (amount_yards !== undefined && amount_yards !== null && amount_yards > 0) {
       // Yards is primary - use it directly and convert to meters for storage
@@ -3547,11 +3553,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       // Fallback to meters if yards not provided
       amountMeters = parseFloat(amount_meters);
       amountYards = amountMeters * 1.0936;
+    } else if (amountKilograms > 0) {
+      // Kilograms-only transaction: set meters/yards to 0 (weight-based, no length deduction)
+      kgOnly = true;
     } else {
-      return res.status(400).json({ error: 'Either amount_meters or amount_yards must be provided' });
+      return res.status(400).json({ error: 'Either amount_meters, amount_yards, or amount_kilograms must be provided' });
     }
 
-    if (isNaN(amountMeters) || amountMeters <= 0 || isNaN(amountYards) || amountYards <= 0) {
+    if (!kgOnly && (isNaN(amountMeters) || amountMeters <= 0 || isNaN(amountYards) || amountYards <= 0)) {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
 
@@ -3711,8 +3720,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       : fabric.fabric_name;
 
     await connection.query(
-      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, finalAmountMeters, finalAmountYards, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
+      'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, amount_kilograms, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, finalAmountMeters, finalAmountYards, amountKilograms, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
 
     await connection.commit();
@@ -4116,9 +4125,10 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
       const conductedByUserId = req.user ? req.user.user_id : null;
       const lotValue = color.lot || src.lot || null;
       const rollNbValue = color.roll_nb || src.roll_nb || null;
+      const returnAmountKilograms = it.return_amount_kilograms != null && it.return_amount_kilograms !== '' ? parseFloat(it.return_amount_kilograms) : null;
       await connection.query(
-        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
+        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, amount_kilograms, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnAmountKilograms, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
       );
     }
 
@@ -6167,9 +6177,11 @@ const sseClients = new Map();
       CREATE TABLE IF NOT EXISTS chat_conversations (
         conversation_id VARCHAR(100) PRIMARY KEY,
         title VARCHAR(255) DEFAULT 'New Conversation',
+        user_id INT NULL,
         message_count INT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user (user_id)
       )
     `);
     await db.query(`
@@ -6189,8 +6201,9 @@ const sseClients = new Map();
   }
 })();
 
+
 // ── Helper: ensure a conversation row exists, return it ──
-async function ensureConversation(sessionId, firstMessageText = null) {
+async function ensureConversation(sessionId, firstMessageText = null, userId = null) {
   const [existing] = await db.query(
     'SELECT * FROM chat_conversations WHERE conversation_id = ?', [sessionId]
   );
@@ -6202,8 +6215,8 @@ async function ensureConversation(sessionId, firstMessageText = null) {
     : 'New Conversation';
 
   await db.query(
-    'INSERT INTO chat_conversations (conversation_id, title) VALUES (?, ?)',
-    [sessionId, title]
+    'INSERT INTO chat_conversations (conversation_id, title, user_id) VALUES (?, ?, ?)',
+    [sessionId, title, userId]
   );
   const [created] = await db.query(
     'SELECT * FROM chat_conversations WHERE conversation_id = ?', [sessionId]
@@ -6250,11 +6263,26 @@ function pushToSSE(sessionId, data) {
   return false;
 }
 
-// ── SSE: persistent connection ──
-app.get('/api/chat-stream', (req, res) => {
+// ── SSE: persistent connection (accepts token as query param since EventSource can't send headers) ──
+app.get('/api/chat-stream', async (req, res) => {
   const sessionId = req.query.session_id;
   if (!sessionId) {
     return res.status(400).json({ error: 'session_id query parameter required' });
+  }
+
+  // Authenticate via query param token (EventSource doesn't support headers)
+  const token = req.query.token;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const [users] = await db.query('SELECT user_id FROM users WHERE user_id = ?', [decoded.userId]);
+      if (users.length > 0) {
+        req.user = users[0];
+      }
+    } catch (e) {
+      // Token invalid — continue without user (backward compatible)
+      console.warn('[SSE] Invalid token provided:', e.message);
+    }
   }
 
   res.writeHead(200, {
@@ -6282,8 +6310,9 @@ app.get('/api/chat-stream', (req, res) => {
 
 // ── POST message: save to DB, fire-and-forget to n8n ──
 // All assistant responses come through POST /api/chat-callback (like Telegram's sendMessage)
-app.post('/api/chat-message', async (req, res) => {
+app.post('/api/chat-message', authMiddleware, async (req, res) => {
   const { session_id, message_text, timestamp } = req.body;
+  const userId = req.user ? req.user.user_id : null;
 
   if (!session_id || !message_text) {
     return res.status(400).json({ error: 'session_id and message_text are required' });
@@ -6294,7 +6323,7 @@ app.post('/api/chat-message', async (req, res) => {
 
   // Ensure conversation exists + save user message
   try {
-    await ensureConversation(session_id, message_text);
+    await ensureConversation(session_id, message_text, userId);
     await saveMessage(session_id, 'user', message_text, timestamp);
   } catch (err) {
     console.error('[Chat DB] Error persisting user message:', err.message);
@@ -6356,11 +6385,13 @@ app.post('/api/chat-callback', async (req, res) => {
 // CHAT HISTORY CRUD ENDPOINTS
 // ============================================
 
-// GET /api/chat/conversations — list all, newest first
-app.get('/api/chat/conversations', async (req, res) => {
+// GET /api/chat/conversations — list user's conversations, newest first
+app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user ? req.user.user_id : null;
     const [rows] = await db.query(
-      'SELECT conversation_id, title, created_at, last_message_at, message_count FROM chat_conversations ORDER BY last_message_at DESC'
+      'SELECT conversation_id, title, created_at, last_message_at, message_count FROM chat_conversations WHERE user_id = ? ORDER BY last_message_at DESC',
+      [userId]
     );
     res.json(rows);
   } catch (err) {
@@ -6369,9 +6400,16 @@ app.get('/api/chat/conversations', async (req, res) => {
   }
 });
 
-// GET /api/chat/conversations/:id/messages — get all messages for a conversation
-app.get('/api/chat/conversations/:id/messages', async (req, res) => {
+// GET /api/chat/conversations/:id/messages — get all messages for a conversation (owned by user)
+app.get('/api/chat/conversations/:id/messages', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user ? req.user.user_id : null;
+    // Verify ownership
+    const [conv] = await db.query(
+      'SELECT conversation_id FROM chat_conversations WHERE conversation_id = ? AND user_id = ?',
+      [req.params.id, userId]
+    );
+    if (conv.length === 0) return res.json([]); // Not found or not owned — return empty
     const [rows] = await db.query(
       'SELECT message_id, role, text, timestamp FROM chat_messages WHERE conversation_id = ? ORDER BY timestamp ASC',
       [req.params.id]
@@ -6383,10 +6421,23 @@ app.get('/api/chat/conversations/:id/messages', async (req, res) => {
   }
 });
 
-// DELETE /api/chat/conversations/:id — delete conversation + cascade messages
-app.delete('/api/chat/conversations/:id', async (req, res) => {
+// DELETE /api/chat/conversations — delete ALL conversations for the authenticated user
+app.delete('/api/chat/conversations', authMiddleware, async (req, res) => {
   try {
-    await db.query('DELETE FROM chat_conversations WHERE conversation_id = ?', [req.params.id]);
+    const userId = req.user ? req.user.user_id : null;
+    const [result] = await db.query('DELETE FROM chat_conversations WHERE user_id = ?', [userId]);
+    res.json({ deleted: true, count: result.affectedRows || 0 });
+  } catch (err) {
+    console.error('[Chat API] Error deleting all conversations:', err.message);
+    res.status(500).json({ error: 'Failed to delete conversations' });
+  }
+});
+
+// DELETE /api/chat/conversations/:id — delete single conversation (owned by user) + cascade messages
+app.delete('/api/chat/conversations/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user ? req.user.user_id : null;
+    await db.query('DELETE FROM chat_conversations WHERE conversation_id = ? AND user_id = ?', [req.params.id, userId]);
     res.json({ deleted: true });
   } catch (err) {
     console.error('[Chat API] Error deleting conversation:', err.message);
@@ -6394,12 +6445,13 @@ app.delete('/api/chat/conversations/:id', async (req, res) => {
   }
 });
 
-// PUT /api/chat/conversations/:id — rename conversation
-app.put('/api/chat/conversations/:id', async (req, res) => {
+// PUT /api/chat/conversations/:id — rename conversation (owned by user)
+app.put('/api/chat/conversations/:id', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user ? req.user.user_id : null;
     const { title } = req.body;
     if (!title) return res.status(400).json({ error: 'title is required' });
-    await db.query('UPDATE chat_conversations SET title = ? WHERE conversation_id = ?', [title, req.params.id]);
+    await db.query('UPDATE chat_conversations SET title = ? WHERE conversation_id = ? AND user_id = ?', [title, req.params.id, userId]);
     res.json({ updated: true });
   } catch (err) {
     console.error('[Chat API] Error renaming conversation:', err.message);
@@ -6407,9 +6459,10 @@ app.put('/api/chat/conversations/:id', async (req, res) => {
   }
 });
 
-// GET /api/chat/search?q=xxx — full-text search across all messages
-app.get('/api/chat/search', async (req, res) => {
+// GET /api/chat/search?q=xxx — full-text search across user's messages
+app.get('/api/chat/search', authMiddleware, async (req, res) => {
   try {
+    const userId = req.user ? req.user.user_id : null;
     const q = req.query.q;
     if (!q || q.trim().length < 2) return res.json([]);
 
@@ -6418,10 +6471,10 @@ app.get('/api/chat/search', async (req, res) => {
               c.title as conversation_title
        FROM chat_messages m
        JOIN chat_conversations c ON m.conversation_id = c.conversation_id
-       WHERE MATCH(m.text) AGAINST(? IN NATURAL LANGUAGE MODE)
+       WHERE c.user_id = ? AND MATCH(m.text) AGAINST(? IN NATURAL LANGUAGE MODE)
        ORDER BY m.timestamp DESC
        LIMIT 50`,
-      [q.trim()]
+      [userId, q.trim()]
     );
     res.json(rows);
   } catch (err) {
