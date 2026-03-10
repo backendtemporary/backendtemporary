@@ -3649,11 +3649,31 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     // Get old record for audit
     const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const oldColorRecord = oldColorRows[0];
+    
+    // Parse the existing weight logic
+    let newWeightStr = oldColorRecord.weight;
+    let oldWeightKg = 0;
+    
+    if (kgOnly && amountKilograms > 0) {
+      if (oldColorRecord.weight && typeof oldColorRecord.weight === 'string') {
+        // Try to extract a number from the string (e.g. "100 kg" -> 100)
+        const match = oldColorRecord.weight.match(/(\d+(\.\d+)?)/);
+        if (match) {
+          oldWeightKg = parseFloat(match[1]);
+          const newWeightKg = Math.max(0, oldWeightKg - amountKilograms);
+          // Preserve anything after the number, like " kg"
+          newWeightStr = oldColorRecord.weight.replace(/(\d+(\.\d+)?)/, newWeightKg.toFixed(2));
+        }
+      } else if (typeof oldColorRecord.weight === 'number') {
+        oldWeightKg = parseFloat(oldColorRecord.weight);
+        newWeightStr = Math.max(0, oldWeightKg - amountKilograms).toString();
+      }
+    }
 
     // Update color (subtract yards directly, convert to meters for storage)
     await connection.query(
-      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = CASE WHEN ? <= 0 THEN 1 ELSE 0 END WHERE color_id = ?',
-      [newMeters, newYards, newRollCount, newMeters, colorId]
+      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, weight = ?, sold = CASE WHEN ? <= 0 AND (weight IS NULL OR weight = \'\' OR CAST(REGEXP_SUBSTR(weight, \'[0-9]+(\\\\.[0-9]+)?\') AS DECIMAL(10,2)) <= 0) THEN 1 ELSE 0 END WHERE color_id = ?',
+      [newMeters, newYards, newRollCount, newWeightStr, newMeters, colorId]
     );
 
     // Get updated record for audit
@@ -3664,7 +3684,8 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     const currentMeters = parseFloat(color.length_meters) || 0;
     const sellMeters = currentMeters - newMeters;
     const sellYards = currentYards - newYards;
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
+    const weightLogText = kgOnly && amountKilograms > 0 ? ` Sold ${amountKilograms}kg of weight.` : '';
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Sold ${sellYards.toFixed(2)}yd/${sellMeters.toFixed(2)}m from color.${weightLogText} | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
 
     // Round to 2 decimals - yards is primary, meters is secondary
     const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : undefined;
@@ -3995,7 +4016,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
         return res.status(400).json({ error: 'Each item must have a valid source_log_id' });
       }
       const [sourceRows] = await connection.query(
-        'SELECT log_id, type, fabric_id, color_id, fabric_name, color_name, amount_meters, amount_yards, roll_count, weight, lot, roll_nb, salesperson_id FROM logs WHERE log_id = ?',
+        'SELECT log_id, type, fabric_id, color_id, fabric_name, color_name, amount_meters, amount_yards, amount_kilograms, roll_count, weight, lot, roll_nb, salesperson_id FROM logs WHERE log_id = ?',
         [sourceLogId]
       );
       if (sourceRows.length === 0) {
@@ -4016,11 +4037,15 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
       const origRollCount = parseInt(src.roll_count) || 0;
       const origYards = src.amount_yards != null && src.amount_yards !== '' ? parseFloat(src.amount_yards) : null;
       const origMeters = src.amount_meters != null && src.amount_meters !== '' ? parseFloat(src.amount_meters) : null;
+      const origKilograms = src.amount_kilograms != null && src.amount_kilograms !== '' ? parseFloat(src.amount_kilograms) : null;
+      
       const yardsBased = origYards != null && !Number.isNaN(origYards) && origYards > 0;
       const metersBased = !yardsBased && origMeters != null && !Number.isNaN(origMeters) && origMeters > 0;
-      if (!yardsBased && !metersBased) {
+      const kgBased = origKilograms != null && !Number.isNaN(origKilograms) && origKilograms > 0;
+      
+      if (!yardsBased && !metersBased && !kgBased) {
         await connection.rollback();
-        return res.status(400).json({ error: `Source log ${sourceLogId} has no valid amount_yards or amount_meters` });
+        return res.status(400).json({ error: `Source log ${sourceLogId} has no valid amount_yards, amount_meters, or amount_kilograms` });
       }
 
       let returnRollCount = it.return_roll_count != null ? parseInt(it.return_roll_count) : 0;
@@ -4051,7 +4076,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
           return res.status(400).json({ error: `return_amount_yards cannot exceed original amount (${origYards}) for source log ${sourceLogId}` });
         }
         returnAmountMeters = returnAmountYards / 1.0936;
-      } else {
+      } else if (metersBased) {
         const raw = it.return_amount_meters;
         if (raw === undefined || raw === null || raw === '') {
           await connection.rollback();
@@ -4068,10 +4093,29 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
         }
         returnAmountYards = returnAmountMeters * 1.0936;
       }
+      
+      let returnAmountKilograms = null;
+      if (kgBased) {
+        const raw = it.return_amount_kilograms;
+        if (raw === undefined || raw === null || raw === '') {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_kilograms is required for source log ${sourceLogId} (kilograms-based sale)` });
+        }
+        returnAmountKilograms = parseFloat(raw);
+        if (Number.isNaN(returnAmountKilograms) || returnAmountKilograms < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'return_amount_kilograms must be a non-negative number' });
+        }
+        if (returnAmountKilograms > origKilograms) {
+          await connection.rollback();
+          return res.status(400).json({ error: `return_amount_kilograms cannot exceed original amount (${origKilograms}) for source log ${sourceLogId}` });
+        }
+      }
       const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
       const finalYards = round2(returnAmountYards);
       const finalMeters = round2(returnAmountMeters);
-      if (finalYards <= 0 && finalMeters <= 0 && returnRollCount === 0) {
+      const finalKilograms = round2(returnAmountKilograms);
+      if (finalYards <= 0 && finalMeters <= 0 && finalKilograms <= 0 && returnRollCount === 0) {
         await connection.rollback();
         return res.status(400).json({ error: `At least one of return amount or return_roll_count must be positive for source log ${sourceLogId}` });
       }
@@ -4095,16 +4139,31 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
       const newMeters = currentMeters + finalMeters;
       const newYards = currentYards + finalYards;
       const newRollCount = currentRollCount + returnRollCount;
+      
+      let newWeightStr = color.weight;
+      if (finalKilograms > 0 && color.weight != null) {
+        if (typeof color.weight === 'string') {
+          const match = color.weight.match(/(\d+(\.\d+)?)/);
+          if (match) {
+            const oldWeightKg = parseFloat(match[1]);
+            const newWeightKg = oldWeightKg + finalKilograms;
+            newWeightStr = color.weight.replace(/(\d+(\.\d+)?)/, newWeightKg.toFixed(2));
+          }
+        } else if (typeof color.weight === 'number') {
+           newWeightStr = (color.weight + finalKilograms).toString();
+        }
+      }
 
       const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
       const oldColorRecord = oldColorRows[0];
       await connection.query(
-        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
-        [newMeters, newYards, newRollCount, colorId]
+        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, weight = ?, sold = 0 WHERE color_id = ?',
+        [newMeters, newYards, newRollCount, newWeightStr, colorId]
       );
       const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
       const newColorRecord = newColorRows[0];
-      await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Partial return: +${finalYards.toFixed(2)}yd / +${returnRollCount} roll(s) | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
+      const returnWeightText = finalKilograms > 0 ? ` +${finalKilograms}kg /` : '';
+      await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Partial return: +${finalYards.toFixed(2)}yd /${returnWeightText} +${returnRollCount} roll(s) | Fabric: ${fabric.fabric_name}, Color: ${color.color_name}`);
 
       await createOrUpdateTransactionGroup(
         connection,
@@ -4125,10 +4184,9 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
       const conductedByUserId = req.user ? req.user.user_id : null;
       const lotValue = color.lot || src.lot || null;
       const rollNbValue = color.roll_nb || src.roll_nb || null;
-      const returnAmountKilograms = it.return_amount_kilograms != null && it.return_amount_kilograms !== '' ? parseFloat(it.return_amount_kilograms) : null;
       await connection.query(
         'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, amount_kilograms, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, returnAmountKilograms, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
+        ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, finalKilograms, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
       );
     }
 
