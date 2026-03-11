@@ -4281,10 +4281,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
 
     const [logs] = await db.query(query, params);
 
-    const r2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
     const formattedLogs = logs.map(log => {
       const am = log.amount_meters ? parseFloat(log.amount_meters) : 0;
       const ay = log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0);
+      const ak = log.amount_kilograms != null ? parseFloat(log.amount_kilograms) : null;
+      const isKgTx = ak != null && !Number.isNaN(ak) && ak > 0;
       return {
         log_id: log.log_id,
         type: log.type,
@@ -4295,10 +4296,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         fabric_name: log.fabric_name,
         color_name: log.color_name,
         customer_name: log.customer_name,
-        amount_meters: r2(am),
-        amount_yards: r2(ay),
-        length_meters: log.type === 'sell' ? r2(am) : null,
-        length_yards: log.type === 'sell' ? r2(ay) : null,
+        amount_meters: isKgTx ? null : r2(am),
+        amount_yards: isKgTx ? null : r2(ay),
+        amount_kilograms: ak,
+        length_meters: log.type === 'sell' ? (isKgTx ? null : r2(am)) : null,
+        length_yards: log.type === 'sell' ? (isKgTx ? null : r2(ay)) : null,
         roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
         lot: log.lot || null,
         roll_nb: log.roll_nb || null,
@@ -4310,6 +4312,8 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         timezone: log.timezone,
         reference_log_id: log.reference_log_id || null,
         transaction_group_id: log.transaction_group_id || null,
+        transaction_type: log.transaction_type || null,
+        permit_number: log.permit_number || null,
         salesperson_id: log.salesperson_id || null,
         salesperson_name: log.salesperson_name || null,
         conducted_by_user_id: log.conducted_by_user_id || null,
@@ -4317,6 +4321,7 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         conducted_by_full_name: log.conducted_by_full_name || null,
         created_at: log.created_at,
         updated_at: log.updated_at,
+        // Camel-case aliases for frontend compatibility
         id: log.log_id,
         rollId: log.roll_id,
         fabricId: log.fabric_id || null,
@@ -4325,9 +4330,6 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
         fabricName: log.fabric_name,
         colorName: log.color_name,
         customerName: log.customer_name,
-        length_meters: log.type === 'sell' ? r2(am) : null,
-        length_yards: log.type === 'sell' ? r2(ay) : null,
-        amount_yards: r2(ay),
         rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : null,
         rollNb: log.roll_nb || null,
         tz: log.timezone,
@@ -4363,8 +4365,12 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
       LEFT JOIN users u ON l.conducted_by_user_id = u.user_id
       WHERE l.log_id = ?
     `, [req.params.id]);
-    if (logs.length > 0) {
+      if (logs.length > 0) {
       const log = logs[0];
+      const ak = log.amount_kilograms != null ? parseFloat(log.amount_kilograms) : null;
+      const isKgTx = ak != null && !Number.isNaN(ak) && ak > 0;
+      const am = isKgTx ? 0 : (log.amount_meters ? parseFloat(log.amount_meters) : 0);
+      const ay = isKgTx ? 0 : (log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0));
       res.json({
         log_id: log.log_id,
         type: log.type,
@@ -4375,7 +4381,9 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         fabric_name: log.fabric_name,
         color_name: log.color_name,
         customer_name: log.customer_name,
-        amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+        amount_meters: isKgTx ? null : am,
+        amount_yards: isKgTx ? null : ay,
+        amount_kilograms: ak,
         is_trimmable: Boolean(log.is_trimmable),
         weight: log.weight,
         notes: log.notes,
@@ -4401,7 +4409,8 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         fabricName: log.fabric_name,
         colorName: log.color_name,
         customerName: log.customer_name,
-        length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
+        length_meters: log.type === 'sell' ? (isKgTx ? null : am) : null,
+        length_yards: log.type === 'sell' ? (isKgTx ? null : ay) : null,
         tz: log.timezone,
         isTrimmable: Boolean(log.is_trimmable),
         referenceLogId: log.reference_log_id || null,
@@ -4411,6 +4420,7 @@ app.get('/api/logs/:id', authMiddleware, async (req, res) => {
         conductedByUserId: log.conducted_by_user_id || null,
         conductedByUserName: log.conducted_by_full_name || log.conducted_by_username || null
       });
+
     } else {
       res.status(404).json({ error: 'Log not found' });
     }
@@ -4450,45 +4460,55 @@ app.get('/api/transaction-groups/:transaction_group_id', authMiddleware, async (
     );
 
     // Format logs
-    const formattedLogs = logs.map(log => ({
-      log_id: log.log_id,
-      type: log.type,
-      roll_id: log.roll_id,
-      fabric_id: log.fabric_id || null,
-      color_id: log.color_id || null,
-      customer_id: log.customer_id || null,
-      fabric_name: log.fabric_name,
-      color_name: log.color_name,
-      customer_name: log.customer_name,
-      main_code: log.fabric_main_code || null,
-      amount_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      amount_yards: log.amount_yards ? parseFloat(log.amount_yards) : (log.amount_meters ? parseFloat(log.amount_meters) * 1.0936 : 0),
-      roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
-      is_trimmable: Boolean(log.is_trimmable),
-      weight: log.weight,
-      notes: log.notes,
-      timestamp: log.timestamp,
-      epoch: log.epoch,
-      timezone: log.timezone,
-      transaction_group_id: log.transaction_group_id || null,
-      created_at: log.created_at,
-      updated_at: log.updated_at,
-      // compatibility aliases
-      id: log.log_id,
-      rollId: log.roll_id,
-      fabricId: log.fabric_id || null,
-      colorId: log.color_id || null,
-      customerId: log.customer_id || null,
-      fabricName: log.fabric_name,
-      colorName: log.color_name,
-      customerName: log.customer_name,
-      mainCode: log.fabric_main_code || null,
-      length_meters: log.amount_meters ? parseFloat(log.amount_meters) : 0,
-      rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
-      tz: log.timezone,
-      isTrimmable: Boolean(log.is_trimmable),
-      transactionGroupId: log.transaction_group_id || null
-    }));
+    const formattedLogs = logs.map(log => {
+      const ak = log.amount_kilograms != null ? parseFloat(log.amount_kilograms) : null;
+      const isKgTx = ak != null && !Number.isNaN(ak) && ak > 0;
+      const am = isKgTx ? 0 : (log.amount_meters ? parseFloat(log.amount_meters) : 0);
+      const ay = isKgTx ? 0 : (log.amount_yards ? parseFloat(log.amount_yards) : (am ? am * 1.0936 : 0));
+      return {
+        log_id: log.log_id,
+        type: log.type,
+        roll_id: log.roll_id,
+        fabric_id: log.fabric_id || null,
+        color_id: log.color_id || null,
+        customer_id: log.customer_id || null,
+        fabric_name: log.fabric_name,
+        color_name: log.color_name,
+        customer_name: log.customer_name,
+        main_code: log.fabric_main_code || null,
+        amount_meters: isKgTx ? null : am,
+        amount_yards: isKgTx ? null : ay,
+        amount_kilograms: ak,
+        roll_count: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
+        is_trimmable: Boolean(log.is_trimmable),
+        lot: log.lot || null,
+        roll_nb: log.roll_nb || null,
+        weight: log.weight,
+        notes: log.notes,
+        timestamp: log.timestamp,
+        epoch: log.epoch,
+        timezone: log.timezone,
+        transaction_group_id: log.transaction_group_id || null,
+        created_at: log.created_at,
+        updated_at: log.updated_at,
+        // compatibility aliases
+        id: log.log_id,
+        rollId: log.roll_id,
+        fabricId: log.fabric_id || null,
+        colorId: log.color_id || null,
+        customerId: log.customer_id || null,
+        fabricName: log.fabric_name,
+        colorName: log.color_name,
+        customerName: log.customer_name,
+        mainCode: log.fabric_main_code || null,
+        length_meters: isKgTx ? null : am,
+        rollCount: log.roll_count !== undefined && log.roll_count !== null ? parseInt(log.roll_count) : 0,
+        tz: log.timezone,
+        isTrimmable: Boolean(log.is_trimmable),
+        transactionGroupId: log.transaction_group_id || null
+      };
+    });
+
 
     // Return transaction group with items
     res.json({
