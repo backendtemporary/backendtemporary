@@ -4276,10 +4276,11 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
       query += ' AND l.amount_meters <= ?';
       params.push(parseFloat(maxLength));
     }
-
     query += ' ORDER BY l.epoch DESC, l.log_id DESC';
 
     const [logs] = await db.query(query, params);
+
+    const r2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
 
     const formattedLogs = logs.map(log => {
       const am = log.amount_meters ? parseFloat(log.amount_meters) : 0;
