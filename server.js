@@ -2301,9 +2301,12 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     }
 
     if (date !== undefined) {
-      const rollDate = date ? String(date).trim() : null;
-      updates.push('date = ?');
-      values.push(rollDate);
+      if (date && String(date).trim() !== '') {
+        const rollDate = String(date).trim();
+        updates.push('date = ?');
+        values.push(rollDate);
+      }
+      // If date is an empty string, we explicitly do NOT push to updates so it preserves the existing DB value.
     }
 
     if (weight !== undefined) {
@@ -3670,10 +3673,24 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       }
     }
 
+    // Determine the newly sold state
+    // If length <= 0 AND weight <= 0, mark as sold
+    let newSoldStatus = 0;
+    if (newMeters <= 0) {
+      if (!newWeightStr || newWeightStr === 'N/A' || newWeightStr === '') {
+        newSoldStatus = 1;
+      } else {
+         const match = String(newWeightStr).match(/(\d+(\.\d+)?)/);
+         if (!match || parseFloat(match[1]) <= 0) {
+           newSoldStatus = 1;
+         }
+      }
+    }
+
     // Update color (subtract yards directly, convert to meters for storage)
     await connection.query(
-      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, weight = ?, sold = CASE WHEN ? <= 0 AND (weight IS NULL OR weight = \'\' OR CAST(REGEXP_SUBSTR(weight, \'[0-9]+(\\\\.[0-9]+)?\') AS DECIMAL(10,2)) <= 0) THEN 1 ELSE 0 END WHERE color_id = ?',
-      [newMeters, newYards, newRollCount, newWeightStr, newMeters, colorId]
+      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, weight = ?, sold = ? WHERE color_id = ?',
+      [newMeters, newYards, newRollCount, newWeightStr, newSoldStatus, colorId]
     );
 
     // Get updated record for audit
