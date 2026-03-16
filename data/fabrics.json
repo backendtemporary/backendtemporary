@@ -1,0 +1,205 @@
+[
+  {
+    "fabric_name": "Couture Tulle",
+    "fabric_code": "FAB-001",
+    "source": "Italy",
+    "design": "none",
+    "colors": [
+      {
+        "id": "FAB-001-COL-001",
+        "color_name": "Ivory",
+        "rolls": []
+      },
+      {
+        "id": "FAB-001-COL-002",
+        "color_name": "White",
+        "rolls": [
+          {
+            "id": "FAB-001-COL-002-ROL-001",
+            "date": "2026-01-03",
+            "length_meters": 55,
+            "length_yards": 60.15,
+            "isTrimmable": true,
+            "weight": "N/A"
+          }
+        ]
+      },
+      {
+        "id": "FAB-001-COL-003",
+        "color_name": "Champagne",
+        "rolls": [
+          {
+            "id": "FAB-001-COL-003-ROL-001",
+            "date": "2025-12-27",
+            "length_meters": 275.8,
+            "length_yards": 301.63,
+            "isTrimmable": false,
+            "weight": "25.5"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "fabric_name": "Silk Chiffon",
+    "fabric_code": "FAB-002",
+    "source": "France",
+    "design": "none",
+    "colors": [
+      {
+        "id": "FAB-002-COL-001",
+        "color_name": "Blush",
+        "rolls": []
+      },
+      {
+        "id": "FAB-002-COL-002",
+        "color_name": "Navy",
+        "rolls": [
+          {
+            "id": "FAB-002-COL-002-ROL-001",
+            "date": "2025-12-24",
+            "length_meters": 210.5,
+            "length_yards": 230.23,
+            "isTrimmable": true,
+            "weight": "18.7"
+          }
+        ]
+      },
+      {
+        "id": "FAB-002-COL-003",
+        "color_name": "Emerald",
+        "rolls": []
+      }
+    ]
+  },
+  {
+    "fabric_name": "Cotton Canvas",
+    "fabric_code": "FAB-003",
+    "source": "USA",
+    "design": "none",
+    "colors": [
+      {
+        "id": "FAB-003-COL-001",
+        "color_name": "Natural",
+        "rolls": [
+          {
+            "id": "FAB-003-COL-001-ROL-001",
+            "date": "2025-12-30",
+            "length_meters": 100,
+            "length_yards": 109.36099999999999,
+            "isTrimmable": true,
+            "weight": "N/A"
+          },
+          {
+            "id": "FAB-003-COL-001-ROL-002",
+            "date": "2025-12-22",
+            "length_meters": 89.4,
+            "length_yards": 97.77,
+            "isTrimmable": true,
+            "weight": "34.2"
+          }
+        ]
+      },
+      {
+        "id": "FAB-003-COL-002",
+        "color_name": "Charcoal",
+        "rolls": [
+          {
+            "id": "FAB-003-COL-002-ROL-001",
+            "date": "2025-12-21",
+            "length_meters": 125.6,
+            "length_yards": 137.36,
+            "isTrimmable": true,
+            "weight": "N/A"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "fabric_name": "Velvet Luxe",
+    "fabric_code": "FAB-004",
+    "source": "Belgium",
+    "design": "none",
+    "colors": [
+      {
+        "id": "FAB-004-COL-001",
+        "color_name": "Burgundy",
+        "rolls": [
+          {
+            "id": "FAB-004-COL-001-ROL-001",
+            "date": "2025-12-20",
+            "length_meters": 78.5,
+            "length_yards": 85.85,
+            "isTrimmable": true,
+            "weight": "42.1"
+          }
+        ]
+      },
+      {
+        "id": "FAB-004-COL-002",
+        "color_name": "Royal Blue",
+        "rolls": [
+          {
+            "id": "FAB-004-COL-002-ROL-001",
+            "date": "2025-12-19",
+            "length_meters": 112.3,
+            "length_yards": 122.81240299999999,
+            "isTrimmable": true,
+            "weight": "N/A"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "fabric_name": "Linen Blend",
+    "fabric_code": "FAB-005",
+    "source": "Portugal",
+    "design": "herringbone",
+    "colors": [
+      {
+        "id": "FAB-005-COL-001",
+        "color_name": "Sand",
+        "rolls": [
+          {
+            "id": "FAB-005-COL-001-ROL-001",
+            "date": "2025-12-18",
+            "length_meters": 195.7,
+            "length_yards": 214.02,
+            "isTrimmable": true,
+            "weight": "28.9"
+          }
+        ]
+      },
+      {
+        "id": "FAB-005-COL-002",
+        "color_name": "Slate",
+        "rolls": [
+          {
+            "id": "FAB-005-COL-002-ROL-001",
+            "date": "2025-12-17",
+            "length_meters": 142.9,
+            "length_yards": 156.3,
+            "isTrimmable": true,
+            "weight": "19.6"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "fabric_name": "Mikado Foil",
+    "fabric_code": "FAB-006",
+    "source": "China",
+    "design": "none",
+    "notes": "",
+    "colors": [
+      {
+        "id": "FAB-006-COL-001",
+        "color_name": "Beige",
+        "rolls": []
+      }
+    ]
+  }
+]

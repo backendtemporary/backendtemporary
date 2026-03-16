@@ -22,6 +22,9 @@ function getPool() {
         connectTimeout: 30000,
         enableKeepAlive: true,
         keepAliveInitialDelay: 10000,
+        ssl: {
+          rejectUnauthorized: false
+        }
       });
     } else {
       console.log('🔧 MySQL pool: using individual DB_* env vars');
@@ -35,9 +38,12 @@ function getPool() {
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0,
-        connectTimeout: 30000,
+        connectTimeout: 60000, // Increased for stability
         enableKeepAlive: true,
         keepAliveInitialDelay: 10000,
+        ssl: {
+          rejectUnauthorized: false
+        }
       });
     }
   }

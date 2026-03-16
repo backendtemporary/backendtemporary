@@ -10,8 +10,6 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import db from './db.js';
 
-import pool from "./db.js";
-
 // Validate required environment variables
 // DB_PORT optional (defaults to 3306 in db.js)
 const requiredEnvVars = ['PORT', 'DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET'];
@@ -4753,6 +4751,21 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
   }
 });
 
+// GET /api/transaction-groups/check-permit/:permitNumber - Check if permit number exists
+app.get('/api/transaction-groups/check-permit/:permitNumber', authMiddleware, async (req, res) => {
+  try {
+    const { permitNumber } = req.params;
+    const [rows] = await db.query(
+      'SELECT transaction_group_id FROM transaction_groups WHERE permit_number = ? LIMIT 1',
+      [permitNumber.trim()]
+    );
+    res.json({ exists: rows.length > 0 });
+  } catch (error) {
+    console.error('Error checking permit number:', error);
+    res.status(500).json({ error: 'Failed to check permit number' });
+  }
+});
+
 app.post('/api/logs', authMiddleware, async (req, res) => {
   try {
     const entry = req.body || {};
@@ -6231,44 +6244,16 @@ if (fs.existsSync(FRONTEND_DIST)) {
   console.warn('frontend/dist not found. Run the frontend build to serve the UI.');
 }
 
-// Test MySQL connection before starting server
-async function testDatabaseConnection() {
+// Initialize database (sequential checks)
+async function initDatabase() {
   try {
     console.log('🔌 Testing MySQL connection...');
     const connection = await db.getConnection();
     await connection.ping();
     connection.release();
     console.log('✅ MySQL connection successful');
-    return true;
-  } catch (error) {
-    console.error('❌ MySQL connection failed:');
-    console.error(`   Error: ${error.message || '(empty)'}`);
-    console.error(`   Code: ${error.code || 'N/A'}`);
-    console.error(`   Errno: ${error.errno || 'N/A'}`);
-    console.error(`   SQLState: ${error.sqlState || 'N/A'}`);
-    console.error(`   Host: ${process.env.DB_HOST}:${process.env.DB_PORT}`);
-    console.error(`   Database: ${process.env.DB_NAME}`);
-    console.error(`   User: ${process.env.DB_USER}`);
-    console.error(`   MYSQL_PRIVATE_URL available: ${!!process.env.MYSQL_PRIVATE_URL}`);
-    console.error(`   MYSQL_URL available: ${!!process.env.MYSQL_URL}`);
-    console.error(`   DATABASE_URL available: ${!!process.env.DATABASE_URL}`);
-    console.error('\nPlease check your database configuration.');
-    return false;
-  }
-}
 
-// ============================================
-// SSE CHAT STREAMING + CHAT HISTORY
-// ============================================
-
-const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
-
-// Active SSE connections keyed by session_id
-const sseClients = new Map();
-
-// Auto-create chat tables if they don't exist
-(async () => {
-  try {
+    console.log('📦 Initializing chat tables...');
     await db.query(`
       CREATE TABLE IF NOT EXISTS chat_conversations (
         conversation_id VARCHAR(100) PRIMARY KEY,
@@ -6292,10 +6277,28 @@ const sseClients = new Map();
       )
     `);
     console.log('✅ Chat tables verified/created');
-  } catch (err) {
-    console.error('⚠️ Chat table creation error (may already exist with different schema):', err.message);
+    return true;
+  } catch (error) {
+    console.error('❌ Database initialization failed:');
+    console.error(`   Error: ${error.message || '(empty)'}`);
+    console.error(`   Code: ${error.code || 'N/A'}`);
+    console.error(`   Errno: ${error.errno || 'N/A'}`);
+    console.error(`   SQLState: ${error.sqlState || 'N/A'}`);
+    console.error(`   Host: ${process.env.DB_HOST}:${process.env.DB_PORT}`);
+    console.error(`   Database: ${process.env.DB_NAME}`);
+    console.error(`   User: ${process.env.DB_USER}`);
+    console.error(`   MYSQL_PRIVATE_URL available: ${!!process.env.MYSQL_PRIVATE_URL}`);
+    console.error(`   MYSQL_URL available: ${!!process.env.MYSQL_URL}`);
+    console.error(`   DATABASE_URL available: ${!!process.env.DATABASE_URL}`);
+    console.error('\nPlease check your database configuration.');
+    return false;
   }
-})();
+}
+
+const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
+
+// Active SSE connections keyed by session_id
+const sseClients = new Map();
 
 
 // ── Helper: ensure a conversation row exists, return it ──
@@ -6581,9 +6584,9 @@ app.get('/api/chat/search', authMiddleware, async (req, res) => {
 
 // Start server
 (async () => {
-  const dbConnected = await testDatabaseConnection();
-  if (!dbConnected) {
-    console.error('❌ Server startup aborted due to database connection failure.');
+  const dbReady = await initDatabase();
+  if (!dbReady) {
+    console.error('❌ Server startup aborted due to database initialization failure.');
     process.exit(1);
   }
 
