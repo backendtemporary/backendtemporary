@@ -38,12 +38,9 @@ function getPool() {
         waitForConnections: true,
         connectionLimit: 10,
         queueLimit: 0,
-        connectTimeout: 60000, // Increased for stability
+        connectTimeout: 60000,
         enableKeepAlive: true,
         keepAliveInitialDelay: 10000,
-        ssl: {
-          rejectUnauthorized: false
-        }
       });
     }
   }
