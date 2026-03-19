@@ -2590,13 +2590,14 @@ async function addMetersToColorHandler(req, res) {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb, update_initial_to_match } = req.body;
+    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb, update_initial_to_match, roll_count } = req.body;
 
     const lenM = parseFloat(length_meters);
     const lenY = parseFloat(length_yards);
     if (isNaN(lenM) || lenM < 0 || isNaN(lenY) || lenY < 0) {
       return res.status(400).json({ error: 'Valid length in meters and yards is required' });
     }
+    const addedRolls = parseInt(roll_count) > 0 ? parseInt(roll_count) : 0;
 
     await connection.beginTransaction();
 
@@ -2635,29 +2636,31 @@ async function addMetersToColorHandler(req, res) {
     const updateInitial = update_initial_to_match === true || update_initial_to_match === 'true';
     if (updateInitial) {
       await connection.query(
-        `UPDATE colors 
-         SET length_meters = ?, 
-             length_yards = ?, 
-             initial_length_meters = ?, 
+        `UPDATE colors
+         SET length_meters = ?,
+             length_yards = ?,
+             initial_length_meters = ?,
              initial_length_yards = ?,
+             roll_count = roll_count + ?,
              date = COALESCE(?, date),
              weight = COALESCE(?, weight),
              lot = COALESCE(?, lot),
              roll_nb = COALESCE(?, roll_nb)
          WHERE color_id = ?`,
-        [newMeters, newYards, newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
+        [newMeters, newYards, newMeters, newYards, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
       );
     } else {
       await connection.query(
-        `UPDATE colors 
-         SET length_meters = ?, 
-             length_yards = ?, 
+        `UPDATE colors
+         SET length_meters = ?,
+             length_yards = ?,
+             roll_count = roll_count + ?,
              date = COALESCE(?, date),
              weight = COALESCE(?, weight),
              lot = COALESCE(?, lot),
              roll_nb = COALESCE(?, roll_nb)
          WHERE color_id = ?`,
-        [newMeters, newYards, rollDate, weight || null, lotValue, rollNbValue, colorId]
+        [newMeters, newYards, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
       );
     }
 
@@ -2667,7 +2670,8 @@ async function addMetersToColorHandler(req, res) {
 
     // Log audit entry for length addition (include fabric/color for clarity)
     const addMetersCtx = await getColorFabricNames(colorId, connection);
-    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m to color | Fabric: ${addMetersCtx.fabric_name}, Color: ${addMetersCtx.color_name}`);
+    const rollsNote = addedRolls > 0 ? `, +${addedRolls} roll(s)` : '';
+    await logUpdate('colors', colorId, req.user, oldColorRecord, newColorRecord, req, `Added ${lenY}yd/${lenM}m${rollsNote} to color | Fabric: ${addMetersCtx.fabric_name}, Color: ${addMetersCtx.color_name}`);
 
     await connection.commit();
 
@@ -3916,6 +3920,171 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     await connection.rollback();
     console.error('Error selling color:', error);
     res.status(500).json({ error: error.message || 'Failed to sell color' });
+  } finally {
+    connection.release();
+  }
+});
+
+// POST /api/transactions/sell-batch - Atomically sell multiple items.
+// Phase 1 (inside transaction): lock + validate ALL items — zero writes.
+// Phase 2 (inside same transaction): write everything only after all checks pass.
+// Any failure in either phase rolls back the entire transaction.
+app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const {
+      items,
+      transaction_group_id,
+      customer_id,
+      customer_name,
+      notes,
+      salesperson_id,
+      transaction_type = 'A',
+      epoch,
+      transaction_date,
+    } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items must be a non-empty array' });
+    }
+
+    const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
+
+    // Resolve epoch/timestamp once for the whole batch
+    let transactionEpoch = epoch ?? null;
+    if (transaction_date && (transactionEpoch == null || transactionEpoch === '')) {
+      const dateStr = typeof transaction_date === 'string' ? transaction_date.trim() : '';
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        const derived = dateStringToEpochBeirut(dateStr);
+        if (!Number.isNaN(derived)) transactionEpoch = derived;
+      }
+    }
+    const hasUserDate = transaction_date || (transactionEpoch != null && transactionEpoch !== '');
+    const now = hasUserDate && transactionEpoch != null && transactionEpoch !== ''
+      ? { iso: epochToDateStringBeirut(Number(transactionEpoch)) + 'T00:00:00', epoch: Number(transactionEpoch), tz: 'Asia/Beirut' }
+      : getLebanonTimestamp();
+
+    const conductedByUserId = req.user ? req.user.user_id : null;
+    const txGroupId = transaction_group_id || `txn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    await connection.beginTransaction();
+
+    // ── PHASE 1: Validate every item — lock rows, check amounts, collect computed values ──
+    // Zero writes happen here. If anything is wrong we abort before touching inventory.
+    const validated = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const fabricId = parseInt(item.fabric_id);
+      const colorId  = parseInt(item.color_id);
+
+      if (!fabricId || !colorId) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Item ${i + 1}: invalid fabric_id or color_id` });
+      }
+
+      let amountYards, amountMeters;
+      if (parseFloat(item.amount_yards) > 0) {
+        amountYards  = round2(parseFloat(item.amount_yards));
+        amountMeters = round2(amountYards / 1.0936);
+      } else if (parseFloat(item.amount_meters) > 0) {
+        amountMeters = round2(parseFloat(item.amount_meters));
+        amountYards  = round2(amountMeters * 1.0936);
+      } else {
+        await connection.rollback();
+        return res.status(400).json({ error: `Item ${i + 1}: amount must be > 0` });
+      }
+
+      // Lock the color row (FOR UPDATE prevents concurrent sells from racing)
+      const color = await getColorForTransaction(connection, fabricId, colorId);
+      if (!color) {
+        await connection.rollback();
+        return res.status(404).json({ error: `Item ${i + 1}: color not found (fabric ${fabricId}, color ${colorId})` });
+      }
+
+      const [fabricRows] = await connection.query(
+        'SELECT fabric_name, design FROM fabrics WHERE fabric_id = ?', [fabricId]
+      );
+      if (fabricRows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({ error: `Item ${i + 1}: fabric ${fabricId} not found` });
+      }
+      const fabric = fabricRows[0];
+      const fabricNameForLog = fabric.design && fabric.design !== 'none'
+        ? `${fabric.fabric_name} [${fabric.design}]`
+        : fabric.fabric_name;
+
+      const currentYards     = parseFloat(color.length_yards) || 0;
+      const currentRollCount = parseInt(color.roll_count) || 0;
+      const sellRollCount    = parseInt(item.roll_count) || 0;
+
+      if (currentYards < amountYards) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `${fabric.fabric_name} / ${color.color_name}: not enough stock — have ${currentYards.toFixed(2)} yd, need ${amountYards.toFixed(2)} yd`
+        });
+      }
+      if (sellRollCount > 0 && sellRollCount > currentRollCount) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `${fabric.fabric_name} / ${color.color_name}: not enough rolls — have ${currentRollCount}, need ${sellRollCount}`
+        });
+      }
+
+      // Pre-compute everything we need for the write phase
+      const newYards     = round2(currentYards - amountYards);
+      const newMeters    = round2(newYards / 1.0936);
+      const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+
+      validated.push({
+        fabricId, colorId, fabricNameForLog,
+        colorName: color.color_name,
+        amountYards, amountMeters, sellRollCount,
+        newYards, newMeters, newRollCount,
+        newSold: newYards <= 0 ? 1 : 0,
+        oldColorSnapshot: color, // already fetched above — used for audit
+      });
+    }
+
+    // ── PHASE 2: All items valid — now write everything ──
+    // Pre-compute totals so we can create the transaction_group row FIRST,
+    // satisfying the FK constraint on logs.transaction_group_id.
+    const batchTotalYards  = round2(validated.reduce((s, v) => s + v.amountYards,  0));
+    const batchTotalMeters = round2(validated.reduce((s, v) => s + v.amountMeters, 0));
+
+    await createOrUpdateTransactionGroup(
+      connection, txGroupId, customer_id, customer_name, notes,
+      batchTotalMeters, transaction_type, transactionEpoch, transaction_date,
+      batchTotalYards, conductedByUserId
+    );
+
+    for (const v of validated) {
+      // Snapshot before for audit (re-read to get full row)
+      const [oldRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [v.colorId]);
+
+      await connection.query(
+        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = ? WHERE color_id = ?',
+        [v.newMeters, v.newYards, v.newRollCount, v.newSold, v.colorId]
+      );
+
+      const [newRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [v.colorId]);
+      await logUpdate(
+        'colors', v.colorId, req.user, oldRows[0], newRows[0], req,
+        `Sold ${v.amountYards.toFixed(2)}yd/${v.amountMeters.toFixed(2)}m | Fabric: ${v.fabricNameForLog}, Color: ${v.colorName}`
+      );
+
+      await connection.query(
+        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['sell', v.fabricId, v.colorId, v.fabricNameForLog, v.colorName, customer_id || null, customer_name || null, v.amountMeters, v.amountYards, v.sellRollCount, notes || null, now.iso, now.epoch, now.tz, txGroupId, salesperson_id || null, conductedByUserId]
+      );
+    }
+
+    await connection.commit();
+    res.json({ success: true, transaction_group_id: txGroupId });
+
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error in sell-batch:', error);
+    res.status(500).json({ error: error.message || 'Failed to process batch transaction' });
   } finally {
     connection.release();
   }
@@ -5282,13 +5451,13 @@ app.put('/api/transaction-groups/:transaction_group_id/permit-number', authMiddl
   }
 });
 
-// PUT /api/transaction-groups/:transaction_group_id - Update transaction group attributes (admin only)
-// Accepts: customer_id, customer_name, epoch, notes
-app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, requireRole('admin'), async (req, res) => {
+// PUT /api/transaction-groups/:transaction_group_id - Update transaction group attributes (manager/ceo/admin)
+// Accepts: customer_id, customer_name, epoch, notes, transaction_type (type change: manager/ceo/admin only)
+app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, requireRole('admin', 'ceo', 'manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const transactionGroupId = req.params.transaction_group_id;
-    const { customer_id, customer_name, epoch, notes } = req.body || {};
+    const { customer_id, customer_name, epoch, notes, transaction_type } = req.body || {};
 
     // Get current group
     const [groups] = await connection.query(
@@ -5331,6 +5500,14 @@ app.put('/api/transaction-groups/:transaction_group_id', authMiddleware, require
     if (notes !== undefined) {
       fields.push('notes = ?');
       values.push(notes || null);
+    }
+    if (transaction_type !== undefined) {
+      if (!['A', 'B'].includes(transaction_type)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'transaction_type must be A or B' });
+      }
+      fields.push('transaction_type = ?');
+      values.push(transaction_type);
     }
 
     if (fields.length === 0) {
