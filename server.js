@@ -4410,6 +4410,26 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
       sourceLogMap[log.log_id] = log;
     }
 
+    // Fetch already-returned amounts for each source log (partial return tracking)
+    const [alreadyReturnedRows] = await db.query(
+      `SELECT reference_log_id,
+              COALESCE(SUM(amount_yards), 0) AS returned_yards,
+              COALESCE(SUM(amount_meters), 0) AS returned_meters,
+              COALESCE(SUM(roll_count), 0) AS returned_rolls
+       FROM logs
+       WHERE reference_log_id IN (${placeholders}) AND type = 'return'
+       GROUP BY reference_log_id`,
+      logIds
+    );
+    const alreadyReturnedMap = {};
+    for (const row of alreadyReturnedRows) {
+      alreadyReturnedMap[row.reference_log_id] = {
+        yards: parseFloat(row.returned_yards) || 0,
+        meters: parseFloat(row.returned_meters) || 0,
+        rolls: parseInt(row.returned_rolls) || 0,
+      };
+    }
+
     // Validate each item
     for (const it of items) {
       const src = sourceLogMap[it.log_id];
@@ -4426,10 +4446,15 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
         return res.status(400).json({ error: `Log ${it.log_id} has no fabric_id or color_id` });
       }
 
-      // Validate return amounts do not exceed original amounts
+      // Validate return amounts do not exceed remaining returnable amounts
       const origMeters = src.amount_meters != null ? parseFloat(src.amount_meters) : 0;
       const origYards = src.amount_yards != null ? parseFloat(src.amount_yards) : 0;
       const origRollCount = parseInt(src.roll_count) || 0;
+
+      const prevReturned = alreadyReturnedMap[it.log_id] || { yards: 0, meters: 0, rolls: 0 };
+      const returnableMeters = Math.max(0, origMeters - prevReturned.meters);
+      const returnableYards = Math.max(0, origYards - prevReturned.yards);
+      const returnableRolls = Math.max(0, origRollCount - prevReturned.rolls);
 
       const retMeters = it.amount_meters != null ? parseFloat(it.amount_meters) : 0;
       const retYards = it.amount_yards != null ? parseFloat(it.amount_yards) : 0;
@@ -4444,14 +4469,14 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
       if (Number.isNaN(retRollCount) || retRollCount < 0) {
         return res.status(400).json({ error: `Invalid roll_count for log ${it.log_id}` });
       }
-      if (retMeters > origMeters + 0.005) {
-        return res.status(400).json({ error: `Return amount_meters (${retMeters}) exceeds original (${origMeters}) for log ${it.log_id}` });
+      if (retMeters > returnableMeters + 0.005) {
+        return res.status(400).json({ error: `Return amount_meters (${retMeters}) exceeds remaining returnable (${returnableMeters.toFixed(2)}) for log ${it.log_id}` });
       }
-      if (retYards > origYards + 0.005) {
-        return res.status(400).json({ error: `Return amount_yards (${retYards}) exceeds original (${origYards}) for log ${it.log_id}` });
+      if (retYards > returnableYards + 0.005) {
+        return res.status(400).json({ error: `Return amount_yards (${retYards}) exceeds remaining returnable (${returnableYards.toFixed(2)}) for log ${it.log_id}` });
       }
-      if (retRollCount > origRollCount) {
-        return res.status(400).json({ error: `Return roll_count (${retRollCount}) exceeds original (${origRollCount}) for log ${it.log_id}` });
+      if (retRollCount > returnableRolls) {
+        return res.status(400).json({ error: `Return roll_count (${retRollCount}) exceeds remaining returnable (${returnableRolls}) for log ${it.log_id}` });
       }
       if (retMeters <= 0 && retYards <= 0 && retRollCount === 0) {
         return res.status(400).json({ error: `At least one of amount_meters, amount_yards, or roll_count must be positive for log ${it.log_id}` });
@@ -4800,6 +4825,58 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error fetching logs:', error);
     res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// GET /api/logs/:logId/return-status - Returns how much of a sell log has already been returned
+app.get('/api/logs/:logId/return-status', authMiddleware, async (req, res) => {
+  try {
+    const logId = parseInt(req.params.logId);
+    if (isNaN(logId)) return res.status(400).json({ error: 'Invalid log ID' });
+
+    // Fetch original log
+    const [logs] = await db.query(
+      'SELECT log_id, type, amount_yards, amount_meters, roll_count FROM logs WHERE log_id = ?',
+      [logId]
+    );
+    if (logs.length === 0) return res.status(404).json({ error: 'Log not found' });
+    const log = logs[0];
+    if (log.type !== 'sell') return res.status(400).json({ error: 'Log is not a sell log' });
+
+    // Fetch sum of already-returned amounts
+    const [returnedRows] = await db.query(
+      `SELECT COALESCE(SUM(amount_yards), 0) AS returned_yards,
+              COALESCE(SUM(amount_meters), 0) AS returned_meters,
+              COALESCE(SUM(roll_count), 0) AS returned_rolls,
+              COUNT(*) AS return_count
+       FROM logs WHERE reference_log_id = ? AND type = 'return'`,
+      [logId]
+    );
+    const ret = returnedRows[0];
+    const origYards = parseFloat(log.amount_yards) || 0;
+    const origMeters = parseFloat(log.amount_meters) || 0;
+    const origRolls = parseInt(log.roll_count) || 0;
+    const returnedYards = parseFloat(ret.returned_yards) || 0;
+    const returnedMeters = parseFloat(ret.returned_meters) || 0;
+    const returnedRolls = parseInt(ret.returned_rolls) || 0;
+
+    return res.json({
+      log_id: logId,
+      original_yards: origYards,
+      original_meters: origMeters,
+      original_rolls: origRolls,
+      returned_yards: returnedYards,
+      returned_meters: returnedMeters,
+      returned_rolls: returnedRolls,
+      returnable_yards: Math.max(0, origYards - returnedYards),
+      returnable_meters: Math.max(0, origMeters - returnedMeters),
+      returnable_rolls: Math.max(0, origRolls - returnedRolls),
+      return_count: parseInt(ret.return_count) || 0,
+      fully_returned: returnedYards >= origYards - 0.005 && origYards > 0,
+    });
+  } catch (err) {
+    console.error('Error fetching return status:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -7682,6 +7759,98 @@ app.get('/api/chat/search', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[Chat API] Error searching messages:', err.message);
     res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ─── Transaction Drafts ────────────────────────────────────────────────────────
+
+// GET /api/drafts — list current user's drafts (newest first)
+app.get('/api/drafts', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const [rows] = await db.query(
+      'SELECT draft_id, name, created_at, updated_at, JSON_LENGTH(JSON_EXTRACT(form_data, "$.fabricBlocks")) AS fabric_count FROM transaction_drafts WHERE user_id = ? ORDER BY updated_at DESC',
+      [userId]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error('Error fetching drafts:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/drafts — create a new draft
+app.post('/api/drafts', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { name, form_data } = req.body;
+    if (!form_data) return res.status(400).json({ error: 'form_data is required' });
+    const [result] = await db.query(
+      'INSERT INTO transaction_drafts (user_id, name, form_data) VALUES (?, ?, ?)',
+      [userId, name || null, JSON.stringify(form_data)]
+    );
+    const [rows] = await db.query(
+      'SELECT draft_id, name, created_at, updated_at FROM transaction_drafts WHERE draft_id = ?',
+      [result.insertId]
+    );
+    return res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating draft:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/drafts/:id — get full form_data for a single draft
+app.get('/api/drafts/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const [rows] = await db.query(
+      'SELECT draft_id, name, form_data, created_at, updated_at FROM transaction_drafts WHERE draft_id = ? AND user_id = ?',
+      [req.params.id, userId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Draft not found' });
+    const row = rows[0];
+    return res.json({ ...row, form_data: typeof row.form_data === 'string' ? JSON.parse(row.form_data) : row.form_data });
+  } catch (err) {
+    console.error('Error fetching draft:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT /api/drafts/:id — update draft name and/or form_data
+app.put('/api/drafts/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const { name, form_data } = req.body;
+    const [check] = await db.query(
+      'SELECT draft_id FROM transaction_drafts WHERE draft_id = ? AND user_id = ?',
+      [req.params.id, userId]
+    );
+    if (check.length === 0) return res.status(404).json({ error: 'Draft not found' });
+    await db.query(
+      'UPDATE transaction_drafts SET name = ?, form_data = ? WHERE draft_id = ?',
+      [name !== undefined ? (name || null) : null, JSON.stringify(form_data), req.params.id]
+    );
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error updating draft:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/drafts/:id — delete a draft
+app.delete('/api/drafts/:id', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const [result] = await db.query(
+      'DELETE FROM transaction_drafts WHERE draft_id = ? AND user_id = ?',
+      [req.params.id, userId]
+    );
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Draft not found' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error deleting draft:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
