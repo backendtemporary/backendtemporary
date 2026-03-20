@@ -5565,6 +5565,45 @@ app.get('/api/transaction-groups/check-permit/:permitNumber', authMiddleware, as
   }
 });
 
+// DELETE /api/transaction-groups/:transaction_group_id - Hard delete (admin only, no inventory restore)
+app.delete('/api/transaction-groups/:transaction_group_id', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { transaction_group_id } = req.params;
+
+    const [groups] = await connection.query(
+      'SELECT * FROM transaction_groups WHERE transaction_group_id = ?',
+      [transaction_group_id]
+    );
+    if (groups.length === 0) {
+      return res.status(404).json({ error: 'Transaction group not found' });
+    }
+
+    await connection.beginTransaction();
+
+    // Delete all logs belonging to this transaction group
+    await connection.query(
+      'DELETE FROM logs WHERE transaction_group_id = ?',
+      [transaction_group_id]
+    );
+
+    // Delete the transaction group itself
+    await connection.query(
+      'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
+      [transaction_group_id]
+    );
+
+    await connection.commit();
+    res.json({ success: true, message: 'Transaction group and all associated logs permanently deleted' });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error deleting transaction group:', error);
+    res.status(500).json({ error: 'Failed to delete transaction group' });
+  } finally {
+    connection.release();
+  }
+});
+
 app.post('/api/logs', authMiddleware, async (req, res) => {
   try {
     const entry = req.body || {};
@@ -7994,7 +8033,7 @@ app.get('/api/drafts/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// PUT /api/drafts/:id — update draft name and/or form_data
+// PUT /api/drafts/:id — update draft name and/or form_data (each field optional)
 app.put('/api/drafts/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.user_id;
@@ -8004,10 +8043,15 @@ app.put('/api/drafts/:id', authMiddleware, async (req, res) => {
       [req.params.id, userId]
     );
     if (check.length === 0) return res.status(404).json({ error: 'Draft not found' });
-    await db.query(
-      'UPDATE transaction_drafts SET name = ?, form_data = ? WHERE draft_id = ?',
-      [name !== undefined ? (name || null) : null, JSON.stringify(form_data), req.params.id]
-    );
+
+    const fields = [];
+    const values = [];
+    if (name !== undefined) { fields.push('name = ?'); values.push(name || null); }
+    if (form_data !== undefined) { fields.push('form_data = ?'); values.push(JSON.stringify(form_data)); }
+    if (fields.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+
+    values.push(req.params.id);
+    await db.query(`UPDATE transaction_drafts SET ${fields.join(', ')} WHERE draft_id = ?`, values);
     return res.json({ ok: true });
   } catch (err) {
     console.error('Error updating draft:', err);
