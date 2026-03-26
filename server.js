@@ -2188,6 +2188,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
       lot,
       roll_nb,
       roll_count,
+      initial_roll_count,
       lots  // Array of lots: [{ lot_number, length_meters, length_yards, date, weight, roll_nb }]
     } = req.body;
 
@@ -2267,12 +2268,15 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
 
     // Insert color with roll attributes
     const rollCountValue = parseInt(roll_count) || 0;
+    const initialRollCountValue = (initial_roll_count !== undefined && initial_roll_count !== null)
+      ? parseInt(initial_roll_count)
+      : rollCountValue;
     // Set initial length if this is the first length (non-zero)
     const initialLenM = (lenM > 0) ? lenM : null;
     const initialLenY = (lenY > 0) ? lenY : null;
     const userId = req.user ? req.user.user_id : null;
     const [result] = await connection.query(
-      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, status, sold, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO colors (fabric_id, color_name, length_meters, length_yards, initial_length_meters, initial_length_yards, date, weight, lot, roll_nb, roll_count, initial_roll_count, status, sold, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         fabricId,
         color_name.trim(),
@@ -2285,6 +2289,7 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
         lotValue,
         rollNbValue,
         rollCountValue,
+        initialRollCountValue,
         'available',
         0,
         userId
@@ -2519,7 +2524,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         await connection.rollback();
         return res.status(403).json({ error: 'Only admins can update initial values' });
       }
-      if (initial_length_meters !== undefined) {
+      if (initial_length_meters !== undefined && initial_length_meters !== null) {
         const initM = parseFloat(initial_length_meters);
         if (isNaN(initM) || initM < 0) {
           await connection.rollback();
@@ -2529,7 +2534,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         values.push(initM);
         newInitM = initM;
       }
-      if (initial_length_yards !== undefined) {
+      if (initial_length_yards !== undefined && initial_length_yards !== null) {
         const initY = parseFloat(initial_length_yards);
         if (isNaN(initY) || initY < 0) {
           await connection.rollback();
