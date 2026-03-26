@@ -2358,6 +2358,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       initial_length_yards,   // Admin only (or with update_initial_to_match)
       update_initial_to_match, // Manager/admin only when setting length
       new_initial_roll_count,  // Optional: set initial_roll_count when updating initial
+      initial_roll_count,      // Admin only: direct set of initial_roll_count
     } = req.body;
 
     await connection.beginTransaction();
@@ -2512,11 +2513,11 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         }
       }
     }
-    // Allow admins to update initial_length explicitly (admin only). Constraint: initial >= current length.
-    else if (initial_length_meters !== undefined || initial_length_yards !== undefined) {
+    // Allow admins to update initial values explicitly (admin only). Constraint: initial length >= current length.
+    else if (initial_length_meters !== undefined || initial_length_yards !== undefined || initial_roll_count !== undefined) {
       if (req.user.role !== 'admin') {
         await connection.rollback();
-        return res.status(403).json({ error: 'Only admins can update initial length' });
+        return res.status(403).json({ error: 'Only admins can update initial values' });
       }
       if (initial_length_meters !== undefined) {
         const initM = parseFloat(initial_length_meters);
@@ -2537,6 +2538,15 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         updates.push('initial_length_yards = ?');
         values.push(initY);
         newInitY = initY;
+      }
+      if (initial_roll_count !== undefined && initial_roll_count !== null) {
+        const initRolls = parseInt(initial_roll_count);
+        if (isNaN(initRolls) || initRolls < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'Invalid initial_roll_count' });
+        }
+        updates.push('initial_roll_count = ?');
+        values.push(initRolls);
       }
     }
 
