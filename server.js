@@ -2548,6 +2548,24 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         updates.push('initial_roll_count = ?');
         values.push(initRolls);
       }
+
+      // Recalculate current stock: new current = new initial − total sold from logs
+      if (newInitY !== null) {
+        const [soldRows] = await connection.query(
+          `SELECT COALESCE(SUM(amount_yards), 0) AS total_sold_yards
+           FROM logs WHERE color_id = ? AND type IN ('sell', 'trim')`,
+          [colorId]
+        );
+        const totalSoldYards = parseFloat(soldRows[0].total_sold_yards) || 0;
+        const recalcY = Math.max(0, Math.round((newInitY - totalSoldYards) * 100) / 100);
+        const recalcM = Math.round(recalcY * 0.9144 * 100) / 100;
+        updates.push('length_yards = ?');
+        values.push(recalcY);
+        updates.push('length_meters = ?');
+        values.push(recalcM);
+        newLenY = recalcY;
+        newLenM = recalcM;
+      }
     }
 
     // Enforce: current length cannot exceed initial. Use effective new length/initial.
