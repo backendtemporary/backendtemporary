@@ -560,6 +560,7 @@ const buildFabricColorAggregatedStructure = async () => {
         lot: color.lot || null,
         roll_nb: color.roll_nb || null,
         roll_count: parseInt(color.roll_count) || 0,
+        initial_roll_count: color.initial_roll_count != null ? parseInt(color.initial_roll_count) : null,
         status: color.status || 'available',
         sold: Boolean(color.sold),
         created_by_username: color.created_by_username,
