@@ -27,8 +27,7 @@ import { basename, extname, resolve } from 'path';
 // CONFIGURATION
 // ============================================
 
-const WEBHOOK_URL =
-    'https://risetexco-data-analyst-agent-production.up.railway.app/webhook-test/operations-assistant';
+const WEBHOOK_URL = process.env.N8N_WEBHOOK_TEST_URL;
 
 // ============================================
 // MULTIPART FORM-DATA BUILDER (zero dependencies)

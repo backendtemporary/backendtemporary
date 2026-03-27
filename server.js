@@ -1109,7 +1109,7 @@ app.post('/api/auth/register', async (req, res) => {
       try {
         const token = req.headers.authorization?.split(' ')[1];
         if (token) {
-          const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret-key');
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
           const [adminCheck] = await db.query('SELECT role FROM users WHERE user_id = ?', [decoded.userId]);
           if (adminCheck.length === 0 || !hasMinRole(adminCheck[0].role, role === 'admin' ? 'admin' : 'ceo')) {
             return res.status(403).json({ error: `Only ${role === 'admin' ? 'admins' : 'admins or CEOs'} can create ${role} accounts` });
@@ -7761,7 +7761,7 @@ async function initDatabase() {
   }
 }
 
-const N8N_WEBHOOK_URL = 'https://risetexco-data-analyst-agent-production.up.railway.app/webhook/operations-assistant';
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
@@ -7917,30 +7917,37 @@ app.post('/api/chat-message', authMiddleware, async (req, res) => {
 });
 
 // ── n8n async callback ──
-// n8n can send { done: false } for intermediate messages and { done: true } (or omit it) for the final message.
-// The frontend uses this flag to keep showing the typing dots until the last message arrives.
+// n8n sends:
+//   { session_id, type: 'thought', text: '...', done: false }  → ephemeral reasoning line, not persisted
+//   { session_id, type: 'assistant', text: '...', done: true }  → final answer, saved to DB
+// type defaults to 'assistant' for backward compatibility.
 app.post('/api/chat-callback', async (req, res) => {
   console.log('[Callback] Received body:', JSON.stringify(req.body, null, 2));
 
-  const { session_id, output, message, text: bodyText, response, content } = req.body;
+  const { session_id, output, message, text: bodyText, response, content, type: bodyType } = req.body;
   if (!session_id) {
     return res.status(400).json({ error: 'session_id is required' });
   }
 
-  // Try every possible field name n8n agents might use
+  const type = bodyType || 'assistant'; // default to 'assistant' for backward compat
   const text = output || message || bodyText || response || content || '';
-  console.log(`[Callback] session=${session_id}, text="${text.substring(0, 100)}..."`);
+  const ts = new Date().toISOString();
 
+  console.log(`[Callback] session=${session_id}, type=${type}, text="${text.substring(0, 80)}..."`);
+
+  // Thought events: push to SSE only — never persist to DB
+  if (type === 'thought') {
+    const pushed = pushToSSE(session_id, { type: 'thought', text, timestamp: ts, done: false });
+    return res.json({ delivered: pushed });
+  }
+
+  // Final assistant answer — persist then push
   if (!text) {
     console.warn('[Callback] ⚠️ All text fields are empty! Check n8n HTTP Request body mapping.');
     console.warn('[Callback] Available keys:', Object.keys(req.body));
   }
 
-  // done flag: defaults to true (backward compatible). n8n sends done:false for intermediate messages.
-  const done = req.body.done !== false;
-  console.log(`[Callback] done=${done}`);
-
-  const ts = new Date().toISOString();
+  const done = req.body.done !== false; // defaults to true
   await saveMessage(session_id, 'assistant', text || '(empty response)', ts);
   const pushed = pushToSSE(session_id, { type: 'assistant', text: text || '(empty response)', timestamp: ts, done });
   res.json({ delivered: pushed });
