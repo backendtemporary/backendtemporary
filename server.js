@@ -7761,7 +7761,7 @@ async function initDatabase() {
   }
 }
 
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_TEST_URL;
 
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
