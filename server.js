@@ -49,7 +49,8 @@ app.get("/api/__prove", (req, res) => {
 const allowedOrigins = [
   'https://depotmanagersystemrisetexcofrontend.pages.dev',
   'https://operations.risetexco.com',
-  'http://localhost:5173'
+  'http://localhost:5173',
+  'http://localhost:5174'
 ];
 
 app.use(cors({
