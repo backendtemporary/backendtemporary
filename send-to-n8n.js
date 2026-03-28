@@ -27,7 +27,7 @@ import { basename, extname, resolve } from 'path';
 // CONFIGURATION
 // ============================================
 
-const WEBHOOK_URL = process.env.N8N_WEBHOOK_TEST_URL;
+const WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
 // ============================================
 // MULTIPART FORM-DATA BUILDER (zero dependencies)
