@@ -3767,11 +3767,15 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     let amountYards = 0;
     let kgOnly = false;
 
-    if (amount_yards !== undefined && amount_yards !== null && amount_yards > 0) {
+    // Check if user has a privileged role (manager/ceo/admin) to allow negative stock
+    const userRole = req.user?.role;
+    const isPrivilegedSell = hasMinRole(userRole, 'manager');
+
+    if (amount_yards !== undefined && amount_yards !== null && parseFloat(amount_yards) !== 0) {
       // Yards is primary - use it directly and convert to meters for storage
       amountYards = parseFloat(amount_yards);
       amountMeters = amountYards / 1.0936;
-    } else if (amount_meters !== undefined && amount_meters !== null && amount_meters > 0) {
+    } else if (amount_meters !== undefined && amount_meters !== null && parseFloat(amount_meters) !== 0) {
       // Fallback to meters if yards not provided
       amountMeters = parseFloat(amount_meters);
       amountYards = amountMeters * 1.0936;
@@ -3782,8 +3786,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(400).json({ error: 'Either amount_meters, amount_yards, or amount_kilograms must be provided' });
     }
 
-    if (!kgOnly && (isNaN(amountMeters) || amountMeters <= 0 || isNaN(amountYards) || amountYards <= 0)) {
-      return res.status(400).json({ error: 'Amount must be a positive number' });
+    // Block negative amounts for non-privileged roles
+    if (!kgOnly && amountYards < 0 && !isPrivilegedSell) {
+      return res.status(403).json({ error: 'Negative quantities are not allowed for your role.' });
+    }
+    if (!kgOnly && amountYards > 0 && (isNaN(amountMeters) || isNaN(amountYards))) {
+      return res.status(400).json({ error: 'Amount must be a valid number' });
     }
 
     await connection.beginTransaction();
@@ -3840,10 +3848,19 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     // Check if we have enough length in color total - use yards as primary
     const currentYards = parseFloat(color.length_yards) || 0;
     if (!kgOnly && currentYards < amountYards) {
-      await connection.rollback();
-      return res.status(400).json({
-        error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd`
-      });
+      if (!isPrivilegedSell) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `Insufficient inventory. Available: ${currentYards.toFixed(2)}yd, Requested: ${amountYards.toFixed(2)}yd`
+        });
+      }
+      // Privileged role: allow negative stock but require a note
+      if (!notes || !notes.trim()) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: 'A note is required when selling more than available stock (will result in negative inventory).'
+        });
+      }
     }
 
     // Calculate new length - use yards as primary for calculation
@@ -3861,10 +3878,18 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       : (parseInt(color.roll_count) || 0);
     const sellRollCount = parseInt(roll_count) || 0;
     if (sellRollCount > 0 && sellRollCount > currentRollCount) {
-      await connection.rollback();
-      return res.status(400).json({
-        error: `Insufficient rolls. Available: ${currentRollCount}, Requested: ${sellRollCount}`
-      });
+      if (!isPrivilegedSell) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: `Insufficient rolls. Available: ${currentRollCount}, Requested: ${sellRollCount}`
+        });
+      }
+      if (!notes || !notes.trim()) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: 'A note is required when selling more rolls than available (will result in negative roll count).'
+        });
+      }
     }
     const newRollCount = Math.max(0, currentRollCount - sellRollCount);
 
@@ -4054,15 +4079,26 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       }
 
       let amountYards, amountMeters;
-      if (parseFloat(item.amount_yards) > 0) {
-        amountYards  = round2(parseFloat(item.amount_yards));
+      const parsedYards = parseFloat(item.amount_yards);
+      const parsedMeters = parseFloat(item.amount_meters);
+
+      if (!isNaN(parsedYards) && parsedYards !== 0) {
+        amountYards  = round2(parsedYards);
         amountMeters = round2(amountYards / 1.0936);
-      } else if (parseFloat(item.amount_meters) > 0) {
-        amountMeters = round2(parseFloat(item.amount_meters));
+      } else if (!isNaN(parsedMeters) && parsedMeters !== 0) {
+        amountMeters = round2(parsedMeters);
         amountYards  = round2(amountMeters * 1.0936);
       } else {
         await connection.rollback();
-        return res.status(400).json({ error: `Item ${i + 1}: amount must be > 0` });
+        return res.status(400).json({ error: `Item ${i + 1}: amount must be non-zero` });
+      }
+
+      // Block negative amounts for non-privileged roles (accountant)
+      const userRole = req.user?.role;
+      const isPrivileged = hasMinRole(userRole, 'manager');
+      if (amountYards < 0 && !isPrivileged) {
+        await connection.rollback();
+        return res.status(403).json({ error: `Item ${i + 1}: negative quantities are not allowed for your role.` });
       }
 
       // Lock the color row (FOR UPDATE prevents concurrent sells from racing)
@@ -4089,16 +4125,34 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       const sellRollCount    = parseInt(item.roll_count) || 0;
 
       if (currentYards < amountYards) {
-        await connection.rollback();
-        return res.status(400).json({
-          error: `${fabric.fabric_name} / ${color.color_name}: not enough stock — have ${currentYards.toFixed(2)} yd, need ${amountYards.toFixed(2)} yd`
-        });
+        if (!isPrivileged) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: not enough stock — have ${currentYards.toFixed(2)} yd, need ${amountYards.toFixed(2)} yd`
+          });
+        }
+        // Privileged role: allow negative stock but require a per-item note
+        if (!item.notes || !item.notes.trim()) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more than available stock (will result in negative inventory).`
+          });
+        }
       }
       if (sellRollCount > 0 && sellRollCount > currentRollCount) {
-        await connection.rollback();
-        return res.status(400).json({
-          error: `${fabric.fabric_name} / ${color.color_name}: not enough rolls — have ${currentRollCount}, need ${sellRollCount}`
-        });
+        if (!isPrivileged) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: not enough rolls — have ${currentRollCount}, need ${sellRollCount}`
+          });
+        }
+        // Privileged role: allow negative rolls but require a per-item note
+        if (!item.notes || !item.notes.trim()) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more rolls than available (have ${currentRollCount}, need ${sellRollCount}).`
+          });
+        }
       }
 
       // Pre-compute everything we need for the write phase
@@ -4113,6 +4167,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         newYards, newMeters, newRollCount,
         newSold: newYards <= 0 ? 1 : 0,
         oldColorSnapshot: color, // already fetched above — used for audit
+        itemNotes: item.notes?.trim() || null, // per-item note (required for negative stock)
       });
     }
 
@@ -4143,9 +4198,12 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         `Sold ${v.amountYards.toFixed(2)}yd/${v.amountMeters.toFixed(2)}m | Fabric: ${v.fabricNameForLog}, Color: ${v.colorName}`
       );
 
+      // Use per-item notes if provided (required for negative stock entries), fall back to group notes
+      const logNotes = v.itemNotes || notes || null;
+
       await connection.query(
         'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['sell', v.fabricId, v.colorId, v.fabricNameForLog, v.colorName, customer_id || null, customer_name || null, v.amountMeters, v.amountYards, v.sellRollCount, notes || null, now.iso, now.epoch, now.tz, txGroupId, salesperson_id || null, conductedByUserId]
+        ['sell', v.fabricId, v.colorId, v.fabricNameForLog, v.colorName, customer_id || null, customer_name || null, v.amountMeters, v.amountYards, v.sellRollCount, logNotes, now.iso, now.epoch, now.tz, txGroupId, salesperson_id || null, conductedByUserId]
       );
     }
 
@@ -7764,6 +7822,25 @@ async function initDatabase() {
 
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 
+const ROLE_PERMISSIONS = {
+  admin: {
+    inventory: true, sales: true, customers: true,
+    audit_logs: true, cancellation_requests: true, deletion_requests: true, user_management: true
+  },
+  ceo: {
+    inventory: true, sales: true, customers: true,
+    audit_logs: true, cancellation_requests: true, deletion_requests: true, user_management: true
+  },
+  manager: {
+    inventory: true, sales: true, customers: true,
+    audit_logs: false, cancellation_requests: true, deletion_requests: true, user_management: false
+  },
+  accountant: {
+    inventory: true, sales: true, customers: true,
+    audit_logs: false, cancellation_requests: false, deletion_requests: false, user_management: false
+  }
+};
+
 // Active SSE connections keyed by session_id
 const sseClients = new Map();
 
@@ -7901,10 +7978,11 @@ app.post('/api/chat-message', authMiddleware, async (req, res) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      message: message_text,
       session_id,
-      original_source: 'webapp',
-      message_text,
-      timestamp,
+      role: req.user.role,
+      user_name: req.user.full_name || req.user.username,
+      permissions: ROLE_PERMISSIONS[req.user.role]
     }),
     signal: AbortSignal.timeout(120000),
   }).then(resp => {
