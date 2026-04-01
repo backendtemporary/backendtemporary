@@ -7995,6 +7995,211 @@ app.post('/api/chat-message', authMiddleware, async (req, res) => {
   });
 });
 
+// ── POST edit message: create a new branch from a parent message ──
+app.post('/api/chat-message/edit', authMiddleware, async (req, res) => {
+  const { conversation_id, parent_message_id, message_text } = req.body;
+  const userId = req.user ? req.user.user_id : null;
+
+  if (!conversation_id || !message_text) {
+    return res.status(400).json({ error: 'conversation_id and message_text are required' });
+  }
+
+  try {
+    // Verify ownership
+    const [conv] = await db.query(
+      'SELECT conversation_id FROM chat_conversations WHERE conversation_id = ? AND user_id = ?',
+      [conversation_id, userId]
+    );
+    if (conv.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // 1. Get max branch_index for this parent_message_id in this conversation
+    const parentId = parent_message_id != null ? parent_message_id : null;
+    const [maxRows] = await db.query(
+      'SELECT MAX(branch_index) AS max_idx FROM chat_messages WHERE conversation_id = ? AND parent_message_id <=> ?',
+      [conversation_id, parentId]
+    );
+    const newBranchIndex = (maxRows[0].max_idx != null ? maxRows[0].max_idx : -1) + 1;
+
+    // 2. Deactivate all messages after the parent message's position in the conversation
+    if (parentId != null) {
+      // Get the parent message's timestamp
+      const [parentMsg] = await db.query(
+        'SELECT timestamp FROM chat_messages WHERE message_id = ? AND conversation_id = ?',
+        [parentId, conversation_id]
+      );
+      if (parentMsg.length > 0) {
+        await db.query(
+          'UPDATE chat_messages SET is_active_branch = 0 WHERE conversation_id = ? AND timestamp > ?',
+          [conversation_id, parentMsg[0].timestamp]
+        );
+      }
+    } else {
+      // Editing from the very beginning — deactivate all messages
+      await db.query(
+        'UPDATE chat_messages SET is_active_branch = 0 WHERE conversation_id = ?',
+        [conversation_id]
+      );
+    }
+
+    // 3. Insert the new user message with branching info
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const [insertResult] = await db.query(
+      `INSERT INTO chat_messages (conversation_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch)
+       VALUES (?, 'user', ?, ?, ?, ?, 1)`,
+      [conversation_id, message_text, now, parentId, newBranchIndex]
+    );
+    const messageId = insertResult.insertId;
+
+    // Update conversation metadata
+    await db.query(
+      'UPDATE chat_conversations SET message_count = message_count + 1, last_message_at = NOW() WHERE conversation_id = ?',
+      [conversation_id]
+    );
+
+    // 4. Generate branch-specific session_id for n8n
+    const branchSessionId = `${conversation_id}_b${newBranchIndex}`;
+
+    // 5. Fire-and-forget: forward to n8n with the branch session_id
+    fetch(N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: message_text,
+        session_id: branchSessionId,
+        role: req.user.role,
+        user_name: req.user.full_name || req.user.username,
+        permissions: ROLE_PERMISSIONS[req.user.role]
+      }),
+      signal: AbortSignal.timeout(120000),
+    }).then(resp => {
+      console.log(`[Chat Branch] n8n acknowledged with status: ${resp.status}`);
+    }).catch(err => {
+      console.error(`[Chat Branch] Error forwarding to n8n:`, err.message);
+      const errMsg = `Failed to reach the assistant: ${err.message}`;
+      // Save error with branching info
+      db.query(
+        `INSERT INTO chat_messages (conversation_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch)
+         VALUES (?, 'error', ?, ?, ?, ?, 1)`,
+        [conversation_id, errMsg, new Date().toISOString().slice(0, 19).replace('T', ' '), messageId, newBranchIndex]
+      ).catch(e => console.error('[Chat Branch DB] Error saving error message:', e.message));
+      pushToSSE(branchSessionId, { type: 'error', text: errMsg, timestamp: new Date().toISOString() });
+    });
+
+    console.log(`[Chat Branch] Created branch ${newBranchIndex} for conversation ${conversation_id}, parent=${parentId}, message_id=${messageId}`);
+
+    res.json({
+      status: 'sent',
+      message_id: messageId,
+      branch_index: newBranchIndex,
+      session_id: branchSessionId
+    });
+  } catch (err) {
+    console.error('[Chat Branch] Error:', err.message);
+    res.status(500).json({ error: 'Failed to create branch' });
+  }
+});
+
+// ── PUT switch branch ──
+app.put('/api/chat/branch/switch', authMiddleware, async (req, res) => {
+  const { conversation_id, parent_message_id, branch_index } = req.body;
+  const userId = req.user ? req.user.user_id : null;
+
+  if (!conversation_id || branch_index == null) {
+    return res.status(400).json({ error: 'conversation_id and branch_index are required' });
+  }
+
+  try {
+    // Verify ownership
+    const [conv] = await db.query(
+      'SELECT conversation_id FROM chat_conversations WHERE conversation_id = ? AND user_id = ?',
+      [conversation_id, userId]
+    );
+    if (conv.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const parentId = parent_message_id != null ? parent_message_id : null;
+
+    // 1. Set all sibling messages at this branch point to inactive
+    await db.query(
+      'UPDATE chat_messages SET is_active_branch = 0 WHERE conversation_id = ? AND parent_message_id <=> ?',
+      [conversation_id, parentId]
+    );
+
+    // 2. Activate the selected branch message
+    await db.query(
+      'UPDATE chat_messages SET is_active_branch = 1 WHERE conversation_id = ? AND parent_message_id <=> ? AND branch_index = ?',
+      [conversation_id, parentId, branch_index]
+    );
+
+    // 3. Get the activated message's id to follow its descendant chain
+    const [activatedRows] = await db.query(
+      'SELECT message_id FROM chat_messages WHERE conversation_id = ? AND parent_message_id <=> ? AND branch_index = ? LIMIT 1',
+      [conversation_id, parentId, branch_index]
+    );
+
+    if (activatedRows.length > 0) {
+      // Deactivate all descendants of all siblings at this branch point first
+      // Get timestamp of the branch point to deactivate everything after it
+      if (parentId != null) {
+        const [parentMsg] = await db.query(
+          'SELECT timestamp FROM chat_messages WHERE message_id = ?',
+          [parentId]
+        );
+        if (parentMsg.length > 0) {
+          // Deactivate everything after parent (except the one we just activated)
+          await db.query(
+            'UPDATE chat_messages SET is_active_branch = 0 WHERE conversation_id = ? AND timestamp > ? AND NOT (parent_message_id <=> ? AND branch_index = ?)',
+            [conversation_id, parentMsg[0].timestamp, parentId, branch_index]
+          );
+        }
+      } else {
+        // Branch point is at root — deactivate everything except the selected root branch
+        await db.query(
+          'UPDATE chat_messages SET is_active_branch = 0 WHERE conversation_id = ? AND NOT (parent_message_id IS NULL AND branch_index = ?)',
+          [conversation_id, branch_index]
+        );
+      }
+
+      // 4. Iteratively activate the descendant chain of the selected branch
+      let currentMessageId = activatedRows[0].message_id;
+      while (currentMessageId) {
+        // Find children of this message — pick the one with the lowest branch_index
+        // (or the one previously marked active, but since we deactivated them, pick branch_index 0 as default)
+        const [children] = await db.query(
+          `SELECT message_id, branch_index FROM chat_messages
+           WHERE conversation_id = ? AND parent_message_id = ?
+           ORDER BY branch_index ASC LIMIT 1`,
+          [conversation_id, currentMessageId]
+        );
+        if (children.length === 0) break;
+
+        await db.query(
+          'UPDATE chat_messages SET is_active_branch = 1 WHERE message_id = ?',
+          [children[0].message_id]
+        );
+        currentMessageId = children[0].message_id;
+      }
+    }
+
+    // 5. Return all active messages
+    const [messages] = await db.query(
+      `SELECT message_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch
+       FROM chat_messages
+       WHERE conversation_id = ? AND is_active_branch = 1
+       ORDER BY timestamp ASC`,
+      [conversation_id]
+    );
+
+    res.json({ status: 'ok', messages });
+  } catch (err) {
+    console.error('[Chat Branch Switch] Error:', err.message);
+    res.status(500).json({ error: 'Failed to switch branch' });
+  }
+});
+
 // ── n8n async callback ──
 // n8n sends:
 //   { session_id, type: 'thought', text: '...', done: false }  → ephemeral reasoning line, not persisted
@@ -8027,7 +8232,42 @@ app.post('/api/chat-callback', async (req, res) => {
   }
 
   const done = req.body.done !== false; // defaults to true
-  await saveMessage(session_id, 'assistant', text || '(empty response)', ts);
+
+  // Check if this is a branch session_id (format: conversationId_bN)
+  const branchMatch = session_id.match(/^(.+)_b(\d+)$/);
+  if (branchMatch) {
+    // Branch callback — save with branching metadata
+    const conversationId = branchMatch[1];
+    const branchIndex = parseInt(branchMatch[2], 10);
+    const mysqlTs = new Date(ts).toISOString().slice(0, 19).replace('T', ' ');
+
+    try {
+      // Find the last user message on this branch to set as parent
+      const [lastUserMsg] = await db.query(
+        `SELECT message_id FROM chat_messages
+         WHERE conversation_id = ? AND branch_index = ? AND is_active_branch = 1
+         ORDER BY timestamp DESC LIMIT 1`,
+        [conversationId, branchIndex]
+      );
+      const parentMsgId = lastUserMsg.length > 0 ? lastUserMsg[0].message_id : null;
+
+      await db.query(
+        `INSERT INTO chat_messages (conversation_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch)
+         VALUES (?, 'assistant', ?, ?, ?, ?, 1)`,
+        [conversationId, text || '(empty response)', mysqlTs, parentMsgId, branchIndex]
+      );
+      await db.query(
+        'UPDATE chat_conversations SET message_count = message_count + 1, last_message_at = NOW() WHERE conversation_id = ?',
+        [conversationId]
+      );
+      console.log(`[Callback] Saved branch assistant message for ${conversationId} branch ${branchIndex}`);
+    } catch (err) {
+      console.error('[Callback] Error saving branch message:', err.message);
+    }
+  } else {
+    await saveMessage(session_id, 'assistant', text || '(empty response)', ts);
+  }
+
   const pushed = pushToSSE(session_id, { type: 'assistant', text: text || '(empty response)', timestamp: ts, done });
   res.json({ delivered: pushed });
 });
@@ -8051,7 +8291,7 @@ app.get('/api/chat/conversations', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/chat/conversations/:id/messages — get all messages for a conversation (owned by user)
+// GET /api/chat/conversations/:id/messages — get active-branch messages + branch_counts
 app.get('/api/chat/conversations/:id/messages', authMiddleware, async (req, res) => {
   try {
     const userId = req.user ? req.user.user_id : null;
@@ -8060,12 +8300,33 @@ app.get('/api/chat/conversations/:id/messages', authMiddleware, async (req, res)
       'SELECT conversation_id FROM chat_conversations WHERE conversation_id = ? AND user_id = ?',
       [req.params.id, userId]
     );
-    if (conv.length === 0) return res.json([]); // Not found or not owned — return empty
-    const [rows] = await db.query(
-      'SELECT message_id, role, text, timestamp FROM chat_messages WHERE conversation_id = ? ORDER BY timestamp ASC',
+    if (conv.length === 0) return res.json({ messages: [], branch_counts: {} });
+
+    // Fetch only active-branch messages
+    const [messages] = await db.query(
+      `SELECT message_id, role, text, timestamp, parent_message_id, branch_index, is_active_branch
+       FROM chat_messages
+       WHERE conversation_id = ? AND is_active_branch = 1
+       ORDER BY timestamp ASC`,
       [req.params.id]
     );
-    res.json(rows);
+
+    // Compute branch_counts: for each parent_message_id, count how many branches exist (including inactive)
+    const [branchRows] = await db.query(
+      `SELECT parent_message_id, COUNT(DISTINCT branch_index) AS cnt
+       FROM chat_messages
+       WHERE conversation_id = ?
+       GROUP BY parent_message_id
+       HAVING cnt > 1`,
+      [req.params.id]
+    );
+    const branch_counts = {};
+    for (const row of branchRows) {
+      const key = row.parent_message_id === null ? 'null' : String(row.parent_message_id);
+      branch_counts[key] = row.cnt;
+    }
+
+    res.json({ messages, branch_counts });
   } catch (err) {
     console.error('[Chat API] Error fetching messages:', err.message);
     res.status(500).json({ error: 'Failed to fetch messages' });
