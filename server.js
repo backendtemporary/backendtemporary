@@ -580,6 +580,7 @@ const buildFabricColorAggregatedStructure = async () => {
       main_code: fabric.main_code,
       source: fabric.source,
       design: fabric.design,
+      unit_type: fabric.unit_type || 'length',
       created_at: fabric.created_at,
       updated_at: fabric.updated_at,
       created_by_username: fabric.created_by_username,
@@ -1934,7 +1935,7 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
 // POST create new fabric
 app.post('/api/fabrics', authMiddleware, async (req, res) => {
   try {
-    const { fabric_name, main_code, source, design } = req.body;
+    const { fabric_name, main_code, source, design, unit_type } = req.body;
 
     // Validation
     if (!fabric_name || !fabric_name.trim()) {
@@ -1942,6 +1943,9 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
     }
     if (!main_code) {
       return res.status(400).json({ error: 'Main code is required' });
+    }
+    if (unit_type && !['length', 'weight'].includes(unit_type)) {
+      return res.status(400).json({ error: 'unit_type must be "length" or "weight"' });
     }
 
     // Check for duplicate main_code + design
@@ -1956,8 +1960,8 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
     // Insert and return DB reality
     const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
-      'INSERT INTO fabrics (fabric_name, main_code, source, design, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
-      [fabric_name.trim(), main_code, source || null, design || 'none', userId]
+      'INSERT INTO fabrics (fabric_name, main_code, source, design, unit_type, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [fabric_name.trim(), main_code, source || null, design || 'none', unit_type || 'length', userId]
     );
 
     // Get created fabric for audit
@@ -1979,7 +1983,7 @@ app.post('/api/fabrics', authMiddleware, async (req, res) => {
 app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
   try {
     const fabricId = parseInt(req.params.fabric_id);
-    const { fabric_name, main_code, source, design } = req.body;
+    const { fabric_name, main_code, source, design, unit_type } = req.body;
 
     // Check fabric exists
     const [existing] = await db.query('SELECT fabric_id FROM fabrics WHERE fabric_id = ?', [fabricId]);
@@ -1993,6 +1997,12 @@ app.put('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
     if (main_code !== undefined) updates.main_code = main_code || null;
     if (source !== undefined) updates.source = source || null;
     if (design !== undefined) updates.design = design || 'none';
+    if (unit_type !== undefined) {
+      if (!['length', 'weight'].includes(unit_type)) {
+        return res.status(400).json({ error: 'unit_type must be "length" or "weight"' });
+      }
+      updates.unit_type = unit_type;
+    }
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
@@ -2201,10 +2211,32 @@ app.post('/api/fabrics/:fabric_id/colors', authMiddleware, async (req, res) => {
     await connection.beginTransaction();
 
     // Check fabric exists
-    const [fabric] = await connection.query('SELECT fabric_id FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    const [fabric] = await connection.query('SELECT fabric_id, unit_type FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabric.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Fabric not found' });
+    }
+
+    const fabricUnitType = fabric[0].unit_type || 'length';
+
+    // Enforce unit_type: length fabrics cannot have weight, weight fabrics cannot have length
+    if (fabricUnitType === 'weight') {
+      const hasLength = (parseFloat(length_meters) || 0) > 0 || (parseFloat(length_yards) || 0) > 0;
+      if (hasLength) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This fabric is sold by weight. Do not provide length (meters/yards).' });
+      }
+      if (!weight || parseFloat(weight) <= 0) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This fabric is sold by weight. Weight (kg) is required.' });
+      }
+    } else {
+      // length-type fabric
+      const hasWeight = weight && parseFloat(weight) > 0;
+      if (hasWeight) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This fabric is sold by length. Do not provide weight.' });
+      }
     }
 
     // Parse roll attributes (default to 0 if not provided)
@@ -2660,6 +2692,14 @@ async function addMetersToColorHandler(req, res) {
       return res.status(404).json({ error: 'Color not found' });
     }
     const fabricId = colors[0].fabric_id;
+
+    // Block add-meters for weight-type fabrics
+    const [fabricRows] = await connection.query('SELECT unit_type FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (fabricRows.length > 0 && (fabricRows[0].unit_type || 'length') === 'weight') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'This fabric is sold by weight. Use add-weight instead of add-meters.' });
+    }
+
     const currentMeters = parseFloat(colors[0].length_meters) || 0;
     const currentYards = parseFloat(colors[0].length_yards) || 0;
 
@@ -3804,13 +3844,27 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       return res.status(404).json({ error: 'Color not found or already sold' });
     }
 
-    // Get fabric info (including design for log formatting)
-    const [fabrics] = await connection.query('SELECT fabric_name, main_code, design FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    // Get fabric info (including design and unit_type for log formatting)
+    const [fabrics] = await connection.query('SELECT fabric_name, main_code, design, unit_type FROM fabrics WHERE fabric_id = ?', [fabricId]);
     if (fabrics.length === 0) {
       await connection.rollback();
       return res.status(404).json({ error: 'Fabric not found' });
     }
     const fabric = fabrics[0];
+    const fabricUnitType = fabric.unit_type || 'length';
+
+    // Enforce unit_type on sell
+    if (fabricUnitType === 'weight') {
+      if (!kgOnly) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This fabric is sold by weight. Provide amount_kilograms only.' });
+      }
+    } else {
+      if (kgOnly) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'This fabric is sold by length. Provide amount_yards or amount_meters.' });
+      }
+    }
 
     // Handle lot_id if provided
     let selectedLot = null;
@@ -4078,28 +4132,9 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         return res.status(400).json({ error: `Item ${i + 1}: invalid fabric_id or color_id` });
       }
 
-      let amountYards, amountMeters;
-      const parsedYards = parseFloat(item.amount_yards);
-      const parsedMeters = parseFloat(item.amount_meters);
-
-      if (!isNaN(parsedYards) && parsedYards !== 0) {
-        amountYards  = round2(parsedYards);
-        amountMeters = round2(amountYards / 1.0936);
-      } else if (!isNaN(parsedMeters) && parsedMeters !== 0) {
-        amountMeters = round2(parsedMeters);
-        amountYards  = round2(amountMeters * 1.0936);
-      } else {
-        await connection.rollback();
-        return res.status(400).json({ error: `Item ${i + 1}: amount must be non-zero` });
-      }
-
       // Block negative amounts for non-privileged roles (accountant)
       const userRole = req.user?.role;
       const isPrivileged = hasMinRole(userRole, 'manager');
-      if (amountYards < 0 && !isPrivileged) {
-        await connection.rollback();
-        return res.status(403).json({ error: `Item ${i + 1}: negative quantities are not allowed for your role.` });
-      }
 
       // Lock the color row (FOR UPDATE prevents concurrent sells from racing)
       const color = await getColorForTransaction(connection, fabricId, colorId);
@@ -4109,36 +4144,151 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       }
 
       const [fabricRows] = await connection.query(
-        'SELECT fabric_name, design FROM fabrics WHERE fabric_id = ?', [fabricId]
+        'SELECT fabric_name, design, unit_type FROM fabrics WHERE fabric_id = ?', [fabricId]
       );
       if (fabricRows.length === 0) {
         await connection.rollback();
         return res.status(404).json({ error: `Item ${i + 1}: fabric ${fabricId} not found` });
       }
       const fabric = fabricRows[0];
+      const fabricUnitType = fabric.unit_type || 'length';
+
+      let amountYards, amountMeters, amountKilograms = null;
+      const isWeightItem = fabricUnitType === 'weight';
+
+      if (isWeightItem) {
+        // Weight-type fabric: parse kilograms, no length needed
+        const parsedKg = parseFloat(item.amount_kilograms);
+        if (isNaN(parsedKg) || parsedKg <= 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Item ${i + 1}: amount_kilograms must be a positive number for weight-type fabric` });
+        }
+        amountKilograms = round2(parsedKg);
+        amountYards = 0;
+        amountMeters = 0;
+      } else {
+        // Length-type fabric: reject if amount_kilograms is provided
+        if (item.amount_kilograms !== undefined && item.amount_kilograms !== null && item.amount_kilograms !== '' && parseFloat(item.amount_kilograms) > 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Item ${i + 1}: ${fabric.fabric_name} is sold by length. Provide amount_yards or amount_meters, not amount_kilograms.` });
+        }
+
+        const parsedYards = parseFloat(item.amount_yards);
+        const parsedMeters = parseFloat(item.amount_meters);
+
+        if (!isNaN(parsedYards) && parsedYards !== 0) {
+          amountYards  = round2(parsedYards);
+          amountMeters = round2(amountYards / 1.0936);
+        } else if (!isNaN(parsedMeters) && parsedMeters !== 0) {
+          amountMeters = round2(parsedMeters);
+          amountYards  = round2(amountMeters * 1.0936);
+        } else {
+          await connection.rollback();
+          return res.status(400).json({ error: `Item ${i + 1}: amount must be non-zero` });
+        }
+
+        if (amountYards < 0 && !isPrivileged) {
+          await connection.rollback();
+          return res.status(403).json({ error: `Item ${i + 1}: negative quantities are not allowed for your role.` });
+        }
+      }
+
       const fabricNameForLog = fabric.design && fabric.design !== 'none'
         ? `${fabric.fabric_name} [${fabric.design}]`
         : fabric.fabric_name;
 
-      const currentYards     = parseFloat(color.length_yards) || 0;
       const currentRollCount = parseInt(color.roll_count) || 0;
       const sellRollCount    = parseInt(item.roll_count) || 0;
 
-      if (currentYards < amountYards) {
-        if (!isPrivileged) {
-          await connection.rollback();
-          return res.status(400).json({
-            error: `${fabric.fabric_name} / ${color.color_name}: not enough stock — have ${currentYards.toFixed(2)} yd, need ${amountYards.toFixed(2)} yd`
-          });
+      if (isWeightItem) {
+        // Weight stock check: parse the color's weight field
+        let currentWeightKg = 0;
+        if (color.weight && typeof color.weight === 'string') {
+          const match = color.weight.match(/(\d+(\.\d+)?)/);
+          if (match) currentWeightKg = parseFloat(match[1]);
+        } else if (typeof color.weight === 'number') {
+          currentWeightKg = parseFloat(color.weight);
         }
-        // Privileged role: allow negative stock but require a per-item note
-        if (!item.notes || !item.notes.trim()) {
-          await connection.rollback();
-          return res.status(400).json({
-            error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more than available stock (will result in negative inventory).`
-          });
+
+        if (currentWeightKg < amountKilograms) {
+          if (!isPrivileged) {
+            await connection.rollback();
+            return res.status(400).json({
+              error: `${fabric.fabric_name} / ${color.color_name}: not enough weight stock — have ${currentWeightKg.toFixed(2)} kg, need ${amountKilograms.toFixed(2)} kg`
+            });
+          }
+          if (!item.notes || !item.notes.trim()) {
+            await connection.rollback();
+            return res.status(400).json({
+              error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more weight than available stock (will result in negative inventory).`
+            });
+          }
         }
+
+        // Pre-compute weight update
+        let newWeightStr = color.weight;
+        let newWeightKg = 0;
+        if (color.weight && typeof color.weight === 'string') {
+          const match = color.weight.match(/(\d+(\.\d+)?)/);
+          if (match) {
+            const oldKg = parseFloat(match[1]);
+            newWeightKg = oldKg - amountKilograms;
+            newWeightStr = color.weight.replace(/(\d+(\.\d+)?)/, Math.max(0, newWeightKg).toFixed(2));
+          }
+        } else if (typeof color.weight === 'number') {
+          newWeightKg = parseFloat(color.weight) - amountKilograms;
+          newWeightStr = Math.max(0, newWeightKg).toString();
+        }
+
+        const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+
+        validated.push({
+          fabricId, colorId, fabricNameForLog,
+          colorName: color.color_name,
+          amountYards: 0, amountMeters: 0, amountKilograms, sellRollCount,
+          newYards: parseFloat(color.length_yards) || 0, newMeters: parseFloat(color.length_meters) || 0,
+          newRollCount,
+          newWeightStr,
+          newSold: newWeightKg <= 0 ? 1 : 0,
+          isWeightItem: true,
+          oldColorSnapshot: color,
+          itemNotes: item.notes?.trim() || null,
+        });
+      } else {
+        const currentYards = parseFloat(color.length_yards) || 0;
+
+        if (currentYards < amountYards) {
+          if (!isPrivileged) {
+            await connection.rollback();
+            return res.status(400).json({
+              error: `${fabric.fabric_name} / ${color.color_name}: not enough stock — have ${currentYards.toFixed(2)} yd, need ${amountYards.toFixed(2)} yd`
+            });
+          }
+          if (!item.notes || !item.notes.trim()) {
+            await connection.rollback();
+            return res.status(400).json({
+              error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more than available stock (will result in negative inventory).`
+            });
+          }
+        }
+
+        const newYards     = round2(currentYards - amountYards);
+        const newMeters    = round2(newYards / 1.0936);
+        const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+
+        validated.push({
+          fabricId, colorId, fabricNameForLog,
+          colorName: color.color_name,
+          amountYards, amountMeters, amountKilograms: null, sellRollCount,
+          newYards, newMeters, newRollCount,
+          newSold: newYards <= 0 ? 1 : 0,
+          isWeightItem: false,
+          oldColorSnapshot: color,
+          itemNotes: item.notes?.trim() || null,
+        });
       }
+
+      // Roll count check (applies to both weight and length items)
       if (sellRollCount > 0 && sellRollCount > currentRollCount) {
         if (!isPrivileged) {
           await connection.rollback();
@@ -4146,7 +4296,6 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
             error: `${fabric.fabric_name} / ${color.color_name}: not enough rolls — have ${currentRollCount}, need ${sellRollCount}`
           });
         }
-        // Privileged role: allow negative rolls but require a per-item note
         if (!item.notes || !item.notes.trim()) {
           await connection.rollback();
           return res.status(400).json({
@@ -4154,26 +4303,12 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
           });
         }
       }
-
-      // Pre-compute everything we need for the write phase
-      const newYards     = round2(currentYards - amountYards);
-      const newMeters    = round2(newYards / 1.0936);
-      const newRollCount = Math.max(0, currentRollCount - sellRollCount);
-
-      validated.push({
-        fabricId, colorId, fabricNameForLog,
-        colorName: color.color_name,
-        amountYards, amountMeters, sellRollCount,
-        newYards, newMeters, newRollCount,
-        newSold: newYards <= 0 ? 1 : 0,
-        oldColorSnapshot: color, // already fetched above — used for audit
-        itemNotes: item.notes?.trim() || null, // per-item note (required for negative stock)
-      });
     }
 
     // ── PHASE 2: All items valid — now write everything ──
     // Pre-compute totals so we can create the transaction_group row FIRST,
     // satisfying the FK constraint on logs.transaction_group_id.
+    // Weight items contribute 0 to length totals (no total_kilograms column in transaction_groups).
     const batchTotalYards  = round2(validated.reduce((s, v) => s + v.amountYards,  0));
     const batchTotalMeters = round2(validated.reduce((s, v) => s + v.amountMeters, 0));
 
@@ -4187,23 +4322,34 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       // Snapshot before for audit (re-read to get full row)
       const [oldRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [v.colorId]);
 
-      await connection.query(
-        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = ? WHERE color_id = ?',
-        [v.newMeters, v.newYards, v.newRollCount, v.newSold, v.colorId]
-      );
+      if (v.isWeightItem) {
+        // Weight item: update weight field and roll_count, leave length fields untouched
+        await connection.query(
+          'UPDATE colors SET weight = ?, roll_count = ?, sold = ? WHERE color_id = ?',
+          [v.newWeightStr, v.newRollCount, v.newSold, v.colorId]
+        );
+      } else {
+        // Length item: update length fields and roll_count as before
+        await connection.query(
+          'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = ? WHERE color_id = ?',
+          [v.newMeters, v.newYards, v.newRollCount, v.newSold, v.colorId]
+        );
+      }
 
       const [newRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [v.colorId]);
+      const auditMsg = v.isWeightItem
+        ? `Sold ${v.amountKilograms.toFixed(2)}kg | Fabric: ${v.fabricNameForLog}, Color: ${v.colorName}`
+        : `Sold ${v.amountYards.toFixed(2)}yd/${v.amountMeters.toFixed(2)}m | Fabric: ${v.fabricNameForLog}, Color: ${v.colorName}`;
       await logUpdate(
-        'colors', v.colorId, req.user, oldRows[0], newRows[0], req,
-        `Sold ${v.amountYards.toFixed(2)}yd/${v.amountMeters.toFixed(2)}m | Fabric: ${v.fabricNameForLog}, Color: ${v.colorName}`
+        'colors', v.colorId, req.user, oldRows[0], newRows[0], req, auditMsg
       );
 
       // Use per-item notes if provided (required for negative stock entries), fall back to group notes
       const logNotes = v.itemNotes || notes || null;
 
       await connection.query(
-        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, roll_count, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['sell', v.fabricId, v.colorId, v.fabricNameForLog, v.colorName, customer_id || null, customer_name || null, v.amountMeters, v.amountYards, v.sellRollCount, logNotes, now.iso, now.epoch, now.tz, txGroupId, salesperson_id || null, conductedByUserId]
+        'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, amount_kilograms, roll_count, notes, timestamp, epoch, timezone, transaction_group_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['sell', v.fabricId, v.colorId, v.fabricNameForLog, v.colorName, customer_id || null, customer_name || null, v.amountMeters, v.amountYards, v.amountKilograms, v.sellRollCount, logNotes, now.iso, now.epoch, now.tz, txGroupId, salesperson_id || null, conductedByUserId]
       );
     }
 
