@@ -1932,6 +1932,32 @@ app.get('/api/fabrics/:fabric_id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/fabrics/:fabric_id/transactions - All transaction groups that include this fabric, sorted by date
+app.get('/api/fabrics/:fabric_id/transactions', authMiddleware, async (req, res) => {
+  try {
+    const fabricId = parseInt(req.params.fabric_id);
+    if (isNaN(fabricId)) return res.status(400).json({ error: 'Invalid fabric_id' });
+
+    const [logs] = await db.query(
+      `SELECT
+        l.log_id, l.color_id, l.color_name, l.type,
+        l.amount_yards, l.amount_kilograms,
+        l.transaction_group_id,
+        tg.epoch, tg.permit_number, tg.transaction_type, tg.customer_name
+       FROM logs l
+       LEFT JOIN transaction_groups tg ON l.transaction_group_id = tg.transaction_group_id
+       WHERE l.fabric_id = ?
+       ORDER BY tg.epoch ASC, l.log_id ASC`,
+      [fabricId]
+    );
+
+    res.json(logs);
+  } catch (error) {
+    console.error('Error fetching fabric transactions:', error);
+    res.status(500).json({ error: 'Failed to fetch fabric transactions' });
+  }
+});
+
 // POST create new fabric
 app.post('/api/fabrics', authMiddleware, async (req, res) => {
   try {
