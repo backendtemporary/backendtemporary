@@ -2478,6 +2478,7 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
     let newLenY = currentLenY;
     let newInitM = currentInitialMeters;
     let newInitY = currentInitialYards;
+    let newInitRolls = null;
 
     // Role check: only managers and admins can directly update stock levels
     if ((length_meters !== undefined || length_yards !== undefined) &&
@@ -2612,24 +2613,37 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         }
         updates.push('initial_roll_count = ?');
         values.push(initRolls);
+        newInitRolls = initRolls;
       }
 
-      // Recalculate current stock: new current = new initial − total sold from logs
-      if (newInitY !== null) {
-        const [soldRows] = await connection.query(
-          `SELECT COALESCE(SUM(amount_yards), 0) AS total_sold_yards
-           FROM logs WHERE color_id = ? AND type IN ('sell', 'trim')`,
+      // Recalculate current stock: new current = new initial − net consumed (sells+trims minus returns)
+      if (newInitY !== null || newInitRolls !== null) {
+        const [netRows] = await connection.query(
+          `SELECT
+            COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN amount_yards ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN type = 'return' THEN amount_yards ELSE 0 END), 0) AS net_yards,
+            COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN roll_count ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN type = 'return' THEN roll_count ELSE 0 END), 0) AS net_rolls
+           FROM logs WHERE color_id = ?`,
           [colorId]
         );
-        const totalSoldYards = parseFloat(soldRows[0].total_sold_yards) || 0;
-        const recalcY = Math.max(0, Math.round((newInitY - totalSoldYards) * 100) / 100);
-        const recalcM = Math.round(recalcY * 0.9144 * 100) / 100;
-        updates.push('length_yards = ?');
-        values.push(recalcY);
-        updates.push('length_meters = ?');
-        values.push(recalcM);
-        newLenY = recalcY;
-        newLenM = recalcM;
+        if (newInitY !== null) {
+          const netYards = parseFloat(netRows[0].net_yards) || 0;
+          const recalcY = Math.max(0, Math.round((newInitY - netYards) * 100) / 100);
+          const recalcM = Math.round(recalcY * 0.9144 * 100) / 100;
+          updates.push('length_yards = ?');
+          values.push(recalcY);
+          updates.push('length_meters = ?');
+          values.push(recalcM);
+          newLenY = recalcY;
+          newLenM = recalcM;
+        }
+        if (newInitRolls !== null) {
+          const netRolls = parseInt(netRows[0].net_rolls) || 0;
+          const recalcRolls = Math.max(0, newInitRolls - netRolls);
+          updates.push('roll_count = ?');
+          values.push(recalcRolls);
+        }
       }
     }
 
