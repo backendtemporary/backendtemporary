@@ -2101,6 +2101,108 @@ app.delete('/api/fabrics/:fabric_id', authMiddleware, requireRole('admin'), asyn
   }
 });
 
+// PURGE fabric by fabric_id — full hard delete, no trace (admin only)
+app.delete('/api/fabrics/:fabric_id/purge', authMiddleware, requireRole('admin'), async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const fabricId = parseInt(req.params.fabric_id);
+
+    await connection.beginTransaction();
+
+    // Load fabric record for audit
+    const [fabricRows] = await connection.query('SELECT * FROM fabrics WHERE fabric_id = ?', [fabricId]);
+    if (fabricRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Fabric not found' });
+    }
+    const fabricRecord = fabricRows[0];
+
+    // Collect color IDs
+    const [colorRows] = await connection.query('SELECT color_id FROM colors WHERE fabric_id = ?', [fabricId]);
+    const colorIds = colorRows.map(r => r.color_id);
+
+    // Collect log IDs + affected transaction group IDs
+    const logQuery = colorIds.length > 0
+      ? connection.query('SELECT log_id, transaction_group_id FROM logs WHERE fabric_id = ? OR color_id IN (?)', [fabricId, colorIds])
+      : connection.query('SELECT log_id, transaction_group_id FROM logs WHERE fabric_id = ?', [fabricId]);
+    const [logRows] = await logQuery;
+    const logIds = logRows.map(r => r.log_id);
+    const affectedGroupIds = [...new Set(logRows.map(r => r.transaction_group_id).filter(Boolean))];
+
+    // Delete all logs for this fabric
+    let logsDeleted = 0;
+    if (colorIds.length > 0) {
+      const [del] = await connection.query('DELETE FROM logs WHERE fabric_id = ? OR color_id IN (?)', [fabricId, colorIds]);
+      logsDeleted = del.affectedRows;
+    } else {
+      const [del] = await connection.query('DELETE FROM logs WHERE fabric_id = ?', [fabricId]);
+      logsDeleted = del.affectedRows;
+    }
+
+    // For each affected transaction group: recalc or delete
+    let groupsDeleted = 0;
+    let groupsRecalculated = 0;
+    for (const groupId of affectedGroupIds) {
+      const [[row]] = await connection.query(
+        'SELECT COUNT(*) AS n, COALESCE(SUM(amount_meters),0) AS m, COALESCE(SUM(amount_yards),0) AS y FROM logs WHERE transaction_group_id = ?',
+        [groupId]
+      );
+      if (row.n === 0) {
+        await connection.query('DELETE FROM transaction_groups WHERE transaction_group_id = ?', [groupId]);
+        groupsDeleted++;
+      } else {
+        await connection.query(
+          'UPDATE transaction_groups SET total_items = ?, total_meters = ?, total_yards = ? WHERE transaction_group_id = ?',
+          [row.n, row.m, row.y, groupId]
+        );
+        groupsRecalculated++;
+      }
+    }
+
+    // Clean up deletion_requests (no FK — must scrub manually)
+    await connection.query('DELETE FROM deletion_requests WHERE request_type = ? AND target_id = ?', ['delete_fabric', fabricId]);
+    if (colorIds.length > 0) {
+      await connection.query('DELETE FROM deletion_requests WHERE request_type = ? AND target_id IN (?)', ['delete_color', colorIds]);
+    }
+    if (logIds.length > 0) {
+      await connection.query('DELETE FROM deletion_requests WHERE request_type = ? AND target_id IN (?)', ['cancel_transaction', logIds]);
+    }
+
+    // Clean up transaction_drafts whose form_data.fabricBlocks references this fabric
+    let draftsDeleted = 0;
+    const [allDrafts] = await connection.query('SELECT draft_id, form_data FROM transaction_drafts');
+    const draftIdsToDelete = allDrafts.filter(d => {
+      try {
+        const data = typeof d.form_data === 'string' ? JSON.parse(d.form_data) : d.form_data;
+        return Array.isArray(data?.fabricBlocks) && data.fabricBlocks.some(b => b.fabric_id === fabricId);
+      } catch { return false; }
+    }).map(d => d.draft_id);
+    if (draftIdsToDelete.length > 0) {
+      await connection.query('DELETE FROM transaction_drafts WHERE draft_id IN (?)', [draftIdsToDelete]);
+      draftsDeleted = draftIdsToDelete.length;
+    }
+
+    // Delete colors (cascades color_lots via FK)
+    await connection.query('DELETE FROM colors WHERE fabric_id = ?', [fabricId]);
+
+    // Delete the fabric
+    await connection.query('DELETE FROM fabrics WHERE fabric_id = ?', [fabricId]);
+
+    // Audit trail
+    await logDelete('fabrics', fabricId, req.user, fabricRecord, req,
+      `PURGE: fabric and all traces removed — ${logsDeleted} logs, ${groupsDeleted} groups deleted, ${groupsRecalculated} groups recalculated, ${draftsDeleted} drafts deleted`);
+
+    await connection.commit();
+    res.json({ success: true, stats: { logsDeleted, groupsDeleted, groupsRecalculated, draftsDeleted } });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error purging fabric:', error);
+    res.status(500).json({ error: 'Failed to purge fabric' });
+  } finally {
+    connection.release();
+  }
+});
+
 // DELETE color by color_id with cascade to rolls
 app.delete('/api/colors/:color_id', authMiddleware, requireRole('admin'), async (req, res) => {
   const connection = await db.getConnection();
