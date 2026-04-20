@@ -1941,7 +1941,8 @@ app.get('/api/fabrics/:fabric_id/transactions', authMiddleware, async (req, res)
     const [logs] = await db.query(
       `SELECT
         l.log_id, l.color_id, l.color_name, l.type,
-        l.amount_yards, l.amount_kilograms,
+        l.amount_yards, l.amount_meters, l.amount_kilograms,
+        l.roll_count, l.roll_nb, l.lot, l.notes,
         l.transaction_group_id,
         tg.epoch, tg.permit_number, tg.transaction_type, tg.customer_name
        FROM logs l
