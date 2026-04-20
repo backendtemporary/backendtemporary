@@ -6611,7 +6611,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
         if (!src) {
           return res.status(400).json({ error: `Log not found: ${it.log_id}` });
         }
-        if (parseInt(src.transaction_group_id) !== parseInt(groupId)) {
+        if (src.transaction_group_id !== groupId) {
           return res.status(400).json({ error: `Log ${it.log_id} does not belong to transaction group ${groupId}` });
         }
         if (group.transaction_type === 'return' && src.type !== 'return') {
