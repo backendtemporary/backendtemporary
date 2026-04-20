@@ -6538,11 +6538,11 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
 // PUT /api/transactions/:groupId/edit - Edit a sell-type transaction group
 // Supports three actions per item: "update" (change amounts), "remove" (delete item), "add" (new item)
 // All inventory changes are applied atomically; inventory cannot go below 0.
-app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'), async (req, res) => {
+app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manager'), async (req, res) => {
   const connection = await db.getConnection();
   try {
     const groupId = req.params.groupId;
-    const { items } = req.body || {};
+    const { items, note } = req.body || {};
 
     // --- Basic request validation ---
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -6664,6 +6664,8 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
 
     const round2 = (x) => (x != null && !Number.isNaN(Number(x))) ? Math.round(Number(x) * 100) / 100 : 0;
     const userId = req.user ? req.user.user_id : null;
+    const isPrivileged = hasMinRole(req.user.role, 'manager');
+    const overrideNote = note && note.trim() ? note.trim() : null;
 
     // Process items sorted by log_id (update/remove) then adds, to avoid deadlocks
     const updateRemoveItems = items
@@ -6790,10 +6792,14 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
         const updatedRollCount = (parseInt(color.roll_count) || 0) + inventorySign * deltaRolls;
 
         if (updatedMeters < -0.005 || updatedYards < -0.005) {
-          await connection.rollback();
-          return res.status(400).json({
-            error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)})`
-          });
+          if (!isPrivileged) {
+            await connection.rollback();
+            return res.status(400).json({ error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)})` });
+          }
+          if (!overrideNote) {
+            await connection.rollback();
+            return res.status(400).json({ error: `Updating log ${it.log_id} would result in negative inventory. A note is required to override.`, requiresNote: true });
+          }
         }
 
         const finalMeters = Math.max(0, updatedMeters);
@@ -6831,8 +6837,12 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
         const oldLogRecord = oldLogRows[0];
 
         await connection.query(
-          'UPDATE logs SET amount_meters = ?, amount_yards = ?, roll_count = ? WHERE log_id = ?',
-          [newMetersVal, newYardsVal, newRollsVal, parseInt(it.log_id)]
+          overrideNote
+            ? 'UPDATE logs SET amount_meters = ?, amount_yards = ?, roll_count = ?, notes = ? WHERE log_id = ?'
+            : 'UPDATE logs SET amount_meters = ?, amount_yards = ?, roll_count = ? WHERE log_id = ?',
+          overrideNote
+            ? [newMetersVal, newYardsVal, newRollsVal, overrideNote, parseInt(it.log_id)]
+            : [newMetersVal, newYardsVal, newRollsVal, parseInt(it.log_id)]
         );
 
         const [newLogRows] = await connection.query('SELECT * FROM logs WHERE log_id = ?', [parseInt(it.log_id)]);
@@ -6889,10 +6899,14 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
       const currentYards = parseFloat(color.length_yards) || 0;
       const currentMeters = parseFloat(color.length_meters) || 0;
       if (currentYards < addYards - 0.005) {
-        await connection.rollback();
-        return res.status(400).json({
-          error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd, Requested: ${addYards.toFixed(2)}yd`
-        });
+        if (!isPrivileged) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd, Requested: ${addYards.toFixed(2)}yd` });
+        }
+        if (!overrideNote) {
+          await connection.rollback();
+          return res.status(400).json({ error: `Insufficient inventory for add item (color_id=${colorId}). Available: ${currentYards.toFixed(2)}yd, Requested: ${addYards.toFixed(2)}yd. A note is required to override.`, requiresNote: true });
+        }
       }
 
       // Capture old record for audit
