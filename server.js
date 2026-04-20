@@ -3986,12 +3986,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
         });
       }
     }
-    const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+    const newRollCount = currentRollCount - sellRollCount;
 
     // Get old record for audit
     const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const oldColorRecord = oldColorRows[0];
-    
+
     // Parse the existing weight logic
     let newWeightStr = oldColorRecord.weight;
     let oldWeightKg = 0;
@@ -4013,9 +4013,9 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
     }
 
     // Determine the newly sold state
-    // If length <= 0 AND weight <= 0, mark as sold
+    // Only mark as sold when stock reaches exactly zero; negative stock = overdraft (still visible)
     let newSoldStatus = 0;
-    if (newMeters <= 0) {
+    if (newMeters > -0.005 && newMeters <= 0.005) {
       if (!newWeightStr || newWeightStr === 'N/A' || newWeightStr === '') {
         newSoldStatus = 1;
       } else {
@@ -4281,7 +4281,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
           newWeightStr = Math.max(0, newWeightKg).toString();
         }
 
-        const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+        const newRollCount = currentRollCount - sellRollCount;
 
         validated.push({
           fabricId, colorId, fabricNameForLog,
@@ -4290,7 +4290,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
           newYards: parseFloat(color.length_yards) || 0, newMeters: parseFloat(color.length_meters) || 0,
           newRollCount,
           newWeightStr,
-          newSold: newWeightKg <= 0 ? 1 : 0,
+          newSold: (newWeightKg > -0.005 && newWeightKg <= 0.005) ? 1 : 0,
           isWeightItem: true,
           oldColorSnapshot: color,
           itemNotes: item.notes?.trim() || null,
@@ -4315,14 +4315,14 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
 
         const newYards     = round2(currentYards - amountYards);
         const newMeters    = round2(newYards / 1.0936);
-        const newRollCount = Math.max(0, currentRollCount - sellRollCount);
+        const newRollCount = currentRollCount - sellRollCount;
 
         validated.push({
           fabricId, colorId, fabricNameForLog,
           colorName: color.color_name,
           amountYards, amountMeters, amountKilograms: null, sellRollCount,
           newYards, newMeters, newRollCount,
-          newSold: newYards <= 0 ? 1 : 0,
+          newSold: (newYards > -0.005 && newYards <= 0.005) ? 1 : 0,
           isWeightItem: false,
           oldColorSnapshot: color,
           itemNotes: item.notes?.trim() || null,
