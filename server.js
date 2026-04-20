@@ -6789,10 +6789,10 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireRole('admin'),
         const updatedYards = round2((parseFloat(color.length_yards) || 0) + inventorySign * deltaYards);
         const updatedRollCount = (parseInt(color.roll_count) || 0) + inventorySign * deltaRolls;
 
-        if (updatedMeters < -0.005 || updatedYards < -0.005 || updatedRollCount < 0) {
+        if (updatedMeters < -0.005 || updatedYards < -0.005) {
           await connection.rollback();
           return res.status(400).json({
-            error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)}, rolls: ${updatedRollCount})`
+            error: `Insufficient inventory for log ${it.log_id}. Updating would result in negative inventory (meters: ${updatedMeters.toFixed(2)}, yards: ${updatedYards.toFixed(2)})`
           });
         }
 
