@@ -2630,18 +2630,20 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         );
         if (newInitY !== null) {
           const netYards = parseFloat(netRows[0].net_yards) || 0;
-          const recalcY = Math.max(0, Math.round((newInitY - netYards) * 100) / 100);
+          const recalcY = Math.round((newInitY - netYards) * 100) / 100;
           const recalcM = Math.round(recalcY * 0.9144 * 100) / 100;
           updates.push('length_yards = ?');
           values.push(recalcY);
           updates.push('length_meters = ?');
           values.push(recalcM);
+          updates.push('sold = ?');
+          values.push(recalcM > -0.005 && recalcM <= 0.005 ? 1 : 0);
           newLenY = recalcY;
           newLenM = recalcM;
         }
         if (newInitRolls !== null) {
           const netRolls = parseInt(netRows[0].net_rolls) || 0;
-          const recalcRolls = Math.max(0, newInitRolls - netRolls);
+          const recalcRolls = newInitRolls - netRolls;
           updates.push('roll_count = ?');
           values.push(recalcRolls);
         }
