@@ -25,6 +25,26 @@ If you are using your current local `.env`, run:
 npm run seed:test
 ```
 
+## MySQL Workbench Setup
+
+If you prefer MySQL Workbench, open `seed-test-data-workbench.sql` in Workbench, select your local/test schema, then run the whole file.
+
+The Workbench file:
+
+- Deletes only previous Workbench seed records with `WB-` / `WB TEST -` prefixes.
+- Inserts users, fabrics, colors, lots, customers, salespersons, transactions, and returns.
+- Commits the data.
+- Runs summary queries at the end so you can compare app or AI answers against known totals.
+
+Workbench test logins:
+
+```text
+wb_admin / Test123!
+wb_ceo / Test123!
+wb_manager / Test123!
+wb_accountant / Test123!
+```
+
 The seeder refuses `NODE_ENV=production`, database names containing `prod` or `production`, and non-local DB hosts unless you pass `--allow-remote`. Only use `--allow-remote` for a disposable remote test database.
 
 ## What The Seeder Creates

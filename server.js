@@ -316,6 +316,109 @@ const getColorFabricNames = async (colorId, connection = null) => {
   return { fabric_name: safeRows[0].fabric_name || 'N/A', color_name: safeRows[0].color_name || 'N/A' };
 };
 
+const roundInventoryValue = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.round(num * 100) / 100 : 0;
+};
+
+const hasInventoryValue = (value) => value !== null && value !== undefined && value !== '';
+
+/**
+ * Reconcile current color inventory with the same source of truth used by Init:
+ * current = initial stock - sell/trim logs + return logs.
+ */
+const recalculateColorInventoryFromInitial = async (connection, colorId, options = {}) => {
+  const numericColorId = Number(colorId);
+  if (!Number.isFinite(numericColorId) || numericColorId <= 0) {
+    return { recalculated: false, reason: 'invalid_color_id' };
+  }
+
+  const q = connection ? connection.query.bind(connection) : db.query.bind(db);
+  const [colorRows] = await q('SELECT * FROM colors WHERE color_id = ? FOR UPDATE', [numericColorId]);
+  if (!Array.isArray(colorRows) || colorRows.length === 0) {
+    return { recalculated: false, reason: 'color_not_found' };
+  }
+
+  const oldColorRecord = colorRows[0];
+  const [fabricRows] = await q(
+    'SELECT fabric_name, unit_type FROM fabrics WHERE fabric_id = ?',
+    [oldColorRecord.fabric_id]
+  );
+  const fabric = Array.isArray(fabricRows) && fabricRows.length > 0 ? fabricRows[0] : {};
+  const isWeightFabric = (fabric.unit_type || 'length') === 'weight';
+  const hasInitialLength = hasInventoryValue(oldColorRecord.initial_length_yards) || hasInventoryValue(oldColorRecord.initial_length_meters);
+  const hasInitialRolls = hasInventoryValue(oldColorRecord.initial_roll_count);
+
+  if ((!hasInitialLength || isWeightFabric) && !hasInitialRolls) {
+    return { recalculated: false, reason: 'no_initial_values' };
+  }
+
+  const [netRows] = await q(
+    `SELECT
+       COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN COALESCE(amount_yards, amount_meters * 1.0936, 0) ELSE 0 END), 0) -
+       COALESCE(SUM(CASE WHEN type = 'return' THEN COALESCE(amount_yards, amount_meters * 1.0936, 0) ELSE 0 END), 0) AS net_yards,
+       COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN COALESCE(roll_count, 0) ELSE 0 END), 0) -
+       COALESCE(SUM(CASE WHEN type = 'return' THEN COALESCE(roll_count, 0) ELSE 0 END), 0) AS net_rolls
+     FROM logs WHERE color_id = ?`,
+    [numericColorId]
+  );
+
+  const updates = [];
+  const values = [];
+  const net = Array.isArray(netRows) && netRows.length > 0 ? netRows[0] : {};
+
+  if (hasInitialLength && !isWeightFabric) {
+    const initialYards = hasInventoryValue(oldColorRecord.initial_length_yards)
+      ? Number(oldColorRecord.initial_length_yards)
+      : Number(oldColorRecord.initial_length_meters) * 1.0936;
+    const netYards = Number(net.net_yards) || 0;
+    const recalcYards = roundInventoryValue(initialYards - netYards);
+    const recalcMeters = roundInventoryValue(recalcYards * 0.9144);
+
+    updates.push('length_yards = ?', 'length_meters = ?', 'sold = ?');
+    values.push(recalcYards, recalcMeters, recalcMeters > -0.005 && recalcMeters <= 0.005 ? 1 : 0);
+  }
+
+  if (hasInitialRolls) {
+    const initialRolls = parseInt(oldColorRecord.initial_roll_count, 10) || 0;
+    const netRolls = parseInt(net.net_rolls, 10) || 0;
+    updates.push('roll_count = ?');
+    values.push(initialRolls - netRolls);
+  }
+
+  const userId = options.user?.user_id ?? null;
+  if (userId !== null && userId !== undefined) {
+    updates.push('updated_by_user_id = ?');
+    values.push(userId);
+  }
+
+  if (updates.length === 0) {
+    return { recalculated: false, reason: 'nothing_to_update' };
+  }
+
+  values.push(numericColorId);
+  await q(`UPDATE colors SET ${updates.join(', ')} WHERE color_id = ?`, values);
+
+  const [newColorRows] = await q('SELECT * FROM colors WHERE color_id = ?', [numericColorId]);
+  const newColorRecord = Array.isArray(newColorRows) && newColorRows.length > 0 ? newColorRows[0] : null;
+  if (newColorRecord) {
+    const notes = `${options.reason || 'Auto-reconciled inventory from initial values and logs'} | Fabric: ${fabric.fabric_name || 'N/A'}, Color: ${oldColorRecord.color_name || 'N/A'}`;
+    await logUpdate('colors', numericColorId, options.user || null, oldColorRecord, newColorRecord, options.req || null, notes);
+  }
+
+  return { recalculated: true };
+};
+
+const reconcileTouchedColorsFromInitial = async (connection, colorIds, options = {}) => {
+  const uniqueColorIds = [...new Set((colorIds || [])
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0))];
+
+  for (const id of uniqueColorIds) {
+    await recalculateColorInventoryFromInitial(connection, id, options);
+  }
+};
+
 /**
  * Log a DELETE action
  */
@@ -4275,6 +4378,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/sell', authMiddleware, async 
       ['sell', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, finalAmountMeters, finalAmountYards, amountKilograms, parseInt(roll_count) || 0, color.weight || 'N/A', lotValue, rollNbValue, notes || null, now.iso, now.epoch, now.tz, transactionGroupId, salespersonId, conductedByUserId]
     );
 
+    await reconcileTouchedColorsFromInitial(connection, [colorId], {
+      user: req.user,
+      req,
+      reason: 'Auto-reconciled inventory after sell'
+    });
+
     await connection.commit();
 
     // Return updated aggregated structure
@@ -4605,6 +4714,12 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
       );
     }
 
+    await reconcileTouchedColorsFromInitial(connection, validated.map((v) => v.colorId), {
+      user: req.user,
+      req,
+      reason: 'Auto-reconciled inventory after batch sell'
+    });
+
     await connection.commit();
     res.json({ success: true, transaction_group_id: txGroupId });
 
@@ -4800,6 +4915,14 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
       ['return', fabricId, colorId, fabricNameForLog, color.color_name, customer_id || null, customer_name || null, returnAmountMeters, logReturnAmountYards, finalRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, reference_log_id || null, salespersonId, conductedByUserId]
     );
 
+    if (!updateInitial) {
+      await reconcileTouchedColorsFromInitial(connection, [colorId], {
+        user: req.user,
+        req,
+        reason: 'Auto-reconciled inventory after return'
+      });
+    }
+
     await connection.commit();
 
     // Return updated aggregated structure
@@ -4865,6 +4988,7 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
 
     // Process items in deterministic order (by source_log_id) to avoid deadlocks
     const sortedItems = [...items].sort((a, b) => (a.source_log_id || 0) - (b.source_log_id || 0));
+    const touchedColorIds = new Set();
 
     for (const it of sortedItems) {
       const sourceLogId = it.source_log_id != null ? parseInt(it.source_log_id) : null;
@@ -5045,7 +5169,14 @@ app.post('/api/transactions/return/partial', authMiddleware, async (req, res) =>
         'INSERT INTO logs (type, fabric_id, color_id, fabric_name, color_name, customer_id, customer_name, amount_meters, amount_yards, amount_kilograms, roll_count, weight, lot, roll_nb, notes, timestamp, epoch, timezone, transaction_group_id, reference_log_id, salesperson_id, conducted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         ['return', fabricId, colorId, fabricNameForLog, color.color_name, customerId, customerName, finalMeters, finalYards, finalKilograms, returnRollCount, color.weight || 'N/A', lotValue, rollNbValue, returnNotes, now.iso, now.epoch, now.tz, transactionGroupId, sourceLogId, salespersonId, conductedByUserId]
       );
+      touchedColorIds.add(colorId);
     }
+
+    await reconcileTouchedColorsFromInitial(connection, [...touchedColorIds], {
+      user: req.user,
+      req,
+      reason: 'Auto-reconciled inventory after partial return'
+    });
 
     await connection.commit();
     const updatedFabrics = await buildFabricColorAggregatedStructure();
@@ -5224,6 +5355,7 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
 
     // Process items sorted by log_id to avoid deadlocks
     const sortedItems = [...items].sort((a, b) => (a.log_id || 0) - (b.log_id || 0));
+    const touchedColorIds = new Set();
 
     for (const it of sortedItems) {
       const src = sourceLogMap[it.log_id];
@@ -5319,7 +5451,14 @@ app.post('/api/transactions/:groupId/return', authMiddleware, async (req, res) =
           conductedByUserId
         ]
       );
+      touchedColorIds.add(colorId);
     }
+
+    await reconcileTouchedColorsFromInitial(connection, [...touchedColorIds], {
+      user: req.user,
+      req,
+      reason: `Auto-reconciled inventory after return from group ${groupId}`
+    });
 
     await connection.commit();
 
@@ -6215,6 +6354,15 @@ app.post('/api/logs', authMiddleware, async (req, res) => {
       insertValues
     );
 
+    const logType = String(logData.type || '').toLowerCase();
+    if (logData.color_id && ['sell', 'return', 'trim'].includes(logType)) {
+      await reconcileTouchedColorsFromInitial(db, [logData.color_id], {
+        user: req.user,
+        req,
+        reason: `Auto-reconciled inventory after ${logType} log insert`
+      });
+    }
+
     // Return DB reality
     const [created] = await db.query('SELECT * FROM logs WHERE log_id = ?', [result.insertId]);
     const log = created[0];
@@ -6485,6 +6633,25 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       }
     }
 
+    const oldInventoryType = String(oldLogRecord.type || '').toLowerCase();
+    const newInventoryType = String(updateData.type || oldLogRecord.type || '').toLowerCase();
+    const inventoryTypeTouched = ['sell', 'return', 'trim'].includes(oldInventoryType) || ['sell', 'return', 'trim'].includes(newInventoryType);
+    const inventoryFieldsChanged =
+      updateData.type !== undefined ||
+      updateData.fabric_id !== undefined ||
+      updateData.color_id !== undefined ||
+      updateData.amount_meters !== undefined ||
+      updateData.amount_yards !== undefined ||
+      updateData.roll_count !== undefined;
+
+    if (inventoryTypeTouched && inventoryFieldsChanged) {
+      await reconcileTouchedColorsFromInitial(db, [oldLogRecord.color_id, updateData.color_id], {
+        user: req.user,
+        req,
+        reason: `Auto-reconciled inventory after log ${logId} edit`
+      });
+    }
+
     // Return DB reality with salesperson info
     const [updated] = await db.query(`
       SELECT 
@@ -6718,6 +6885,14 @@ app.post('/api/logs/:log_id/cancel', authMiddleware, requireRole('admin'), async
       }
     }
 
+    if (['sell', 'return', 'trim'].includes(String(log.type || '').toLowerCase()) && log.color_id) {
+      await reconcileTouchedColorsFromInitial(connection, [log.color_id], {
+        user: req.user,
+        req,
+        reason: `Auto-reconciled inventory after canceling log ${logId}`
+      });
+    }
+
     // Step 5: Decrease permit number counter if we deleted the last transaction group
     if (shouldDeleteGroup && permitNumber && permitNumber.match(/^[AB]-[0-9]+$/)) {
       // Parse numeric part as integer for SQL comparison (no string/integer mixing)
@@ -6895,6 +7070,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
     let deltaTotalMeters = 0;
     let deltaTotalYards = 0;
     let deltaTotalItems = 0;
+    const touchedColorIds = new Set();
 
     // ---- Process "update" and "remove" items ----
     for (const it of updateRemoveItems) {
@@ -6956,6 +7132,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
 
         // Hard delete the log (matching existing cancel pattern)
         await connection.query('DELETE FROM logs WHERE log_id = ?', [parseInt(it.log_id)]);
+        touchedColorIds.add(colorId);
 
         // Update totals delta
         deltaTotalMeters -= origMeters;
@@ -7079,6 +7256,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         // Update totals delta
         deltaTotalMeters += deltaMeters;
         deltaTotalYards += deltaYards;
+        touchedColorIds.add(colorId);
         // total_items count does not change for updates
       }
     }
@@ -7206,6 +7384,7 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
       deltaTotalMeters += addMeters;
       deltaTotalYards += addYards;
       deltaTotalItems += 1;
+      touchedColorIds.add(colorId);
     }
 
     // ---- Recalculate and update transaction group totals ----
@@ -7232,6 +7411,12 @@ app.put('/api/transactions/:groupId/edit', authMiddleware, requireMinRole('manag
         [groupId]
       );
     }
+
+    await reconcileTouchedColorsFromInitial(connection, [...touchedColorIds], {
+      user: req.user,
+      req,
+      reason: `Auto-reconciled inventory after editing transaction group ${groupId}`
+    });
 
     await connection.commit();
 
@@ -7486,6 +7671,16 @@ app.post('/api/transactions/:transaction_group_id/cancel', authMiddleware, requi
     await connection.query(
       'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
       [transactionGroupId]
+    );
+
+    await reconcileTouchedColorsFromInitial(
+      connection,
+      Object.values(colorRestoreMap).map((restore) => restore.color_id),
+      {
+        user: req.user,
+        req,
+        reason: `Auto-reconciled inventory after canceling transaction ${transactionGroupId}`
+      }
     );
 
     // Step 6: Decrease permit number counter if permit number matches pattern
