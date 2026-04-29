@@ -4267,6 +4267,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
     // ── PHASE 1: Validate every item — lock rows, check amounts, collect computed values ──
     // Zero writes happen here. If anything is wrong we abort before touching inventory.
     const validated = [];
+    const projectedByColor = new Map();
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       const fabricId = parseInt(item.fabric_id);
@@ -4342,11 +4343,9 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         ? `${fabric.fabric_name} [${fabric.design}]`
         : fabric.fabric_name;
 
-      const currentRollCount = parseInt(color.roll_count) || 0;
-      const sellRollCount    = parseInt(item.roll_count) || 0;
-
-      if (isWeightItem) {
-        // Weight stock check: parse the color's weight field
+      const stockKey = `${fabricId}:${colorId}`;
+      let projected = projectedByColor.get(stockKey);
+      if (!projected) {
         let currentWeightKg = 0;
         if (color.weight && typeof color.weight === 'string') {
           const match = color.weight.match(/(\d+(\.\d+)?)/);
@@ -4354,6 +4353,35 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         } else if (typeof color.weight === 'number') {
           currentWeightKg = parseFloat(color.weight);
         }
+        projected = {
+          yards: parseFloat(color.length_yards) || 0,
+          meters: parseFloat(color.length_meters) || 0,
+          rollCount: parseInt(color.roll_count) || 0,
+          weightStr: color.weight,
+          weightKg: currentWeightKg,
+        };
+      }
+
+      const currentRollCount = projected.rollCount;
+      const sellRollCount    = parseInt(item.roll_count) || 0;
+
+      if (sellRollCount > 0 && sellRollCount > currentRollCount) {
+        if (!isPrivileged) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: not enough rolls â€” have ${currentRollCount}, need ${sellRollCount}`
+          });
+        }
+        if (!item.notes || !item.notes.trim()) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `${fabric.fabric_name} / ${color.color_name}: a note is required when selling more rolls than available (have ${currentRollCount}, need ${sellRollCount}).`
+          });
+        }
+      }
+
+      if (isWeightItem) {
+        const currentWeightKg = projected.weightKg;
 
         if (currentWeightKg < amountKilograms) {
           if (!isPrivileged) {
@@ -4371,21 +4399,24 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         }
 
         // Pre-compute weight update
-        let newWeightStr = color.weight;
-        let newWeightKg = 0;
-        if (color.weight && typeof color.weight === 'string') {
-          const match = color.weight.match(/(\d+(\.\d+)?)/);
+        let newWeightStr = projected.weightStr;
+        const newWeightKg = currentWeightKg - amountKilograms;
+        if (projected.weightStr && typeof projected.weightStr === 'string') {
+          const match = projected.weightStr.match(/(\d+(\.\d+)?)/);
           if (match) {
-            const oldKg = parseFloat(match[1]);
-            newWeightKg = oldKg - amountKilograms;
-            newWeightStr = color.weight.replace(/(\d+(\.\d+)?)/, Math.max(0, newWeightKg).toFixed(2));
+            newWeightStr = projected.weightStr.replace(/(\d+(\.\d+)?)/, Math.max(0, newWeightKg).toFixed(2));
           }
-        } else if (typeof color.weight === 'number') {
-          newWeightKg = parseFloat(color.weight) - amountKilograms;
+        } else if (typeof projected.weightStr === 'number') {
           newWeightStr = Math.max(0, newWeightKg).toString();
         }
 
         const newRollCount = currentRollCount - sellRollCount;
+        projectedByColor.set(stockKey, {
+          ...projected,
+          rollCount: newRollCount,
+          weightStr: newWeightStr,
+          weightKg: newWeightKg,
+        });
 
         validated.push({
           fabricId, colorId, fabricNameForLog,
@@ -4400,7 +4431,7 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
           itemNotes: item.notes?.trim() || null,
         });
       } else {
-        const currentYards = parseFloat(color.length_yards) || 0;
+        const currentYards = projected.yards;
 
         if (currentYards < amountYards) {
           if (!isPrivileged) {
@@ -4420,6 +4451,12 @@ app.post('/api/transactions/sell-batch', authMiddleware, async (req, res) => {
         const newYards     = round2(currentYards - amountYards);
         const newMeters    = round2(newYards / 1.0936);
         const newRollCount = currentRollCount - sellRollCount;
+        projectedByColor.set(stockKey, {
+          ...projected,
+          yards: newYards,
+          meters: newMeters,
+          rollCount: newRollCount,
+        });
 
         validated.push({
           fabricId, colorId, fabricNameForLog,
@@ -6158,6 +6195,13 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
   try {
     const logId = parseInt(req.params.id);
     const updates = req.body;
+    const readRollCountUpdate = () => {
+      const raw = updates.roll_count !== undefined ? updates.roll_count : updates.rollCount;
+      if (raw === undefined) return undefined;
+      const parsed = parseInt(raw, 10);
+      return Number.isNaN(parsed) ? 0 : parsed;
+    };
+    const providedRollCount = readRollCountUpdate();
 
     // Check log exists
     const [existing] = await db.query('SELECT log_id FROM logs WHERE log_id = ?', [logId]);
@@ -6221,7 +6265,7 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
             // Calculate new inventory based on transaction type
             let newMeters, newYards, newRollCount;
             const oldRollCount = parseInt(log.roll_count) || 0;
-            const newRollCountFromLog = parseInt(updates.roll_count) || oldRollCount;
+            const newRollCountFromLog = providedRollCount !== undefined ? providedRollCount : oldRollCount;
             const rollCountDelta = newRollCountFromLog - oldRollCount;
 
             // Calculate inventory adjustment based on transaction type
@@ -6301,8 +6345,8 @@ app.put('/api/logs/:id', authMiddleware, requireRole('admin'), async (req, res) 
       const rollNbValue = ((updates.roll_nb || updates.rollNb) && typeof (updates.roll_nb || updates.rollNb) === 'string' && (updates.roll_nb || updates.rollNb).trim() !== '') ? (updates.roll_nb || updates.rollNb).trim() : null;
       updateData.roll_nb = rollNbValue;
     }
-    if (updates.roll_count !== undefined || updates.rollCount !== undefined) {
-      updateData.roll_count = parseInt(updates.roll_count || updates.rollCount) || 0;
+    if (providedRollCount !== undefined) {
+      updateData.roll_count = providedRollCount;
     }
     if (updates.timestamp !== undefined && String(updates.timestamp || '').trim()) {
       const normalized = normalizeTimestampToDate(updates.timestamp);
