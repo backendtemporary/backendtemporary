@@ -872,10 +872,11 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
 
   // If customer_name is provided but no valid customer_id, create the customer
   if (customerName && customerName.trim()) {
+    const trimmedCustomerName = customerName.trim();
     // Check if customer with this name already exists
     const [existingByName] = await connection.query(
       'SELECT customer_id FROM customers WHERE customer_name = ?',
-      [customerName.trim()]
+      [trimmedCustomerName]
     );
 
     if (existingByName.length > 0) {
@@ -883,10 +884,24 @@ async function ensureCustomerExists(connection, customerId, customerName, userId
     }
 
     // Create new customer
-    const [result] = await connection.query(
-      'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
-      [customerName.trim(), null, null, null, userId]
-    );
+    let result;
+    try {
+      [result] = await connection.query(
+        'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
+        [trimmedCustomerName, null, null, null, userId]
+      );
+    } catch (error) {
+      if (isDuplicateCustomerNameError(error)) {
+        const [duplicateRows] = await connection.query(
+          'SELECT customer_id FROM customers WHERE customer_name = ?',
+          [trimmedCustomerName]
+        );
+        if (duplicateRows.length > 0) {
+          return duplicateRows[0].customer_id;
+        }
+      }
+      throw error;
+    }
 
     // Log audit entry for customer creation
     const [newCustomer] = await connection.query('SELECT * FROM customers WHERE customer_id = ?', [result.insertId]);
@@ -998,6 +1013,8 @@ async function createOrUpdateTransactionGroup(connection, transactionGroupId, cu
 
 // Map customer row to API shape
 const mapCustomer = (row) => ({
+  customer_id: row.customer_id,
+  customer_name: row.customer_name,
   id: row.customer_id,
   name: row.customer_name,
   phone: row.phone || null,
@@ -1006,6 +1023,29 @@ const mapCustomer = (row) => ({
   created_at: row.created_at,
   updated_at: row.updated_at
 });
+
+const isDuplicateCustomerNameError = (error) =>
+  error?.code === 'ER_DUP_ENTRY' && String(error.message || '').includes('uniq_customer_name');
+
+async function findCustomerByName(customerName, excludeCustomerId = null) {
+  const params = [customerName];
+  let sql = 'SELECT * FROM customers WHERE customer_name = ?';
+  if (excludeCustomerId != null) {
+    sql += ' AND customer_id <> ?';
+    params.push(excludeCustomerId);
+  }
+  sql += ' LIMIT 1';
+  const [rows] = await db.query(sql, params);
+  return rows[0] || null;
+}
+
+function sendDuplicateCustomerName(res, existingCustomer, requestedName) {
+  const displayName = existingCustomer?.customer_name || requestedName;
+  return res.status(409).json({
+    error: `Customer "${displayName}" already exists.`,
+    customer: existingCustomer ? mapCustomer(existingCustomer) : null
+  });
+}
 
 // ============================================
 // AUTHENTICATION ENDPOINTS (Public)
@@ -1639,6 +1679,8 @@ app.put('/api/cancellation-requests/:id/review', authMiddleware, requireMinRole(
 app.get('/api/customers', authMiddleware, async (req, res) => {
   try {
     const search = (req.query.search || '').trim();
+    const rawLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : null;
     let sql = `SELECT c.*,
       u_created.username as created_by_username, u_created.full_name as created_by_full_name,
       u_updated.username as updated_by_username, u_updated.full_name as updated_by_full_name
@@ -1650,7 +1692,11 @@ app.get('/api/customers', authMiddleware, async (req, res) => {
       sql += ' WHERE customer_name LIKE ?';
       params.push(`%${search}%`);
     }
-    sql += ' ORDER BY customer_name ASC LIMIT 100';
+    sql += ' ORDER BY customer_name ASC';
+    if (limit) {
+      sql += ' LIMIT ?';
+      params.push(limit);
+    }
     const [rows] = await db.query(sql, params);
     // Ensure rows is always an array (defensive check)
     const safeRows = Array.isArray(rows) ? rows : [];
@@ -1778,13 +1824,19 @@ app.get('/api/customers/:id/transaction-groups', authMiddleware, async (req, res
 app.post('/api/customers', authMiddleware, async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
-    if (!name || !name.trim()) {
+    const customerName = typeof name === 'string' ? name.trim() : '';
+    if (!customerName) {
       return res.status(400).json({ error: 'Name is required' });
     }
+    const existingCustomer = await findCustomerByName(customerName);
+    if (existingCustomer) {
+      return sendDuplicateCustomerName(res, existingCustomer, customerName);
+    }
+
     const userId = req.user ? req.user.user_id : null;
     const [result] = await db.query(
       'INSERT INTO customers (customer_name, phone, email, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)',
-      [name.trim(), phone || null, email || null, notes || null, userId]
+      [customerName, phone || null, email || null, notes || null, userId]
     );
     const [rows] = await db.query(`
       SELECT c.*,
@@ -1797,10 +1849,15 @@ app.post('/api/customers', authMiddleware, async (req, res) => {
     `, [result.insertId]);
 
     // Log audit entry
-    await logInsert('customers', result.insertId, req.user, rows[0], req, `Created customer: ${name.trim()}`);
+    await logInsert('customers', result.insertId, req.user, rows[0], req, `Created customer: ${customerName}`);
 
     res.status(201).json(mapCustomer(rows[0]));
   } catch (error) {
+    if (isDuplicateCustomerNameError(error)) {
+      const requestedName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const existingCustomer = requestedName ? await findCustomerByName(requestedName) : null;
+      return sendDuplicateCustomerName(res, existingCustomer, requestedName || 'this name');
+    }
     console.error('Error creating customer:', error.message, error.code);
     res.status(500).json({ error: error.message || 'Failed to create customer' });
   }
@@ -1810,7 +1867,15 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
   try {
     const { name, phone, email, notes } = req.body || {};
     const updates = {};
-    if (name !== undefined) updates.customer_name = name?.trim() || null;
+    if (name !== undefined) {
+      const customerName = typeof name === 'string' ? name.trim() : '';
+      if (!customerName) return res.status(400).json({ error: 'Name is required' });
+      const existingCustomer = await findCustomerByName(customerName, req.params.id);
+      if (existingCustomer) {
+        return sendDuplicateCustomerName(res, existingCustomer, customerName);
+      }
+      updates.customer_name = customerName;
+    }
     if (phone !== undefined) updates.phone = phone || null;
     if (email !== undefined) updates.email = email || null;
     if (notes !== undefined) updates.notes = notes || null;
@@ -1838,6 +1903,11 @@ app.put('/api/customers/:id', authMiddleware, async (req, res) => {
 
     res.json(mapCustomer(rows[0]));
   } catch (error) {
+    if (isDuplicateCustomerNameError(error)) {
+      const requestedName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const existingCustomer = requestedName ? await findCustomerByName(requestedName, req.params.id) : null;
+      return sendDuplicateCustomerName(res, existingCustomer, requestedName || 'this name');
+    }
     console.error('Error updating customer:', error.message, error.code);
     res.status(500).json({ error: error.message || 'Failed to update customer' });
   }

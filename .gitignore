@@ -2,6 +2,7 @@ node_modules/
 *.log
 .DS_Store
 .env
+data/test-seed-summary.json
 
 # Elastic Beanstalk Files
 .elasticbeanstalk/*

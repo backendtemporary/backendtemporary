@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "seed:test": "node seed-test-data.js",
     "deploy": "node deploy-with-env.js"
   },
   "keywords": [],
