@@ -637,7 +637,7 @@ const buildFabricColorAggregatedStructure = async () => {
           - COALESCE(SUM(CASE WHEN type = 'return'    THEN amount_yards  ELSE 0 END), 0) AS total_sold_yards,
         COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN amount_meters ELSE 0 END), 0)
           - COALESCE(SUM(CASE WHEN type = 'return'    THEN amount_meters ELSE 0 END), 0) AS total_sold_meters,
-        COALESCE(SUM(CASE WHEN type = 'sell'          THEN roll_count    ELSE 0 END), 0)
+        COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN roll_count   ELSE 0 END), 0)
           - COALESCE(SUM(CASE WHEN type = 'return'    THEN roll_count    ELSE 0 END), 0) AS total_sold_rolls
       FROM logs
       GROUP BY fabric_id
@@ -3140,11 +3140,28 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
       values.push(status);
     }
 
-    // update_initial_to_match: when setting length, managers and admins can set initial = new length.
+    // update_initial_to_match: when correcting the on-hand length, rebase initial to
+    // "new length + everything already sold" so that initial - sold = current still holds.
+    // Setting initial = new length would silently drop this color's sales history.
     const doUpdateInitialToMatch = update_initial_to_match === true || update_initial_to_match === 'true';
     if (doUpdateInitialToMatch && (length_meters !== undefined || length_yards !== undefined)) {
-      const initM = length_meters !== undefined ? parseFloat(length_meters) : newLenM;
-      const initY = length_yards !== undefined ? parseFloat(length_yards) : newLenY;
+      const [soldRows] = await connection.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN COALESCE(amount_yards, amount_meters * 1.0936, 0) ELSE 0 END), 0) -
+           COALESCE(SUM(CASE WHEN type = 'return' THEN COALESCE(amount_yards, amount_meters * 1.0936, 0) ELSE 0 END), 0) AS net_yards,
+           COALESCE(SUM(CASE WHEN type IN ('sell','trim') THEN COALESCE(roll_count, 0) ELSE 0 END), 0) -
+           COALESCE(SUM(CASE WHEN type = 'return' THEN COALESCE(roll_count, 0) ELSE 0 END), 0) AS net_rolls
+         FROM logs WHERE color_id = ?`,
+        [colorId]
+      );
+      const netSoldYards = Number(soldRows?.[0]?.net_yards) || 0;
+      const netSoldRolls = parseInt(soldRows?.[0]?.net_rolls, 10) || 0;
+      const netSoldMeters = netSoldYards * 0.9144;
+
+      const baseM = length_meters !== undefined ? parseFloat(length_meters) : newLenM;
+      const baseY = length_yards !== undefined ? parseFloat(length_yards) : newLenY;
+      const initM = isNaN(baseM) ? baseM : roundInventoryValue(baseM + netSoldMeters);
+      const initY = isNaN(baseY) ? baseY : roundInventoryValue(baseY + netSoldYards);
       if (!isNaN(initM) && initM >= 0) {
         updates.push('initial_length_meters = ?');
         values.push(initM);
@@ -3156,10 +3173,18 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
         newInitY = initY;
       }
       if (new_initial_roll_count !== undefined && new_initial_roll_count !== null) {
+        // Explicit override: the caller states the initial roll count directly.
         const rollCount = parseInt(new_initial_roll_count);
         if (!isNaN(rollCount) && rollCount >= 0) {
           updates.push('initial_roll_count = ?');
           values.push(rollCount);
+        }
+      } else if (roll_count !== undefined) {
+        // Same rebase as the lengths above, so rolls cannot drift apart from yards.
+        const rebasedRolls = (parseInt(roll_count) || 0) + netSoldRolls;
+        if (rebasedRolls >= 0) {
+          updates.push('initial_roll_count = ?');
+          values.push(rebasedRolls);
         }
       }
     }
@@ -3292,13 +3317,13 @@ app.put('/api/colors/:color_id', authMiddleware, async (req, res) => {
   }
 });
 
-// Shared handler: Add meters/yards to color. Only updates current length by default.
-// Pass update_initial_to_match: true to also set initial = new current (when user confirms in UI).
+// Shared handler: Add meters/yards to color. Restocking is treated as intake, so the
+// added amount is applied to both the current length and the initial totals.
 async function addMetersToColorHandler(req, res) {
   const connection = await db.getConnection();
   try {
     const colorId = parseInt(req.params.color_id);
-    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb, update_initial_to_match, roll_count, new_initial_roll_count } = req.body;
+    const { date, length_meters, length_yards, is_trimmable, weight, lot, roll_nb, roll_count } = req.body;
 
     const lenM = parseFloat(length_meters);
     const lenY = parseFloat(length_yards);
@@ -3349,57 +3374,23 @@ async function addMetersToColorHandler(req, res) {
     const newMeters = currentMeters + lenM;
     const newYards = currentYards + lenY;
 
-    const updateInitial = update_initial_to_match === true || update_initial_to_match === 'true';
-    if (updateInitial) {
-      const newInitialRolls = (new_initial_roll_count !== undefined && new_initial_roll_count !== null)
-        ? parseInt(new_initial_roll_count) : null;
-      const hasNewRollCount = newInitialRolls !== null && !isNaN(newInitialRolls) && newInitialRolls >= 0;
-      if (hasNewRollCount) {
-        await connection.query(
-          `UPDATE colors
-           SET length_meters = ?,
-               length_yards = ?,
-               initial_length_meters = ?,
-               initial_length_yards = ?,
-               initial_roll_count = ?,
-               roll_count = roll_count + ?,
-               date = COALESCE(?, date),
-               weight = COALESCE(?, weight),
-               lot = COALESCE(?, lot),
-               roll_nb = COALESCE(?, roll_nb)
-           WHERE color_id = ?`,
-          [newMeters, newYards, newMeters, newYards, newInitialRolls, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
-        );
-      } else {
-        await connection.query(
-          `UPDATE colors
-           SET length_meters = ?,
-               length_yards = ?,
-               initial_length_meters = ?,
-               initial_length_yards = ?,
-               roll_count = roll_count + ?,
-               date = COALESCE(?, date),
-               weight = COALESCE(?, weight),
-               lot = COALESCE(?, lot),
-               roll_nb = COALESCE(?, roll_nb)
-           WHERE color_id = ?`,
-          [newMeters, newYards, newMeters, newYards, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
-        );
-      }
-    } else {
-      await connection.query(
-        `UPDATE colors
-         SET length_meters = ?,
-             length_yards = ?,
-             roll_count = roll_count + ?,
-             date = COALESCE(?, date),
-             weight = COALESCE(?, weight),
-             lot = COALESCE(?, lot),
-             roll_nb = COALESCE(?, roll_nb)
-         WHERE color_id = ?`,
-        [newMeters, newYards, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
-      );
-    }
+    // Restocking is intake: every unit that enters stock must also enter the initial
+    // totals, otherwise the (initial - sold = current) balance drifts by the added amount.
+    await connection.query(
+      `UPDATE colors
+       SET length_meters = ?,
+           length_yards = ?,
+           initial_length_meters = COALESCE(initial_length_meters, 0) + ?,
+           initial_length_yards = COALESCE(initial_length_yards, 0) + ?,
+           initial_roll_count = COALESCE(initial_roll_count, 0) + ?,
+           roll_count = roll_count + ?,
+           date = COALESCE(?, date),
+           weight = COALESCE(?, weight),
+           lot = COALESCE(?, lot),
+           roll_nb = COALESCE(?, roll_nb)
+       WHERE color_id = ?`,
+      [newMeters, newYards, lenM, lenY, addedRolls, addedRolls, rollDate, weight || null, lotValue, rollNbValue, colorId]
+    );
 
     // Get updated record for audit
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
@@ -5130,7 +5121,7 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const [oldColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
     const oldColorRecord = oldColorRows[0];
 
-    // Add meters/yards back to color. Optionally set initial = new current when update_initial_to_match.
+    // Add meters/yards back to color.
     // Use yards as primary unit - if amount_yards provided, use it directly
     const currentMeters = parseFloat(color.length_meters) || 0;
     const currentYards = parseFloat(color.length_yards) || 0;
@@ -5139,19 +5130,12 @@ app.post('/api/fabrics/:fabric_id/colors/:color_id/return', authMiddleware, asyn
     const newYards = currentYards + returnAmountYardsValue; // Use yards directly if provided
     const currentRollCount = parseInt(color.roll_count) || 0;
     const newRollCount = currentRollCount + finalRollCount;
-    const updateInitial = req.body.update_initial_to_match === true || req.body.update_initial_to_match === 'true';
-
-    if (updateInitial) {
-      await connection.query(
-        'UPDATE colors SET length_meters = ?, length_yards = ?, initial_length_meters = ?, initial_length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
-        [newMeters, newYards, newMeters, newYards, newRollCount, colorId]
-      );
-    } else {
-      await connection.query(
-        'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
-        [newMeters, newYards, newRollCount, colorId]
-      );
-    }
+    // A return restores stock and is logged as a 'return', which already reduces the
+    // sold total. The initial totals must stay untouched or the balance breaks.
+    await connection.query(
+      'UPDATE colors SET length_meters = ?, length_yards = ?, roll_count = ?, sold = 0 WHERE color_id = ?',
+      [newMeters, newYards, newRollCount, colorId]
+    );
 
     // Get updated record for audit
     const [newColorRows] = await connection.query('SELECT * FROM colors WHERE color_id = ?', [colorId]);
@@ -6745,6 +6729,13 @@ app.delete('/api/transaction-groups/:transaction_group_id', authMiddleware, requ
 
     await connection.beginTransaction();
 
+    // Remember which colors these logs touched so their stock can be restored below
+    const [affectedLogs] = await connection.query(
+      'SELECT DISTINCT color_id FROM logs WHERE transaction_group_id = ? AND color_id IS NOT NULL',
+      [transaction_group_id]
+    );
+    const affectedColorIds = (Array.isArray(affectedLogs) ? affectedLogs : []).map((row) => row.color_id);
+
     // Delete all logs belonging to this transaction group
     await connection.query(
       'DELETE FROM logs WHERE transaction_group_id = ?',
@@ -6756,6 +6747,14 @@ app.delete('/api/transaction-groups/:transaction_group_id', authMiddleware, requ
       'DELETE FROM transaction_groups WHERE transaction_group_id = ?',
       [transaction_group_id]
     );
+
+    // The logs are gone, so recomputing from initial values gives the stock back.
+    // Without this the deleted sales stay subtracted from inventory forever.
+    await reconcileTouchedColorsFromInitial(connection, affectedColorIds, {
+      user: req.user,
+      req,
+      reason: `Auto-reconciled inventory after deleting transaction ${transaction_group_id}`
+    });
 
     await connection.commit();
     res.json({ success: true, message: 'Transaction group and all associated logs permanently deleted' });
