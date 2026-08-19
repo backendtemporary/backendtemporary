@@ -8,3 +8,6 @@ data/test-seed-summary.json
 .elasticbeanstalk/*
 !.elasticbeanstalk/*.cfg.yml
 !.elasticbeanstalk/*.global.yml
+
+# SQL scripts (migrations, dumps, one-off repairs) stay local
+*.sql
